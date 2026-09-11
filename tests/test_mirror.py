@@ -32,6 +32,24 @@ class MirrorStoreTest(unittest.TestCase):
             store.release_lease(token)
             self.assertFalse(store.status()["worker"]["alive"])
 
+    def test_multiple_bindings_are_isolated_and_duplicates_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MirrorStore(Path(directory) / "mirror.sqlite3")
+            store.initialize({"wechat_chat_name": "源1", "wechat_talker": "talker-1", "feishu_chat_name": "目标1", "feishu_chat_id": "chat-1", "sender_map": {}})
+            store.upsert_profile("second", "app-second")
+            b2 = store.create_binding({"wechat_chat_name": "源2", "wechat_talker": "talker-2", "feishu_chat_name": "目标2", "feishu_chat_id": "chat-2", "lark_profile": "second"})
+            self.assertEqual(b2["id"], 2)
+            with self.assertRaises(ValueError):
+                store.create_binding({"wechat_chat_name": "重复源", "wechat_talker": "talker-1", "feishu_chat_name": "目标3", "feishu_chat_id": "chat-3", "lark_profile": "second"})
+            with self.assertRaises(ValueError):
+                store.create_binding({"wechat_chat_name": "源3", "wechat_talker": "talker-3", "feishu_chat_name": "重复目标", "feishu_chat_id": "chat-1", "lark_profile": "second"})
+            row = {"talker": "talker-1", "local_id": 9, "sender_wxid": "wx", "sender": "甲", "kind_name": "text", "text": "a"}
+            store.upsert_message("talker-1:9", row, "text", binding_id=1)
+            row["talker"] = "talker-2"
+            store.upsert_message("talker-2:9", row, "text", binding_id=2)
+            self.assertEqual(store.status(1)["messages"], {"received": 1})
+            self.assertEqual(store.status(2)["messages"], {"received": 1})
+
 
 class MirrorFormattingTest(unittest.TestCase):
     def test_xml_url_and_unknown_sender_fallback(self):
@@ -48,6 +66,33 @@ class MirrorFormattingTest(unittest.TestCase):
             self.assertEqual(send.call_args.args[1][send.call_args.args[1].index("--text") + 1], "微信昵称：内容")
             self.assertEqual(store.message_state("talker:1"), "sent")
             self.assertEqual(store.status()["pending_senders"], 1)
+
+    def test_quote_info_extracts_parent_and_sends_fallback_context(self):
+        xml = '<msg><appmsg><title>回复</title><refermsg><type>1</type><svrid>12345</svrid><fromusr>talker</fromusr><displayname>原作者</displayname><content>原消息</content></refermsg></appmsg></msg>'
+        self.assertEqual(mirror.quote_info({"text": xml}), {"key": "talker:12345", "sender": "原作者", "content": "原消息", "server_id": "12345"})
+        with tempfile.TemporaryDirectory() as directory:
+            store = MirrorStore(Path(directory) / "mirror.sqlite3")
+            store.initialize({"wechat_chat_name": "源", "wechat_talker": "talker", "feishu_chat_name": "目标", "feishu_chat_id": "chat", "sender_map": {"wx": "实名"}})
+            config = {"lark_profile": "test", "feishu_chat_id": "chat", "sender_map": {"wx": "实名"}}
+            row = {"talker": "talker", "local_id": 2, "server_id": "new", "sender_wxid": "wx", "sender": "昵称", "kind_name": "quote", "text": xml}
+            with patch.object(mirror, "run_lark", return_value={"data": {"message_id": "om_test"}}) as send:
+                mirror.send_row(config, row, {"pending_senders": {}}, store)
+            sent_text = send.call_args.args[1][send.call_args.args[1].index("--text") + 1]
+            self.assertIn("> 原作者：原消息", sent_text)
+            self.assertEqual(store.message_state("talker:2"), "sent")
+
+    def test_unknown_sender_reminder_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MirrorStore(Path(directory) / "mirror.sqlite3")
+            store.initialize({"wechat_chat_name": "源", "wechat_talker": "talker", "feishu_chat_name": "目标", "feishu_chat_id": "chat", "sender_map": {}})
+            config = {"lark_profile": "test", "feishu_chat_id": "chat", "sender_map": {}, "admin_feishu_user_id": "ou_admin"}
+            row = {"talker": "talker", "local_id": 3, "sender_wxid": "unknown", "sender": "微信昵称", "kind_name": "text", "text": "内容"}
+            with patch.object(mirror, "run_lark", return_value={"data": {"message_id": "om_test"}}) as send:
+                mirror.send_row(config, row, {"pending_senders": {}}, store)
+                row["local_id"] = 4
+                mirror.send_row(config, row, {"pending_senders": {}}, store)
+            self.assertEqual(send.call_count, 3)
+            self.assertEqual(store.list_confirmations()[0]["notification_status"], "sent")
 
 
 if __name__ == "__main__":

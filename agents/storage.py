@@ -1,4 +1,4 @@
-"""SQLite control and delivery state for the WeChat -> Feishu mirror."""
+"""SQLite persistence for profiles, bindings, identities and deliveries."""
 from __future__ import annotations
 
 import json
@@ -9,11 +9,17 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+SCHEMA_VERSION = 2
+STATUSES = {"running", "paused", "stopped"}
 
-SCHEMA_VERSION = 1
+
+def now() -> float:
+    return time.time()
 
 
 class MirrorStore:
+    """Shared state store used by the manager API and each worker process."""
+
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -28,216 +34,412 @@ class MirrorStore:
 
     def initialize(self, config: dict[str, Any] | None = None) -> None:
         with self.connect() as db:
-            db.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS schema_meta (
-                    key TEXT PRIMARY KEY, value TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS bindings (
-                    id INTEGER PRIMARY KEY CHECK (id = 1),
-                    wechat_chat_name TEXT NOT NULL,
-                    wechat_talker TEXT NOT NULL UNIQUE,
-                    feishu_chat_name TEXT NOT NULL,
-                    feishu_chat_id TEXT NOT NULL,
-                    enabled INTEGER NOT NULL DEFAULT 1,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS runtime_control (
-                    binding_id INTEGER PRIMARY KEY REFERENCES bindings(id),
-                    status TEXT NOT NULL CHECK(status IN ('running','paused','stopped')),
-                    reason TEXT,
-                    actor TEXT,
-                    updated_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS runtime_state (
-                    binding_id INTEGER PRIMARY KEY REFERENCES bindings(id),
-                    cursor INTEGER NOT NULL DEFAULT 0,
-                    last_success_at REAL,
-                    updated_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS worker_leases (
-                    binding_id INTEGER PRIMARY KEY REFERENCES bindings(id),
-                    pid INTEGER NOT NULL,
-                    token TEXT NOT NULL,
-                    started_at REAL NOT NULL,
-                    heartbeat_at REAL NOT NULL,
-                    stopped_at REAL
-                );
-                CREATE TABLE IF NOT EXISTS messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    binding_id INTEGER NOT NULL REFERENCES bindings(id),
-                    wechat_message_key TEXT NOT NULL,
-                    local_id INTEGER,
-                    server_id TEXT,
-                    sender_wxid TEXT,
-                    sender_name TEXT,
-                    kind TEXT NOT NULL,
-                    payload_json TEXT,
-                    state TEXT NOT NULL CHECK(state IN ('received','processing','sent','placeholder','failed','pending')),
-                    feishu_message_id TEXT,
-                    idempotency_key TEXT,
-                    attempts INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    UNIQUE(binding_id, wechat_message_key)
-                );
-                CREATE INDEX IF NOT EXISTS messages_state_idx ON messages(binding_id, state, updated_at);
-                CREATE TABLE IF NOT EXISTS sender_mappings (
-                    binding_id INTEGER NOT NULL REFERENCES bindings(id),
-                    wechat_sender_id TEXT NOT NULL,
-                    wechat_display_name TEXT,
-                    confirmed_name TEXT,
-                    feishu_open_id TEXT,
-                    status TEXT NOT NULL CHECK(status IN ('confirmed','pending','rejected')),
-                    updated_at REAL NOT NULL,
-                    PRIMARY KEY(binding_id, wechat_sender_id)
-                );
-                CREATE TABLE IF NOT EXISTS media_jobs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    message_id INTEGER NOT NULL REFERENCES messages(id),
-                    media_type TEXT NOT NULL,
-                    source_ref TEXT,
-                    staging_path TEXT,
-                    state TEXT NOT NULL CHECK(state IN ('pending','processing','uploaded','placeholder','manual','failed')),
-                    error TEXT,
-                    attempts INTEGER NOT NULL DEFAULT 0,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS media_jobs_state_idx ON media_jobs(state, updated_at);
-                CREATE TABLE IF NOT EXISTS management_actions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    action TEXT NOT NULL,
-                    actor TEXT NOT NULL,
-                    binding_id INTEGER REFERENCES bindings(id),
-                    details_json TEXT,
-                    result TEXT NOT NULL,
-                    created_at REAL NOT NULL
-                );
-                """
-            )
-            db.execute(
-                "INSERT INTO schema_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                ("schema_version", str(SCHEMA_VERSION)),
-            )
+            db.execute("PRAGMA foreign_keys=OFF")
+            if self._needs_migration(db):
+                self._migrate_v1(db)
+            self._create_schema(db)
+            db.execute("INSERT INTO schema_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", ("schema_version", str(SCHEMA_VERSION)))
             if config:
-                now = time.time()
-                db.execute(
-                    """INSERT INTO bindings(id,wechat_chat_name,wechat_talker,feishu_chat_name,feishu_chat_id,created_at,updated_at)
-                       VALUES(1,?,?,?,?,?,?)
-                       ON CONFLICT(id) DO UPDATE SET wechat_chat_name=excluded.wechat_chat_name,
-                       wechat_talker=excluded.wechat_talker,feishu_chat_name=excluded.feishu_chat_name,
-                       feishu_chat_id=excluded.feishu_chat_id,updated_at=excluded.updated_at""",
-                    (config.get("wechat_chat_name", ""), config["wechat_talker"], config.get("feishu_chat_name", ""), config["feishu_chat_id"], now, now),
-                )
-                db.execute(
-                    "INSERT INTO runtime_control(binding_id,status,updated_at) VALUES(1,'stopped',?) ON CONFLICT(binding_id) DO NOTHING",
-                    (now,),
-                )
-                db.execute(
-                    "INSERT INTO runtime_state(binding_id,cursor,updated_at) VALUES(1,?,?) ON CONFLICT(binding_id) DO NOTHING",
-                    (int(config.get("initial_cursor", 0)), now),
-                )
-                for sender_id, name in config.get("sender_map", {}).items():
-                    db.execute(
-                        """INSERT INTO sender_mappings(binding_id,wechat_sender_id,wechat_display_name,confirmed_name,status,updated_at)
-                           VALUES(1,?,?,?,'confirmed',?)
-                           ON CONFLICT(binding_id,wechat_sender_id) DO UPDATE SET confirmed_name=excluded.confirmed_name,status='confirmed',updated_at=excluded.updated_at""",
-                        (sender_id, name, name, now),
-                    )
+                self._seed_config(db, config)
+            db.execute("PRAGMA foreign_keys=ON")
 
-    def binding_id(self) -> int:
-        return 1
+    def _needs_migration(self, db: sqlite3.Connection) -> bool:
+        row = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bindings'").fetchone()
+        if not row:
+            return False
+        columns = {r[1] for r in db.execute("PRAGMA table_info(bindings)")}
+        return "source_account" not in columns or "lark_profile" not in columns
 
-    def get_control(self) -> dict[str, Any]:
+    def _create_schema(self, db: sqlite3.Connection) -> None:
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS profiles(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, profile_name TEXT NOT NULL UNIQUE,
+                app_id TEXT NOT NULL UNIQUE, brand TEXT NOT NULL DEFAULT 'feishu',
+                purpose TEXT NOT NULL DEFAULT 'mirror', protected INTEGER NOT NULL DEFAULT 0,
+                enabled INTEGER NOT NULL DEFAULT 1, bot_status TEXT NOT NULL DEFAULT 'unknown',
+                user_status TEXT NOT NULL DEFAULT 'unknown', last_checked_at REAL,
+                last_error TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS bindings(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, source_account TEXT NOT NULL DEFAULT 'default',
+                wechat_chat_name TEXT NOT NULL, wechat_talker TEXT NOT NULL,
+                feishu_chat_name TEXT NOT NULL, feishu_chat_id TEXT NOT NULL,
+                lark_profile TEXT NOT NULL, lark_app_id TEXT, enabled INTEGER NOT NULL DEFAULT 1,
+                archived INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+                UNIQUE(source_account,wechat_talker), UNIQUE(feishu_chat_id)
+            );
+            CREATE INDEX IF NOT EXISTS bindings_active_idx ON bindings(archived,enabled);
+            CREATE TABLE IF NOT EXISTS runtime_control(
+                binding_id INTEGER PRIMARY KEY REFERENCES bindings(id),
+                status TEXT NOT NULL CHECK(status IN ('running','paused','stopped')),
+                reason TEXT, actor TEXT, updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS runtime_state(
+                binding_id INTEGER PRIMARY KEY REFERENCES bindings(id), cursor INTEGER NOT NULL DEFAULT 0,
+                last_success_at REAL, updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS worker_leases(
+                binding_id INTEGER PRIMARY KEY REFERENCES bindings(id), pid INTEGER NOT NULL,
+                token TEXT NOT NULL, started_at REAL NOT NULL, heartbeat_at REAL NOT NULL, stopped_at REAL
+            );
+            CREATE TABLE IF NOT EXISTS people(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, confirmed_name TEXT NOT NULL,
+                notes TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','archived')),
+                created_at REAL NOT NULL, updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS wechat_identities(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, person_id INTEGER REFERENCES people(id),
+                source_account TEXT NOT NULL, wechat_sender_id TEXT NOT NULL,
+                last_display_name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('confirmed','pending','rejected')),
+                created_at REAL NOT NULL, updated_at REAL NOT NULL, UNIQUE(source_account,wechat_sender_id)
+            );
+            CREATE TABLE IF NOT EXISTS feishu_identities(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, person_id INTEGER NOT NULL REFERENCES people(id),
+                profile_id INTEGER NOT NULL REFERENCES profiles(id), open_id TEXT NOT NULL,
+                user_id TEXT, display_name TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, updated_at REAL NOT NULL,
+                UNIQUE(profile_id,open_id)
+            );
+            CREATE TABLE IF NOT EXISTS confirmations(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, source_account TEXT NOT NULL,
+                wechat_sender_id TEXT NOT NULL, display_name TEXT NOT NULL DEFAULT '',
+                binding_id INTEGER REFERENCES bindings(id), person_id INTEGER REFERENCES people(id),
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','confirmed','rejected')),
+                notification_status TEXT NOT NULL DEFAULT 'pending', last_error TEXT,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL, UNIQUE(source_account,wechat_sender_id)
+            );
+            CREATE TABLE IF NOT EXISTS messages(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, binding_id INTEGER NOT NULL REFERENCES bindings(id),
+                source_account TEXT NOT NULL, wechat_message_key TEXT NOT NULL, local_id INTEGER,
+                server_id TEXT, sender_wxid TEXT, sender_name TEXT, sender_person_id INTEGER REFERENCES people(id),
+                kind TEXT NOT NULL, payload_json TEXT, quoted_message_key TEXT,
+                state TEXT NOT NULL CHECK(state IN ('received','processing','sent','placeholder','failed','pending')),
+                feishu_message_id TEXT, idempotency_key TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+                UNIQUE(binding_id,wechat_message_key)
+            );
+            CREATE INDEX IF NOT EXISTS messages_state_idx ON messages(binding_id,state,updated_at);
+            CREATE TABLE IF NOT EXISTS media_jobs(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER NOT NULL REFERENCES messages(id),
+                media_type TEXT NOT NULL, source_ref TEXT, staging_path TEXT,
+                state TEXT NOT NULL CHECK(state IN ('pending','processing','uploaded','placeholder','manual','failed')),
+                error TEXT, attempts INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS media_jobs_state_idx ON media_jobs(state,updated_at);
+            CREATE TABLE IF NOT EXISTS management_actions(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, actor TEXT NOT NULL,
+                binding_id INTEGER REFERENCES bindings(id), details_json TEXT, result TEXT NOT NULL, created_at REAL NOT NULL
+            );
+            """
+        )
+
+    def _migrate_v1(self, db: sqlite3.Connection) -> None:
+        """Copy the old single-binding schema before replacing fixed tables."""
+        old: dict[str, list[dict[str, Any]]] = {}
+        tables = ("bindings", "runtime_control", "runtime_state", "worker_leases", "messages", "sender_mappings", "media_jobs", "management_actions")
+        for table in tables:
+            try:
+                old[table] = [dict(row) for row in db.execute(f"SELECT * FROM {table}").fetchall()]
+            except sqlite3.OperationalError:
+                old[table] = []
+        for table in ("media_jobs", "messages", "sender_mappings", "worker_leases", "runtime_state", "runtime_control", "management_actions", "bindings"):
+            db.execute(f"DROP TABLE IF EXISTS {table}")
+        self._create_schema(db)
+        ts = now()
+        binding = old["bindings"][0] if old["bindings"] else {}
+        if not binding:
+            return
+        db.execute("INSERT INTO bindings(id,source_account,wechat_chat_name,wechat_talker,feishu_chat_name,feishu_chat_id,lark_profile,enabled,created_at,updated_at) VALUES(1,'default',?,?,?,?,?,?,?,?)", (binding.get("wechat_chat_name", ""), binding.get("wechat_talker", ""), binding.get("feishu_chat_name", ""), binding.get("feishu_chat_id", ""), "wechat-mirror", int(binding.get("enabled", 1)), binding.get("created_at", ts), binding.get("updated_at", ts)))
+        control = old["runtime_control"][0] if old["runtime_control"] else {}
+        state = old["runtime_state"][0] if old["runtime_state"] else {}
+        db.execute("INSERT INTO runtime_control(binding_id,status,reason,actor,updated_at) VALUES(?,?,?,?,?)", (1, control.get("status", "stopped"), control.get("reason"), control.get("actor"), control.get("updated_at", ts)))
+        db.execute("INSERT INTO runtime_state(binding_id,cursor,last_success_at,updated_at) VALUES(1,?,?,?)", (int(state.get("cursor", 0)), state.get("last_success_at"), state.get("updated_at", ts)))
+        for row in old["messages"]:
+            db.execute("INSERT INTO messages(id,binding_id,source_account,wechat_message_key,local_id,server_id,sender_wxid,sender_name,kind,payload_json,state,feishu_message_id,idempotency_key,attempts,last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (row.get("id"), 1, "default", row.get("wechat_message_key", ""), row.get("local_id"), row.get("server_id", ""), row.get("sender_wxid"), row.get("sender_name", ""), row.get("kind", "text"), row.get("payload_json"), row.get("state", "received"), row.get("feishu_message_id"), row.get("idempotency_key"), row.get("attempts", 0), row.get("last_error"), row.get("created_at", ts), row.get("updated_at", ts)))
+        for row in old["media_jobs"]:
+            db.execute("INSERT INTO media_jobs(id,message_id,media_type,source_ref,staging_path,state,error,attempts,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (row.get("id"), row.get("message_id"), row.get("media_type", "media"), row.get("source_ref"), row.get("staging_path"), row.get("state", "pending"), row.get("error"), row.get("attempts", 0), row.get("created_at", ts), row.get("updated_at", ts)))
+        for row in old["management_actions"]:
+            db.execute("INSERT INTO management_actions(id,action,actor,binding_id,details_json,result,created_at) VALUES(?,?,?,?,?,?,?)", (row.get("id"), row.get("action", "legacy"), row.get("actor", "legacy"), row.get("binding_id"), row.get("details_json"), row.get("result", "accepted"), row.get("created_at", ts)))
+        for row in old["sender_mappings"]:
+            name = row.get("confirmed_name") or row.get("wechat_display_name") or "未知发言人"
+            person = db.execute("SELECT id FROM people WHERE confirmed_name=? LIMIT 1", (name,)).fetchone()
+            person_id = int(person[0]) if person else int(db.execute("INSERT INTO people(confirmed_name,created_at,updated_at) VALUES(?,?,?) RETURNING id", (name, row.get("updated_at", ts), row.get("updated_at", ts))).fetchone()[0])
+            sender_id = row.get("wechat_sender_id") or f"legacy:{person_id}"
+            db.execute("INSERT OR IGNORE INTO wechat_identities(person_id,source_account,wechat_sender_id,last_display_name,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", (person_id if row.get("status") == "confirmed" else None, "default", sender_id, row.get("wechat_display_name", ""), row.get("status", "pending"), row.get("updated_at", ts), row.get("updated_at", ts)))
+
+    def _seed_config(self, db: sqlite3.Connection, config: dict[str, Any]) -> None:
+        ts = now()
+        profile = str(config.get("lark_profile") or "wechat-mirror")
+        app_id = str(config.get("lark_app_id") or profile)
+        db.execute("INSERT INTO profiles(profile_name,app_id,brand,purpose,protected,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(profile_name) DO UPDATE SET app_id=excluded.app_id,updated_at=excluded.updated_at", (profile, app_id, config.get("lark_brand", "feishu"), "mirror", int(profile in {"feishu-mcp", "cli_example_common_app"}), ts, ts))
+        db.execute("INSERT INTO bindings(source_account,wechat_chat_name,wechat_talker,feishu_chat_name,feishu_chat_id,lark_profile,lark_app_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(source_account,wechat_talker) DO UPDATE SET wechat_chat_name=excluded.wechat_chat_name,feishu_chat_name=excluded.feishu_chat_name,feishu_chat_id=excluded.feishu_chat_id,lark_profile=excluded.lark_profile,lark_app_id=excluded.lark_app_id,updated_at=excluded.updated_at", (config.get("source_account", "default"), config.get("wechat_chat_name", ""), config["wechat_talker"], config.get("feishu_chat_name", ""), config["feishu_chat_id"], profile, app_id, ts, ts))
+        binding = db.execute("SELECT id FROM bindings WHERE source_account=? AND wechat_talker=?", (config.get("source_account", "default"), config["wechat_talker"])).fetchone()
+        bid = int(binding[0])
+        db.execute("INSERT INTO runtime_control(binding_id,status,updated_at) VALUES(?,?,?) ON CONFLICT(binding_id) DO NOTHING", (bid, "stopped", ts))
+        db.execute("INSERT INTO runtime_state(binding_id,cursor,updated_at) VALUES(?,?,?) ON CONFLICT(binding_id) DO NOTHING", (bid, int(config.get("initial_cursor", 0)), ts))
+        for sender_id, name in config.get("sender_map", {}).items():
+            self._upsert_confirmed_in_db(db, str(config.get("source_account", "default")), str(sender_id), str(name), ts)
+
+    def _upsert_confirmed_in_db(self, db: sqlite3.Connection, source_account: str, sender_id: str, name: str, ts: float) -> int:
+        person = db.execute("SELECT id FROM people WHERE confirmed_name=? AND status='active' LIMIT 1", (name,)).fetchone()
+        person_id = int(person[0]) if person else int(db.execute("INSERT INTO people(confirmed_name,created_at,updated_at) VALUES(?,?,?) RETURNING id", (name, ts, ts)).fetchone()[0])
+        db.execute("INSERT INTO wechat_identities(person_id,source_account,wechat_sender_id,last_display_name,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(source_account,wechat_sender_id) DO UPDATE SET person_id=excluded.person_id,last_display_name=excluded.last_display_name,status='confirmed',updated_at=excluded.updated_at", (person_id, source_account, sender_id, name, "confirmed", ts, ts))
+        return person_id
+
+    def list_profiles(self) -> list[dict[str, Any]]:
         with self.connect() as db:
-            row = db.execute("SELECT * FROM runtime_control WHERE binding_id=1").fetchone()
-        return dict(row) if row else {"binding_id": 1, "status": "stopped", "reason": None, "actor": None, "updated_at": 0}
+            return [dict(r) for r in db.execute("SELECT * FROM profiles ORDER BY profile_name").fetchall()]
 
-    def get_cursor(self) -> int:
+    def list_people(self) -> list[dict[str, Any]]:
         with self.connect() as db:
-            row = db.execute("SELECT cursor FROM runtime_state WHERE binding_id=1").fetchone()
+            rows = db.execute("SELECT p.*,COUNT(DISTINCT w.id) AS wechat_identity_count,COUNT(DISTINCT f.id) AS feishu_identity_count FROM people p LEFT JOIN wechat_identities w ON w.person_id=p.id LEFT JOIN feishu_identities f ON f.person_id=p.id GROUP BY p.id ORDER BY p.confirmed_name").fetchall()
+        return [dict(x) for x in rows]
+
+    def list_wechat_identities(self, person_id: int | None = None) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            query = "SELECT w.*,p.confirmed_name FROM wechat_identities w LEFT JOIN people p ON p.id=w.person_id"
+            rows = db.execute(query + (" WHERE w.person_id=?" if person_id else "") + " ORDER BY w.updated_at DESC", (person_id,) if person_id else ()).fetchall()
+        return [dict(x) for x in rows]
+
+    def list_feishu_identities(self, person_id: int | None = None) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            query = "SELECT f.*,p.confirmed_name,pr.profile_name FROM feishu_identities f JOIN people p ON p.id=f.person_id JOIN profiles pr ON pr.id=f.profile_id"
+            rows = db.execute(query + (" WHERE f.person_id=?" if person_id else "") + " ORDER BY f.updated_at DESC", (person_id,) if person_id else ()).fetchall()
+        return [dict(x) for x in rows]
+
+    def create_person(self, name: str, notes: str = "") -> dict[str, Any]:
+        if not name.strip():
+            raise ValueError("姓名不能为空")
+        ts = now()
+        with self.connect() as db:
+            cur = db.execute("INSERT INTO people(confirmed_name,notes,created_at,updated_at) VALUES(?,?,?,?)", (name.strip(), notes, ts, ts))
+            return dict(db.execute("SELECT * FROM people WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    def rename_person(self, person_id: int, name: str, actor: str = "codex") -> dict[str, Any]:
+        if not name.strip():
+            raise ValueError("姓名不能为空")
+        with self.connect() as db:
+            db.execute("UPDATE people SET confirmed_name=?,updated_at=? WHERE id=?", (name.strip(), now(), person_id))
+            row = db.execute("SELECT * FROM people WHERE id=?", (person_id,)).fetchone()
+            if not row:
+                raise ValueError("人员不存在")
+            db.execute("INSERT INTO management_actions(action,actor,details_json,result,created_at) VALUES(?,?,?,?,?)", ("rename_person", actor, json.dumps({"person_id": person_id, "name": name.strip()}, ensure_ascii=False), "accepted", now()))
+            return dict(row)
+
+    def link_wechat_identity(self, person_id: int, source_account: str, sender_id: str, display_name: str = "") -> dict[str, Any]:
+        with self.connect() as db:
+            if not db.execute("SELECT 1 FROM people WHERE id=?", (person_id,)).fetchone():
+                raise ValueError("人员不存在")
+            db.execute("INSERT INTO wechat_identities(person_id,source_account,wechat_sender_id,last_display_name,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(source_account,wechat_sender_id) DO UPDATE SET person_id=excluded.person_id,last_display_name=excluded.last_display_name,status='confirmed',updated_at=excluded.updated_at", (person_id, source_account, sender_id, display_name, "confirmed", now(), now()))
+            db.execute("UPDATE confirmations SET person_id=?,status='confirmed',updated_at=? WHERE source_account=? AND wechat_sender_id=?", (person_id, now(), source_account, sender_id))
+            return dict(db.execute("SELECT w.*,p.confirmed_name FROM wechat_identities w JOIN people p ON p.id=w.person_id WHERE w.source_account=? AND w.wechat_sender_id=?", (source_account, sender_id)).fetchone())
+
+    def link_feishu_identity(self, person_id: int, profile_id: int, open_id: str, user_id: str = "", display_name: str = "") -> dict[str, Any]:
+        with self.connect() as db:
+            if not db.execute("SELECT 1 FROM people WHERE id=?", (person_id,)).fetchone():
+                raise ValueError("人员不存在")
+            db.execute("INSERT INTO feishu_identities(person_id,profile_id,open_id,user_id,display_name,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(profile_id,open_id) DO UPDATE SET person_id=excluded.person_id,user_id=excluded.user_id,display_name=excluded.display_name,updated_at=excluded.updated_at", (person_id, profile_id, open_id, user_id, display_name, now(), now()))
+            return dict(db.execute("SELECT f.*,p.confirmed_name,pr.profile_name FROM feishu_identities f JOIN people p ON p.id=f.person_id JOIN profiles pr ON pr.id=f.profile_id WHERE f.profile_id=? AND f.open_id=?", (profile_id, open_id)).fetchone())
+
+    def upsert_profile(self, profile_name: str, app_id: str, *, brand: str = "feishu", purpose: str = "mirror", protected: bool = False) -> dict[str, Any]:
+        ts = now()
+        with self.connect() as db:
+            db.execute("INSERT INTO profiles(profile_name,app_id,brand,purpose,protected,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(profile_name) DO UPDATE SET app_id=excluded.app_id,brand=excluded.brand,purpose=excluded.purpose,updated_at=excluded.updated_at", (profile_name, app_id, brand, purpose, int(protected), ts, ts))
+            return dict(db.execute("SELECT * FROM profiles WHERE profile_name=?", (profile_name,)).fetchone())
+
+    def update_profile_health(self, profile_name: str, *, bot_status: str, user_status: str, error: str | None = None) -> None:
+        with self.connect() as db:
+            db.execute("UPDATE profiles SET bot_status=?,user_status=?,last_error=?,last_checked_at=?,updated_at=? WHERE profile_name=?", (bot_status, user_status, error, now(), now(), profile_name))
+
+    def profile_has_bindings(self, profile_name: str) -> bool:
+        with self.connect() as db:
+            return bool(db.execute("SELECT 1 FROM bindings WHERE lark_profile=? AND archived=0 AND enabled=1 LIMIT 1", (profile_name,)).fetchone())
+
+    def list_bindings(self, include_archived: bool = True) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            where = "" if include_archived else "WHERE b.archived=0"
+            rows = db.execute(f"SELECT b.*,c.status control_status,s.cursor,w.pid,w.heartbeat_at,w.stopped_at FROM bindings b LEFT JOIN runtime_control c ON c.binding_id=b.id LEFT JOIN runtime_state s ON s.binding_id=b.id LEFT JOIN worker_leases w ON w.binding_id=b.id {where} ORDER BY b.id").fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["worker_alive"] = bool(item.get("stopped_at") is None and item.get("heartbeat_at") and now() - float(item["heartbeat_at"]) < 20)
+            result.append(item)
+        return result
+
+    def get_binding(self, binding_id: int) -> dict[str, Any] | None:
+        return next((x for x in self.list_bindings() if int(x["id"]) == int(binding_id)), None)
+
+    def create_binding(self, data: dict[str, Any]) -> dict[str, Any]:
+        required = ("wechat_chat_name", "wechat_talker", "feishu_chat_name", "feishu_chat_id", "lark_profile")
+        missing = [x for x in required if not str(data.get(x) or "").strip()]
+        if missing:
+            raise ValueError(f"缺少字段: {', '.join(missing)}")
+        source = str(data.get("source_account") or "default")
+        with self.connect() as db:
+            profile = db.execute("SELECT id,app_id,enabled FROM profiles WHERE profile_name=?", (data["lark_profile"],)).fetchone()
+            if not profile:
+                raise ValueError("Profile 不存在，请先同步或接入 Profile")
+            if not profile[2]:
+                raise ValueError("Profile 已停用")
+            if db.execute("SELECT 1 FROM bindings WHERE source_account=? AND wechat_talker=? AND archived=0", (source, data["wechat_talker"])).fetchone():
+                raise ValueError("该微信源群已有有效绑定")
+            if db.execute("SELECT 1 FROM bindings WHERE feishu_chat_id=? AND archived=0", (data["feishu_chat_id"],)).fetchone():
+                raise ValueError("该飞书目标群已有有效绑定")
+            ts = now()
+            cur = db.execute("INSERT INTO bindings(source_account,wechat_chat_name,wechat_talker,feishu_chat_name,feishu_chat_id,lark_profile,lark_app_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (source, data["wechat_chat_name"], data["wechat_talker"], data["feishu_chat_name"], data["feishu_chat_id"], data["lark_profile"], data.get("lark_app_id") or profile[1], ts, ts))
+            bid = cur.lastrowid
+            db.execute("INSERT INTO runtime_control(binding_id,status,reason,actor,updated_at) VALUES(?,?,?,?,?)", (bid, "stopped", "new binding", "manager", ts))
+            db.execute("INSERT INTO runtime_state(binding_id,cursor,updated_at) VALUES(?,?,?)", (bid, int(data.get("initial_cursor", 0)), ts))
+        return self.get_binding(int(bid)) or {}
+
+    def archive_binding(self, binding_id: int, actor: str = "codex") -> None:
+        with self.connect() as db:
+            db.execute("UPDATE bindings SET archived=1,enabled=0,updated_at=? WHERE id=?", (now(), binding_id))
+        self.set_control(binding_id, "stopped", actor, "binding archived")
+
+    def get_control(self, binding_id: int = 1) -> dict[str, Any]:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM runtime_control WHERE binding_id=?", (binding_id,)).fetchone()
+        return dict(row) if row else {"binding_id": binding_id, "status": "stopped", "reason": None, "actor": None, "updated_at": 0}
+
+    def get_cursor(self, binding_id: int = 1) -> int:
+        with self.connect() as db:
+            row = db.execute("SELECT cursor FROM runtime_state WHERE binding_id=?", (binding_id,)).fetchone()
         return int(row[0]) if row else 0
 
-    def set_cursor(self, cursor: int) -> None:
+    def set_cursor(self, cursor: int, binding_id: int = 1) -> None:
+        ts = now()
         with self.connect() as db:
-            db.execute("INSERT INTO runtime_state(binding_id,cursor,last_success_at,updated_at) VALUES(1,?,?,?) ON CONFLICT(binding_id) DO UPDATE SET cursor=MAX(runtime_state.cursor,excluded.cursor),last_success_at=excluded.last_success_at,updated_at=excluded.updated_at", (int(cursor), time.time(), time.time()))
+            db.execute("INSERT INTO runtime_state(binding_id,cursor,last_success_at,updated_at) VALUES(?,?,?,?) ON CONFLICT(binding_id) DO UPDATE SET cursor=MAX(runtime_state.cursor,excluded.cursor),last_success_at=excluded.last_success_at,updated_at=excluded.updated_at", (binding_id, int(cursor), ts, ts))
 
-    def set_control(self, status: str, actor: str = "codex", reason: str | None = None) -> None:
-        now = time.time()
+    def set_control(self, binding_id: int | str, status: str | None = None, actor: str = "codex", reason: str | None = None) -> None:
+        # Keep the v0.1 call shape: set_control("paused", actor=...).
+        if status is None and isinstance(binding_id, str) and binding_id in STATUSES:
+            status, binding_id = binding_id, 1
+        if status not in STATUSES:
+            raise ValueError(f"invalid status: {status}")
+        bid = int(binding_id)
+        ts = now()
         with self.connect() as db:
-            db.execute(
-                """INSERT INTO runtime_control(binding_id,status,reason,actor,updated_at) VALUES(1,?,?,?,?)
-                   ON CONFLICT(binding_id) DO UPDATE SET status=excluded.status,reason=excluded.reason,actor=excluded.actor,updated_at=excluded.updated_at""",
-                (status, reason, actor, now),
-            )
-            db.execute("INSERT INTO management_actions(action,actor,binding_id,details_json,result,created_at) VALUES(?,?,?,?,?,?)", (status, actor, 1, json.dumps({"reason": reason}, ensure_ascii=False), "accepted", now))
+            db.execute("INSERT INTO runtime_control(binding_id,status,reason,actor,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(binding_id) DO UPDATE SET status=excluded.status,reason=excluded.reason,actor=excluded.actor,updated_at=excluded.updated_at", (bid, status, reason, actor, ts))
+            db.execute("INSERT INTO management_actions(action,actor,binding_id,details_json,result,created_at) VALUES(?,?,?,?,?,?)", (status, actor, bid, json.dumps({"reason": reason}, ensure_ascii=False), "accepted", ts))
 
-    def acquire_lease(self, pid: int | None = None) -> str:
+    def acquire_lease(self, binding_id: int = 1, pid: int | None = None) -> str:
         pid = pid or os.getpid()
         token = str(uuid.uuid4())
-        now = time.time()
+        ts = now()
         with self.connect() as db:
-            row = db.execute("SELECT pid,token,heartbeat_at,stopped_at FROM worker_leases WHERE binding_id=1").fetchone()
-            if row and row[3] is None and now - float(row[2]) < 20:
+            row = db.execute("SELECT pid,heartbeat_at,stopped_at FROM worker_leases WHERE binding_id=?", (binding_id,)).fetchone()
+            if row and row[2] is None and ts - float(row[1]) < 20:
                 raise RuntimeError(f"已有同步 worker 运行中（pid={row[0]}）")
-            db.execute("INSERT INTO worker_leases(binding_id,pid,token,started_at,heartbeat_at,stopped_at) VALUES(1,?,?,?,?,NULL) ON CONFLICT(binding_id) DO UPDATE SET pid=excluded.pid,token=excluded.token,started_at=excluded.started_at,heartbeat_at=excluded.heartbeat_at,stopped_at=NULL", (pid, token, now, now))
+            db.execute("INSERT INTO worker_leases(binding_id,pid,token,started_at,heartbeat_at,stopped_at) VALUES(?,?,?,?,?,NULL) ON CONFLICT(binding_id) DO UPDATE SET pid=excluded.pid,token=excluded.token,started_at=excluded.started_at,heartbeat_at=excluded.heartbeat_at,stopped_at=NULL", (binding_id, pid, token, ts, ts))
         return token
 
-    def heartbeat(self, token: str) -> None:
+    def heartbeat(self, token: str, binding_id: int = 1) -> None:
         with self.connect() as db:
-            db.execute("UPDATE worker_leases SET heartbeat_at=? WHERE binding_id=1 AND token=?", (time.time(), token))
+            db.execute("UPDATE worker_leases SET heartbeat_at=? WHERE binding_id=? AND token=?", (now(), binding_id, token))
 
-    def release_lease(self, token: str) -> None:
+    def release_lease(self, token: str, binding_id: int = 1) -> None:
         with self.connect() as db:
-            db.execute("UPDATE worker_leases SET stopped_at=?,heartbeat_at=? WHERE binding_id=1 AND token=?", (time.time(), time.time(), token))
+            db.execute("UPDATE worker_leases SET stopped_at=?,heartbeat_at=? WHERE binding_id=? AND token=?", (now(), now(), binding_id, token))
 
-    def get_lease(self) -> dict[str, Any] | None:
+    def get_lease(self, binding_id: int = 1) -> dict[str, Any] | None:
         with self.connect() as db:
-            row = db.execute("SELECT * FROM worker_leases WHERE binding_id=1").fetchone()
+            row = db.execute("SELECT * FROM worker_leases WHERE binding_id=?", (binding_id,)).fetchone()
         return dict(row) if row else None
 
-    def upsert_message(self, key: str, row: dict[str, Any], kind: str, state: str = "received", payload: dict[str, Any] | None = None) -> int:
-        now = time.time()
+    def resolve_sender(self, source_account: str, sender_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT w.*,p.confirmed_name FROM wechat_identities w LEFT JOIN people p ON p.id=w.person_id WHERE w.source_account=? AND w.wechat_sender_id=?", (source_account, sender_id)).fetchone()
+        return dict(row) if row else None
+
+    def record_sender(self, source_account: str, sender_id: str, display_name: str, confirmed_name: str | None = None, *, binding_id: int | None = None) -> int | None:
+        # Keep compatibility with v0.1 record_sender(sender_id, display, name, status).
+        if confirmed_name in {"confirmed", "pending", "rejected"}:
+            source_account, sender_id, display_name, confirmed_name = "default", source_account, sender_id, display_name
+        ts = now()
+        with self.connect() as db:
+            if confirmed_name:
+                person = db.execute("SELECT id FROM people WHERE confirmed_name=? AND status='active' LIMIT 1", (confirmed_name,)).fetchone()
+                person_id = int(person[0]) if person else int(db.execute("INSERT INTO people(confirmed_name,created_at,updated_at) VALUES(?,?,?) RETURNING id", (confirmed_name, ts, ts)).fetchone()[0])
+                status = "confirmed"
+            else:
+                person_id = None
+                status = "pending"
+            db.execute("INSERT INTO wechat_identities(person_id,source_account,wechat_sender_id,last_display_name,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(source_account,wechat_sender_id) DO UPDATE SET person_id=COALESCE(excluded.person_id,wechat_identities.person_id),last_display_name=excluded.last_display_name,status=excluded.status,updated_at=excluded.updated_at", (person_id, source_account, sender_id, display_name, status, ts, ts))
+            if not confirmed_name:
+                db.execute("INSERT INTO confirmations(source_account,wechat_sender_id,display_name,binding_id,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(source_account,wechat_sender_id) DO UPDATE SET display_name=excluded.display_name,binding_id=COALESCE(confirmations.binding_id,excluded.binding_id),updated_at=excluded.updated_at", (source_account, sender_id, display_name, binding_id, ts, ts))
+            return person_id
+
+    def confirm_sender(self, confirmation_id: int, name: str, actor: str = "codex") -> dict[str, Any]:
+        if not name.strip():
+            raise ValueError("姓名不能为空")
+        ts = now()
+        with self.connect() as db:
+            item = db.execute("SELECT * FROM confirmations WHERE id=?", (confirmation_id,)).fetchone()
+            if not item:
+                raise ValueError("待确认事项不存在")
+            person = db.execute("SELECT id FROM people WHERE confirmed_name=? AND status='active' LIMIT 1", (name.strip(),)).fetchone()
+            person_id = int(person[0]) if person else int(db.execute("INSERT INTO people(confirmed_name,created_at,updated_at) VALUES(?,?,?) RETURNING id", (name.strip(), ts, ts)).fetchone()[0])
+            db.execute("UPDATE confirmations SET person_id=?,status='confirmed',updated_at=? WHERE id=?", (person_id, ts, confirmation_id))
+            db.execute("UPDATE wechat_identities SET person_id=?,status='confirmed',updated_at=? WHERE source_account=? AND wechat_sender_id=?", (person_id, ts, item["source_account"], item["wechat_sender_id"]))
+            db.execute("INSERT INTO management_actions(action,actor,binding_id,details_json,result,created_at) VALUES(?,?,?,?,?,?)", ("confirm_sender", actor, item["binding_id"], json.dumps({"confirmation_id": confirmation_id, "name": name.strip()}, ensure_ascii=False), "accepted", ts))
+            return dict(db.execute("SELECT * FROM confirmations WHERE id=?", (confirmation_id,)).fetchone())
+
+    def claim_confirmation_notification(self, source_account: str, sender_id: str) -> dict[str, Any] | None:
+        """Atomically claim one pending reminder so parallel workers do not duplicate it."""
+        cutoff = now() - 60
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM confirmations WHERE source_account=? AND wechat_sender_id=?", (source_account, sender_id)).fetchone()
+            if not row or row["status"] != "pending" or not (row["notification_status"] in {"pending", "failed"} or (row["notification_status"] == "sending" and float(row["updated_at"]) < cutoff)):
+                return None
+            db.execute("UPDATE confirmations SET notification_status='sending',updated_at=? WHERE id=?", (now(), row["id"]))
+            return dict(db.execute("SELECT * FROM confirmations WHERE id=? AND notification_status='sending'", (row["id"],)).fetchone())
+
+    def finish_confirmation_notification(self, confirmation_id: int, *, error: str | None = None) -> None:
+        with self.connect() as db:
+            db.execute("UPDATE confirmations SET notification_status=?,last_error=?,updated_at=? WHERE id=?", ("failed" if error else "sent", error, now(), confirmation_id))
+
+    def list_confirmations(self, status: str | None = "pending") -> list[dict[str, Any]]:
+        with self.connect() as db:
+            query = "SELECT c.*,b.wechat_chat_name FROM confirmations c LEFT JOIN bindings b ON b.id=c.binding_id"
+            rows = db.execute(query + (" WHERE c.status=?" if status else "") + " ORDER BY c.updated_at DESC", (status,) if status else ()).fetchall()
+        return [dict(x) for x in rows]
+
+    def upsert_message(self, key: str, row: dict[str, Any], kind: str, state: str = "received", *, binding_id: int = 1, source_account: str = "default", payload: dict[str, Any] | None = None, quoted_message_key: str | None = None) -> int:
+        ts = now()
         safe_payload = payload or {k: row.get(k) for k in ("talker", "local_id", "server_id", "sender_wxid", "sender", "kind_name", "text", "content", "time") if k in row}
         with self.connect() as db:
-            db.execute(
-                """INSERT INTO messages(binding_id,wechat_message_key,local_id,server_id,sender_wxid,sender_name,kind,payload_json,state,created_at,updated_at)
-                   VALUES(1,?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(binding_id,wechat_message_key) DO UPDATE SET updated_at=excluded.updated_at""",
-                (key, row.get("local_id"), str(row.get("server_id") or ""), row.get("sender_wxid"), row.get("sender"), kind, json.dumps(safe_payload, ensure_ascii=False, default=str), state, now, now),
-            )
-            found = db.execute("SELECT id FROM messages WHERE binding_id=1 AND wechat_message_key=?", (key,)).fetchone()
+            db.execute("INSERT INTO messages(binding_id,source_account,wechat_message_key,local_id,server_id,sender_wxid,sender_name,kind,payload_json,quoted_message_key,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(binding_id,wechat_message_key) DO UPDATE SET updated_at=excluded.updated_at", (binding_id, source_account, key, row.get("local_id"), str(row.get("server_id") or ""), row.get("sender_wxid"), row.get("sender"), kind, json.dumps(safe_payload, ensure_ascii=False, default=str), quoted_message_key, state, ts, ts))
+            found = db.execute("SELECT id FROM messages WHERE binding_id=? AND wechat_message_key=?", (binding_id, key)).fetchone()
         return int(found[0])
 
-    def message_state(self, key: str) -> str | None:
+    def message_state(self, key: str, binding_id: int = 1) -> str | None:
         with self.connect() as db:
-            row = db.execute("SELECT state FROM messages WHERE binding_id=1 AND wechat_message_key=?", (key,)).fetchone()
+            row = db.execute("SELECT state FROM messages WHERE binding_id=? AND wechat_message_key=?", (binding_id, key)).fetchone()
         return str(row[0]) if row else None
 
-    def mark_message(self, key: str, state: str, *, feishu_message_id: str | None = None, idempotency_key: str | None = None, error: str | None = None) -> None:
+    def find_message_by_server_id(self, binding_id: int, server_id: str) -> dict[str, Any] | None:
         with self.connect() as db:
-            db.execute("UPDATE messages SET state=?,feishu_message_id=COALESCE(?,feishu_message_id),idempotency_key=COALESCE(?,idempotency_key),last_error=?,attempts=attempts+1,updated_at=? WHERE binding_id=1 AND wechat_message_key=?", (state, feishu_message_id, idempotency_key, error, time.time(), key))
+            row = db.execute("SELECT * FROM messages WHERE binding_id=? AND server_id=? ORDER BY id DESC LIMIT 1", (binding_id, str(server_id))).fetchone()
+        return dict(row) if row else None
+
+    def mark_message(self, key: str, state: str, *, binding_id: int = 1, feishu_message_id: str | None = None, idempotency_key: str | None = None, error: str | None = None, sender_person_id: int | None = None, sender_name: str | None = None) -> None:
+        with self.connect() as db:
+            db.execute("UPDATE messages SET state=?,feishu_message_id=COALESCE(?,feishu_message_id),idempotency_key=COALESCE(?,idempotency_key),last_error=?,sender_person_id=COALESCE(?,sender_person_id),sender_name=COALESCE(?,sender_name),attempts=attempts+1,updated_at=? WHERE binding_id=? AND wechat_message_key=?", (state, feishu_message_id, idempotency_key, error, sender_person_id, sender_name, now(), binding_id, key))
 
     def add_media_job(self, message_id: int, media_type: str, source_ref: str | None, staging_path: str | None, state: str = "pending", error: str | None = None) -> None:
         with self.connect() as db:
-            db.execute("INSERT INTO media_jobs(message_id,media_type,source_ref,staging_path,state,error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", (message_id, media_type, source_ref, staging_path, state, error, time.time(), time.time()))
+            db.execute("INSERT INTO media_jobs(message_id,media_type,source_ref,staging_path,state,error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", (message_id, media_type, source_ref, staging_path, state, error, now(), now()))
 
-    def record_sender(self, sender_id: str, display_name: str, confirmed_name: str | None, status: str) -> None:
+    def status(self, binding_id: int = 1) -> dict[str, Any]:
+        control = self.get_control(binding_id)
+        lease = self.get_lease(binding_id)
         with self.connect() as db:
-            db.execute("INSERT INTO sender_mappings(binding_id,wechat_sender_id,wechat_display_name,confirmed_name,status,updated_at) VALUES(1,?,?,?,?,?) ON CONFLICT(binding_id,wechat_sender_id) DO UPDATE SET wechat_display_name=excluded.wechat_display_name,confirmed_name=excluded.confirmed_name,status=excluded.status,updated_at=excluded.updated_at", (sender_id, display_name, confirmed_name, status, time.time()))
-
-    def status(self) -> dict[str, Any]:
-        control = self.get_control()
-        lease = self.get_lease()
-        with self.connect() as db:
-            counts = {row[0]: row[1] for row in db.execute("SELECT state,COUNT(*) FROM messages WHERE binding_id=1 GROUP BY state")}
-            media_failed = db.execute("SELECT COUNT(*) FROM media_jobs WHERE state IN ('failed','manual','placeholder')").fetchone()[0]
-            pending_senders = db.execute("SELECT COUNT(*) FROM sender_mappings WHERE binding_id=1 AND status='pending'").fetchone()[0]
-            last = db.execute("SELECT local_id,sender_name,kind,state,updated_at FROM messages WHERE binding_id=1 ORDER BY updated_at DESC LIMIT 1").fetchone()
-        alive = False
-        if lease and lease.get("stopped_at") is None:
-            alive = time.time() - float(lease.get("heartbeat_at", 0)) < 20
-        return {"control": control, "worker": {"alive": alive, "pid": lease.get("pid") if lease else None, "heartbeat_at": lease.get("heartbeat_at") if lease else None, "started_at": lease.get("started_at") if lease else None}, "cursor": self.get_cursor(), "messages": counts, "media_failures": int(media_failed), "pending_senders": int(pending_senders), "last_message": dict(last) if last else None}
+            counts = {row[0]: row[1] for row in db.execute("SELECT state,COUNT(*) FROM messages WHERE binding_id=? GROUP BY state", (binding_id,))}
+            media_failed = db.execute("SELECT COUNT(*) FROM media_jobs m JOIN messages x ON x.id=m.message_id WHERE x.binding_id=? AND m.state IN ('failed','manual','placeholder')", (binding_id,)).fetchone()[0]
+            pending = db.execute("SELECT COUNT(*) FROM confirmations WHERE status='pending'").fetchone()[0]
+            last = db.execute("SELECT local_id,sender_name,kind,state,updated_at FROM messages WHERE binding_id=? ORDER BY updated_at DESC LIMIT 1", (binding_id,)).fetchone()
+        alive = bool(lease and lease.get("stopped_at") is None and now() - float(lease.get("heartbeat_at", 0)) < 20)
+        return {"control": control, "worker": {"alive": alive, "pid": lease.get("pid") if lease else None, "heartbeat_at": lease.get("heartbeat_at") if lease else None, "started_at": lease.get("started_at") if lease else None}, "cursor": self.get_cursor(binding_id), "messages": counts, "media_failures": int(media_failed), "pending_senders": int(pending), "last_message": dict(last) if last else None}

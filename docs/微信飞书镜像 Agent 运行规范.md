@@ -8,7 +8,7 @@
 
 ## Codex 管理流程
 
-当前方案中的 Codex 是按需参与的管理员。尚未配置持续巡检或事件唤醒，因此不能将它描述为已经持续运行的守护进程。正式 worker 已实现本节所需的进程控制和状态持久化；管理私聊入口、身份确认编排和补偿扫描仍在后续迭代。
+当前方案中的 Codex 是按需参与的管理员。尚未配置持续巡检或事件唤醒，因此不能将它描述为已经持续运行的守护进程。正式 worker 已实现本节所需的进程控制和状态持久化；管理台入口、身份确认记录和飞书私聊提醒已纳入 v0.2；补偿扫描仍由后续迭代处理。
 
 ### 一次启动会话
 
@@ -62,6 +62,17 @@ python agents/wechat_feishu_mirror.py stop \
 
 正式 worker 已提供上述子命令；Codex 负责在用户请求时调用它们、读取 SQLite 状态并反馈结果。
 
+多绑定和人员管理使用统一入口：
+
+```bash
+python -m agents.manage profiles --health
+python -m agents.manage bindings list
+python -m agents.manage bindings pause --id 1
+python -m agents.manage people list
+python -m agents.manage status
+python -m agents.manage serve
+```
+
 `status` 至少返回：进程是否存活、当前游标、最近心跳、最近成功消息、待发送数量、媒体失败数量、未知身份数量和最近错误。
 
 ## 暂停与恢复
@@ -96,7 +107,7 @@ media_jobs             媒体类型、staging 文件、上传状态、错误和�
 发现未知 ID 后：
 
 1. 先使用微信昵称同步；没有昵称则使用“未知发言人”。
-2. 通过飞书私聊向用户发送确认请求。
+2. 通过飞书私聊向配置的管理员发送一次确认请求；发送失败会保留错误并允许后续重试。
 3. 用户确认后写入 `sender_mappings`，只影响后续消息。
 4. 不因为一个未知 ID 阻塞其他成员消息。
 

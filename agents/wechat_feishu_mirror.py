@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import urllib.request
+import xml.etree.ElementTree as ET
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -62,6 +63,28 @@ def run_lark(config: dict[str, Any], args: list[str]) -> dict[str, Any]:
     return json.loads(proc.stdout)
 
 
+def notify_confirmation(config: dict[str, Any], store: MirrorStore, source_account: str, sender_id: str) -> None:
+    """Send one private reminder to the configured administrator."""
+    user_id = str(config.get("admin_feishu_user_id") or "").strip()
+    if not user_id or not sender_id:
+        return
+    item = store.claim_confirmation_notification(source_account, sender_id)
+    if not item:
+        return
+    groups = store.list_confirmations()
+    group_names = ", ".join(sorted({str(x.get("wechat_chat_name") or "") for x in groups if x.get("wechat_sender_id") == sender_id and x.get("wechat_chat_name")}))
+    text = f"微信群镜像待确认：编号 {item['id']}，昵称「{item.get('display_name') or '未知'}」，微信 ID {sender_id}"
+    if group_names:
+        text += f"，出现于：{group_names}"
+    try:
+        run_lark(config, ["+messages-send", "--user-id", user_id, "--text", text, "--idempotency-key", f"mirror-confirm-{item['id']}"])
+    except Exception as exc:
+        store.finish_confirmation_notification(int(item["id"]), error=str(exc)[:500])
+        print(f"身份提醒发送失败 confirmation_id={item['id']}: {exc}", file=sys.stderr, flush=True)
+    else:
+        store.finish_confirmation_notification(int(item["id"]))
+
+
 def clean_body(row: dict[str, Any]) -> str:
     kind = str(row.get("kind_name") or "text")
     raw = str(row.get("text") or row.get("content") or "").strip()
@@ -83,6 +106,32 @@ def clean_body(row: dict[str, Any]) -> str:
             return "\n".join(dict.fromkeys(pieces))
         return "[富文本消息]"
     return raw or "[空消息]"
+
+
+def quote_info(row: dict[str, Any]) -> dict[str, str] | None:
+    """Extract the stable parent message reference from WeChat type-57 XML."""
+    raw = str(row.get("text") or row.get("content") or "").strip()
+    if "<refermsg" not in raw:
+        return None
+    try:
+        root = ET.fromstring(raw)
+        parent = root.find(".//refermsg")
+        if parent is None:
+            return None
+        value = lambda tag: str(parent.findtext(tag) or "").strip()
+        sender = value("displayname") or "未知发言人"
+        content = value("content")
+        parent_id = value("svrid")
+        source = value("fromusr") or str(row.get("talker") or "")
+        if content.startswith("<"):
+            try:
+                nested = ET.fromstring(html.unescape(content))
+                content = (nested.findtext(".//title") or nested.findtext(".//des") or "[媒体或富文本]").strip()
+            except ET.ParseError:
+                content = "[媒体或富文本]"
+        return {"key": f"{source}:{parent_id}" if parent_id else "", "sender": sender, "content": content or "[原消息内容不可用]", "server_id": parent_id}
+    except ET.ParseError:
+        return None
 
 
 def sticker_url(row: dict[str, Any]) -> str | None:
@@ -118,7 +167,8 @@ def stage_media(row: dict[str, Any], kind: str) -> str | None:
         if not ext:
             ext = {"image": ".jpg", "video": ".mp4", "file": ".bin", "voice": ".ogg"}.get(kind, ".bin")
         MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-        path = MEDIA_DIR / f"{int(row.get('local_id') or 0)}{ext}"
+        namespace = hashlib.sha1(str(row.get("talker") or "default").encode()).hexdigest()[:10]
+        path = MEDIA_DIR / f"{namespace}-{int(row.get('local_id') or 0)}{ext}"
         path.write_bytes(payload)
         return str(path.relative_to(ROOT))
     except Exception as exc:
@@ -159,17 +209,18 @@ def stage_sticker(row: dict[str, Any]) -> str | None:
             return None
 
         local_id = int(row.get("local_id") or 0)
+        namespace = hashlib.sha1(str(row.get("talker") or "default").encode()).hexdigest()[:10]
         STICKER_DIR.mkdir(parents=True, exist_ok=True)
         # GIF preserves animated stickers. Other formats are emitted as PNG
         # because Feishu's image upload path accepts it consistently.
         if source_format == "GIF" and len(frames) > 1:
-            path = STICKER_DIR / f"{local_id}.gif"
+            path = STICKER_DIR / f"{namespace}-{local_id}.gif"
             frames[0].convert("P", palette=Image.Palette.ADAPTIVE).save(
                 path, save_all=True, append_images=[f.convert("P", palette=Image.Palette.ADAPTIVE) for f in frames[1:]],
                 duration=durations, loop=int(source.info.get("loop", 0) or 0), disposal=2, optimize=True,
             )
         else:
-            path = STICKER_DIR / f"{local_id}.png"
+            path = STICKER_DIR / f"{namespace}-{local_id}.png"
             frames[0].save(path, format="PNG", optimize=True)
         return str(path.relative_to(ROOT))
     except Exception as exc:
@@ -184,33 +235,42 @@ def message_key(row: dict[str, Any]) -> str:
 def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any], store: MirrorStore) -> None:
     msg_key = message_key(row)
     kind = str(row.get("kind_name") or "text")
+    quote = quote_info(row)
     # Store only the allowlisted fields selected by MirrorStore; message rows
     # can contain large base64/media fields that should not enter SQLite logs.
-    store.upsert_message(msg_key, row, kind)
-    if store.message_state(msg_key) in {"sent", "placeholder"}:
+    binding_id = int(config.get("binding_id", 1))
+    source_account = str(config.get("source_account", "default"))
+    store.upsert_message(msg_key, row, kind, binding_id=binding_id, source_account=source_account, quoted_message_key=quote.get("key") if quote else None)
+    if store.message_state(msg_key, binding_id) in {"sent", "placeholder"}:
         print(f"已跳过已完成消息 local_id={row.get('local_id')}", flush=True)
         return
     sender_id = str(row.get("sender_wxid") or "")
-    mapped_name = config.get("sender_map", {}).get(sender_id)
+    sender_record = store.resolve_sender(source_account, sender_id) if sender_id else None
+    mapped_name = (sender_record or {}).get("confirmed_name") or config.get("sender_map", {}).get(sender_id)
     display_name = str(row.get("sender") or "").strip()
     name = mapped_name or display_name or "未知发言人"
     if not mapped_name:
         # Continue mirroring with WeChat's display name while Codex asks the
         # administrator to confirm the person for future messages.
         pending_key = sender_id or f"unknown:{display_name or 'empty'}"
-        store.record_sender(pending_key, display_name, None, "pending")
+        store.record_sender(source_account, pending_key, display_name, None, binding_id=binding_id)
+        notify_confirmation(config, store, source_account, pending_key)
         state.setdefault("pending_senders", {})[pending_key] = {
             "display_name": row.get("sender", ""),
             "last_local_id": row.get("local_id"),
         }
         print(f"身份待确认，先使用显示名同步 local_id={row.get('local_id')} display={name}", file=sys.stderr, flush=True)
     else:
-        store.record_sender(sender_id, display_name, name, "confirmed")
+        store.record_sender(source_account, sender_id, display_name, name, binding_id=binding_id)
     body = clean_body(row)
+    quoted_parent = store.find_message_by_server_id(binding_id, quote["server_id"]) if quote and quote.get("server_id") else None
+    quoted_key = quote.get("key") if quote else None
+    if quote:
+        body = f"{body}\n> {quote['sender']}：{quote['content']}"
     # Feishu limits idempotency keys to 50 bytes; reserve room for the
     # per-part suffix used by a sticker's name/image pair.
     key = "wechat-mirror-" + hashlib.sha256(msg_key.encode()).hexdigest()[:26]
-    store.mark_message(msg_key, "processing", idempotency_key=key)
+    store.mark_message(msg_key, "processing", binding_id=binding_id, idempotency_key=key)
     try:
       if kind in {"sticker", "emoji"}:
         # A Feishu image message cannot carry a text caption. Send the sender
@@ -219,11 +279,11 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
         image_input = stage_sticker(row)
         if image_input:
             result = run_lark(config, ["+messages-send", "--chat-id", config["feishu_chat_id"], "--image", image_input, "--idempotency-key", key + "-image"])
-            store.add_media_job(store.upsert_message(msg_key, row, kind, state="processing"), kind, image_input, image_input, "uploaded")
+            store.add_media_job(store.upsert_message(msg_key, row, kind, state="processing", binding_id=binding_id, source_account=source_account), kind, image_input, image_input, "uploaded")
         else:
             result = run_lark(config, ["+messages-send", "--chat-id", config["feishu_chat_id"], "--text", f"{name}：[表情资源不可用]", "--idempotency-key", key + "-fallback"])
-            store.add_media_job(store.upsert_message(msg_key, row, kind, state="processing"), kind, None, None, "placeholder", "resource unavailable")
-            store.mark_message(msg_key, "placeholder", feishu_message_id=str((result.get("data") or {}).get("message_id") or ""), idempotency_key=key)
+            store.add_media_job(store.upsert_message(msg_key, row, kind, state="processing", binding_id=binding_id, source_account=source_account), kind, None, None, "placeholder", "resource unavailable")
+            store.mark_message(msg_key, "placeholder", binding_id=binding_id, feishu_message_id=str((result.get("data") or {}).get("message_id") or ""), idempotency_key=key)
             print(f"已同步 local_id={row.get('local_id')} sender={name} kind={kind}", flush=True)
             return
       elif kind in {"image", "video", "file", "voice", "audio", "media"}:
@@ -238,20 +298,23 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
             if media_flag == "--video":
                 media_flag = "--file"
             result = run_lark(config, ["+messages-send", "--chat-id", config["feishu_chat_id"], media_flag, media_input, "--idempotency-key", key + "-media"])
-            message_id = store.upsert_message(msg_key, row, kind, state="processing")
+            message_id = store.upsert_message(msg_key, row, kind, state="processing", binding_id=binding_id, source_account=source_account)
             store.add_media_job(message_id, kind, media_url(row), media_input, "uploaded")
         else:
             result = run_lark(config, ["+messages-send", "--chat-id", config["feishu_chat_id"], "--text", f"{name}：[资源不可用，待人工排查]", "--idempotency-key", key + "-fallback"])
-            message_id = store.upsert_message(msg_key, row, kind, state="processing")
+            message_id = store.upsert_message(msg_key, row, kind, state="processing", binding_id=binding_id, source_account=source_account)
             store.add_media_job(message_id, kind, media_url(row), None, "placeholder", "resource unavailable")
-            store.mark_message(msg_key, "placeholder", feishu_message_id=str((result.get("data") or {}).get("message_id") or ""), idempotency_key=key)
+            store.mark_message(msg_key, "placeholder", binding_id=binding_id, feishu_message_id=str((result.get("data") or {}).get("message_id") or ""), idempotency_key=key)
             print(f"已同步 local_id={row.get('local_id')} sender={name} kind={kind}（占位符）", flush=True)
             return
       else:
-        result = run_lark(config, ["+messages-send", "--chat-id", config["feishu_chat_id"], "--text", f"{name}：{body}", "--idempotency-key", key])
-      store.mark_message(msg_key, "sent", feishu_message_id=str((result.get("data") or {}).get("message_id") or ""), idempotency_key=key)
+        if quote and quoted_parent and quoted_parent.get("feishu_message_id"):
+            result = run_lark(config, ["+messages-reply", "--message-id", str(quoted_parent["feishu_message_id"]), "--text", f"{name}：{clean_body(row)}", "--idempotency-key", key])
+        else:
+            result = run_lark(config, ["+messages-send", "--chat-id", config["feishu_chat_id"], "--text", f"{name}：{body}", "--idempotency-key", key])
+      store.mark_message(msg_key, "sent", binding_id=binding_id, feishu_message_id=str((result.get("data") or {}).get("message_id") or ""), idempotency_key=key)
     except Exception as exc:
-      store.mark_message(msg_key, "failed", idempotency_key=key, error=str(exc)[:2000])
+      store.mark_message(msg_key, "failed", binding_id=binding_id, idempotency_key=key, error=str(exc)[:2000])
       raise
     print(f"已同步 local_id={row.get('local_id')} sender={name} kind={row.get('kind_name', 'text')}", flush=True)
 
@@ -259,12 +322,14 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
 def stream(config: dict[str, Any], state: dict[str, Any]) -> None:
     store = MirrorStore(config["sqlite_file"])
     store.initialize(config)
-    token = store.acquire_lease()
-    atexit.register(store.release_lease, token)
+    binding_id = int(config.get("binding_id", 1))
+    source_account = str(config.get("source_account", "default"))
+    token = store.acquire_lease(binding_id)
+    atexit.register(store.release_lease, token, binding_id)
     stop_heartbeat = threading.Event()
     def heartbeat() -> None:
         while not stop_heartbeat.wait(5):
-            store.heartbeat(token)
+            store.heartbeat(token, binding_id)
     heartbeat_thread = threading.Thread(target=heartbeat, name="mirror-heartbeat", daemon=True)
     heartbeat_thread.start()
     while True:
@@ -288,12 +353,12 @@ def stream(config: dict[str, Any], state: dict[str, Any]) -> None:
                     if row.get("talker") != config["wechat_talker"] or not isinstance(row.get("local_id"), int):
                         print("忽略非消息输出", file=sys.stderr, flush=True)
                         continue
-                    while store.get_control().get("status") == "paused":
+                    while store.get_control(binding_id).get("status") == "paused":
                         time.sleep(1)
                     send_row(config, row, state, store)
                     state["cursor"] = max(int(state.get("cursor", 0)), int(row.get("local_id") or 0))
-                    store.set_cursor(state["cursor"])
-                    store.heartbeat(token)
+                    store.set_cursor(state["cursor"], binding_id)
+                    store.heartbeat(token, binding_id)
                     save_json(Path(config["state_file"]), state)
                 except Exception as exc:  # keep tail alive; retry later
                     print(f"处理消息失败：{exc}", file=sys.stderr, flush=True)
@@ -316,12 +381,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("command", nargs="?", choices=("run", "start", "stop", "pause", "resume", "status"), default="run")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--binding-id", type=int, default=1, help="SQLite binding id")
     parser.add_argument("--once", action="store_true", help="启动一次 tail 快照，便于验收")
     args = parser.parse_args()
     config = load_json(args.config, {})
     state_path = Path(config.get("state_file", ROOT / "state" / "wechat_feishu_mirror.json"))
     if not state_path.is_absolute():
         state_path = ROOT / state_path
+    if args.binding_id != 1 and state_path.name == "wechat_feishu_mirror.json":
+        state_path = ROOT / "state" / "bindings" / f"{args.binding_id}.json"
     config["state_file"] = str(state_path)
     sqlite_path = Path(config.get("sqlite_file", ROOT / "state" / "wechat_feishu_mirror.sqlite3"))
     if not sqlite_path.is_absolute():
@@ -329,12 +397,24 @@ def main() -> int:
     config["sqlite_file"] = str(sqlite_path)
     store = MirrorStore(sqlite_path)
     store.initialize(config)
+    binding = store.get_binding(args.binding_id)
+    if binding:
+        config.update({
+            "binding_id": int(binding["id"]),
+            "source_account": binding["source_account"],
+            "wechat_chat_name": binding["wechat_chat_name"],
+            "wechat_talker": binding["wechat_talker"],
+            "feishu_chat_name": binding["feishu_chat_name"],
+            "feishu_chat_id": binding["feishu_chat_id"],
+            "lark_profile": binding["lark_profile"],
+            "lark_app_id": binding.get("lark_app_id"),
+        })
     if args.once:
-        state = load_json(state_path, {"cursor": config.get("initial_cursor", 0), "pending_senders": {}})
+        state = load_json(state_path, {"cursor": store.get_cursor(args.binding_id), "pending_senders": {}})
         # Migrate the prototype JSON cursor on the first formal start so the
         # SQLite store does not backfill messages already mirrored by it.
-        if int(state.get("cursor", 0)) > store.get_cursor():
-            store.set_cursor(int(state["cursor"]))
+        if int(state.get("cursor", 0)) > store.get_cursor(args.binding_id):
+            store.set_cursor(int(state["cursor"]), args.binding_id)
         config["poll_interval"] = 0.2
         # A bounded snapshot is useful in tests and never backfills history.
         cmd = [str(WECHAT_READER), "tail", "--talker", config["wechat_talker"], "--since-local-id", str(state.get("cursor", 0)),
@@ -343,14 +423,14 @@ def main() -> int:
         print(payload.stdout, end="")
         return 0
     if args.command == "status":
-        print(json.dumps(store.status(), ensure_ascii=False, indent=2))
+        print(json.dumps(store.status(args.binding_id), ensure_ascii=False, indent=2))
         return 0
     if args.command in {"pause", "resume"}:
-        store.set_control("paused" if args.command == "pause" else "running", actor="codex", reason=f"manual {args.command}")
-        print(json.dumps(store.status(), ensure_ascii=False, indent=2))
+        store.set_control(args.binding_id, "paused" if args.command == "pause" else "running", actor="codex", reason=f"manual {args.command}")
+        print(json.dumps(store.status(args.binding_id), ensure_ascii=False, indent=2))
         return 0
     if args.command == "stop":
-        lease = store.get_lease()
+        lease = store.get_lease(args.binding_id)
         if lease and lease.get("stopped_at") is None:
             pid = int(lease["pid"])
             try:
@@ -365,20 +445,20 @@ def main() -> int:
                     except ProcessLookupError:
                         break
                     time.sleep(0.2)
-            store.release_lease(str(lease["token"]))
-        store.set_control("stopped", actor="codex", reason="manual stop")
-        print(json.dumps(store.status(), ensure_ascii=False, indent=2))
+            store.release_lease(str(lease["token"]), args.binding_id)
+        store.set_control(args.binding_id, "stopped", actor="codex", reason="manual stop")
+        print(json.dumps(store.status(args.binding_id), ensure_ascii=False, indent=2))
         return 0
     if args.command == "start":
-        current = store.status()
+        current = store.status(args.binding_id)
         if current["worker"]["alive"]:
             print(json.dumps(current, ensure_ascii=False, indent=2))
             return 0
-        store.set_control("running", actor="codex", reason="manual start")
+        store.set_control(args.binding_id, "running", actor="codex", reason="manual start")
         log_path = ROOT / "logs" / "wechat_feishu_mirror.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8") as log:
-            child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "run", "--config", str(args.config.resolve())], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "run", "--config", str(args.config.resolve()), "--binding-id", str(args.binding_id)], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         time.sleep(0.4)
         print(json.dumps({"started_pid": child.pid, **store.status()}, ensure_ascii=False, indent=2))
         return 0
@@ -389,9 +469,9 @@ def main() -> int:
         except BlockingIOError:
             print("已有同步进程正在运行", file=sys.stderr)
             return 1
-        state = load_json(state_path, {"cursor": config.get("initial_cursor", 0), "pending_senders": {}})
-        if store.get_control().get("status") == "stopped":
-            store.set_control("running", actor="worker", reason="worker started")
+        state = load_json(state_path, {"cursor": store.get_cursor(args.binding_id), "pending_senders": {}})
+        if store.get_control(args.binding_id).get("status") == "stopped":
+            store.set_control(args.binding_id, "running", actor="worker", reason="worker started")
         state.get("pending_senders", {}).pop("", None)
         save_json(state_path, state)
         def stop(_signum: int, _frame: Any) -> None:

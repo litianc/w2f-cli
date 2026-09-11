@@ -1,9 +1,11 @@
 {
   "wechat_chat_name": "示例微信群",
+  "source_account": "default",
   "wechat_talker": "example_group@chatroom",
   "feishu_chat_name": "微信群镜像同步",
   "feishu_chat_id": "oc_example_chat_id",
   "lark_profile": "wechat-mirror",
+  "lark_app_id": "cli_example_mirror_app",
   "initial_cursor": 1130,
   "poll_interval": 2,
   "sqlite_file": "state/wechat_feishu_mirror.sqlite3",
