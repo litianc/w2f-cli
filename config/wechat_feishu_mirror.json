@@ -1,0 +1,16 @@
+{
+  "wechat_chat_name": "示例微信群",
+  "wechat_talker": "example_group@chatroom",
+  "feishu_chat_name": "微信群镜像同步",
+  "feishu_chat_id": "oc_example_chat_id",
+  "lark_profile": "wechat-mirror",
+  "initial_cursor": 1130,
+  "poll_interval": 2,
+  "sqlite_file": "state/wechat_feishu_mirror.sqlite3",
+  "state_file": "state/wechat_feishu_mirror.json",
+  "sender_map": {
+    "TC_bjtu": "小林",
+    "wxid_jxfvhf0j4kx422": "小周",
+    "wxid_t885sjomyz1i22": "小赵"
+  }
+}

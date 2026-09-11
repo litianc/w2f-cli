@@ -1,0 +1,18 @@
+# Runtime state and local secrets
+.auth-tmp/
+state/*.sqlite3
+state/*.sqlite3-*
+state/*.json
+state/*.lock
+
+# Logs and downloaded media
+logs/*.log
+staging/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.DS_Store
