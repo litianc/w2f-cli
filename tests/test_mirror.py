@@ -2,6 +2,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from io import BytesIO
+
+from PIL import Image
 
 from agents.storage import MirrorStore
 from agents import wechat_feishu_mirror as mirror
@@ -50,6 +53,16 @@ class MirrorStoreTest(unittest.TestCase):
             self.assertEqual(store.status(1)["messages"], {"received": 1})
             self.assertEqual(store.status(2)["messages"], {"received": 1})
 
+    def test_binding_name_audit_and_profile_disable_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MirrorStore(Path(directory) / "mirror.sqlite3")
+            store.initialize({"wechat_chat_name": "源", "wechat_talker": "talker", "feishu_chat_name": "目标", "feishu_chat_id": "chat", "lark_profile": "profile", "lark_app_id": "app", "sender_map": {}})
+            renamed = store.rename_binding(1, wechat_chat_name="新源", feishu_chat_name="新目标")
+            self.assertEqual((renamed["wechat_chat_name"], renamed["feishu_chat_name"]), ("新源", "新目标"))
+            store.set_control(1, "running", actor="test")
+            store.set_profile_enabled("profile", False)
+            self.assertEqual(store.get_control(1)["status"], "stopped")
+
 
 class MirrorFormattingTest(unittest.TestCase):
     def test_xml_url_and_unknown_sender_fallback(self):
@@ -80,6 +93,39 @@ class MirrorFormattingTest(unittest.TestCase):
             sent_text = send.call_args.args[1][send.call_args.args[1].index("--text") + 1]
             self.assertIn("> 原作者：原消息", sent_text)
             self.assertEqual(store.message_state("talker:2"), "sent")
+
+    def test_merged_forward_extracts_speakers_media_and_links(self):
+        xml = """<msg><appmsg><type>19</type><recorditem><![CDATA[
+        <datalist><dataitem><sourcename>甲</sourcename><datadesc>第一句 😀</datadesc></dataitem>
+        <dataitem><sourcename>乙</sourcename><type>3</type></dataitem>
+        <dataitem><sourcename>丙</sourcename><datadesc>文章</datadesc><url>https://example.test/a</url></dataitem>
+        </datalist>]]></recorditem></appmsg></msg>"""
+        self.assertTrue(mirror.is_forward_row({"kind_name": "app", "text": xml}))
+        body = mirror.clean_body({"kind_name": "app", "text": xml})
+        self.assertIn("甲：第一句 😀", body)
+        self.assertIn("乙：[图片]", body)
+        self.assertIn("丙：文章", body)
+        self.assertIn("https://example.test/a", body)
+
+    def test_reader_media_paths_uses_local_resource(self):
+        completed = type("Completed", (), {"returncode": 0, "stdout": '{"resources":[{"local_path":"/tmp/example.jpg"}]}', "stderr": ""})()
+        with patch.object(mirror.subprocess, "run", return_value=completed) as run:
+            with patch.object(Path, "is_file", return_value=True):
+                paths = mirror.reader_media_paths({"talker": "talker", "local_id": 9, "server_id": "s9"})
+        self.assertEqual(str(paths[0]), "/tmp/example.jpg")
+        self.assertIn("--include-local-paths", run.call_args.args[0])
+
+    def test_wechat_dat_decoder_accepts_xor_image(self):
+        image = Image.new("RGB", (2, 2), (255, 0, 0))
+        buf = BytesIO(); image.save(buf, format="JPEG")
+        original = buf.getvalue(); key = 0x37
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.dat"
+            source.write_bytes(bytes(byte ^ key for byte in original))
+            destination = Path(directory) / "decoded.dat"
+            self.assertTrue(mirror.decode_wechat_dat(source, destination))
+            with Image.open(destination.with_suffix(".jpg")) as decoded:
+                self.assertEqual(decoded.size, (2, 2))
 
     def test_unknown_sender_reminder_is_idempotent(self):
         with tempfile.TemporaryDirectory() as directory:

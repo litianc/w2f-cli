@@ -4,6 +4,8 @@ state/*.sqlite3
 state/*.sqlite3-*
 state/*.json
 state/*.lock
+data/
+config/*.local.json
 
 # Logs and downloaded media
 logs/*.log

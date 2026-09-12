@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -20,17 +21,81 @@ from typing import Any
 
 try:
     from .storage import MirrorStore
+    from .paths import CONFIG_DIR, DATA_DIR, DEFAULT_CONFIG as RUNTIME_CONFIG, EXAMPLE_CONFIG, config_path, runtime_paths, is_initialized
 except ImportError:
     from storage import MirrorStore
+    from paths import CONFIG_DIR, DATA_DIR, DEFAULT_CONFIG as RUNTIME_CONFIG, EXAMPLE_CONFIG, config_path, runtime_paths, is_initialized
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = ROOT / "config" / "wechat_feishu_mirror.json"
-DEFAULT_DB = ROOT / "state" / "wechat_feishu_mirror.sqlite3"
+DEFAULT_CONFIG = RUNTIME_CONFIG
+DEFAULT_DB = DATA_DIR / "wechat_feishu_mirror.sqlite3"
 READER = Path(os.environ.get("WECHAT_READER", str(Path.home() / ".codex/skills/wechat-cli/scripts/reader.sh")))
 
 
 def read_config(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    if not path.exists():
+        return {}
+    return runtime_paths(json.loads(path.read_text(encoding="utf-8")))
+
+
+def write_runtime_config(value: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    clean = dict(value)
+    # The config is safe to publish only when it contains references, never
+    # secrets.  lark-cli keeps App Secret and tokens in its own credential
+    # store; setup rejects secret-like keys here.
+    for key in ("app_secret", "app_secret_value", "access_token", "refresh_token"):
+        clean.pop(key, None)
+    path.write_text(json.dumps(clean, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def setup_status(config_path: Path, db_path: Path) -> dict[str, Any]:
+    cfg = read_config(config_path)
+    return {
+        "initialized": is_initialized(cfg, db_path),
+        "config_path": str(config_path),
+        "data_dir": str(Path(cfg.get("data_dir", DATA_DIR)).expanduser()),
+        "database": str(db_path),
+        "missing": [key for key in ("wechat_talker", "feishu_chat_id", "lark_profile") if not str(cfg.get(key) or "").strip()],
+    }
+
+
+def setup_init(config_path: Path, db_path: Path, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Create a resumable, non-secret runtime config.
+
+    Interactive prompts are deliberately small.  A JSON payload is supported
+    for Codex/UI automation and tests.  This command never starts a worker or
+    changes a Feishu group.
+    """
+    current = read_config(config_path)
+    values = dict(current)
+    if payload:
+        values.update({k: v for k, v in payload.items() if v is not None})
+    else:
+        prompts = (
+            ("source_account", "微信账号标识", "default"),
+            ("wechat_chat_name", "微信群名称", values.get("wechat_chat_name", "")),
+            ("wechat_talker", "微信群 talker", values.get("wechat_talker", "")),
+            ("feishu_chat_name", "飞书群名称", values.get("feishu_chat_name", "")),
+            ("feishu_chat_id", "飞书群 chat_id", values.get("feishu_chat_id", "")),
+            ("lark_profile", "lark-cli Profile 名称", values.get("lark_profile", "wechat-mirror")),
+            ("lark_app_id", "飞书 App ID", values.get("lark_app_id", "")),
+            ("admin_feishu_user_id", "管理员飞书 open_id（可留空）", values.get("admin_feishu_user_id", "")),
+        )
+        for key, label, default in prompts:
+            suffix = f" [{default}]" if default else ""
+            answer = input(f"{label}{suffix}: ").strip()
+            values[key] = answer or default
+    values = runtime_paths(values)
+    if not values.get("wechat_talker") or not values.get("feishu_chat_id") or not values.get("lark_profile"):
+        raise ValueError("尚未完成初始化：至少需要 wechat_talker、feishu_chat_id、lark_profile")
+    if db_path.exists():
+        backup = db_path.with_suffix(db_path.suffix + f".backup-{int(__import__('time').time())}")
+        shutil.copy2(db_path, backup)
+    write_runtime_config(values, config_path)
+    store = MirrorStore(db_path)
+    store.initialize(values)
+    return setup_status(config_path, db_path)
 
 
 def run_cli(argv: list[str], *, stdin: str | None = None) -> Any:
@@ -154,6 +219,13 @@ async function loadBindings(){let x=await api('/api/bindings');bindingsRows.inne
 async function loadPeople(){let x=await api('/api/people');peopleRows.innerHTML=x.map(p=>`<tr><td>${p.confirmed_name}</td><td>${p.wechat_identity_count}</td><td>${p.feishu_identity_count}</td><td><button onclick="renamePerson(${p.id},'${p.confirmed_name.replaceAll("'","\\'")}')">改名</button></td></tr>`).join('')||'<tr><td colspan="4">暂无人员</td></tr>';let c=await api('/api/confirmations');confirmRows.innerHTML=c.map(x=>`<tr><td>${x.id}</td><td>${x.display_name}</td><td>${x.wechat_sender_id}</td><td><button onclick="confirmPerson(${x.id})">确认姓名</button></td></tr>`).join('')||'<tr><td colspan="4">暂无待确认身份</td></tr>'}async function newPerson(){let n=prompt('实名');if(n)await api('/api/people',{method:'POST',body:JSON.stringify({op:'create',name:n})});loadPeople()}async function renamePerson(id,old){let n=prompt('新姓名',old);if(n)await api('/api/people',{method:'POST',body:JSON.stringify({op:'rename',id,name:n})});loadPeople()}async function confirmPerson(id){let n=prompt('确认实名');if(n)await api('/api/confirmations',{method:'POST',body:JSON.stringify({op:'confirm',id,name:n})});loadPeople()}
 </script></body></html>'''
 
+# Keep the prototype markup compact while layering the v0.3 safety/status
+# affordances without making the server depend on a frontend build step.
+HTML = HTML.replace('</header><main>', '</header><main><div id="setupNotice" class="muted"></div>')
+HTML = HTML.replace("<button onclick=\"health('${p.profile_name}')\">检查</button>", "<button onclick=\"health('${p.profile_name}')\">检查</button><button onclick=\"toggleProfile('${p.profile_name}',${p.enabled?'false':'true'})\">${p.enabled?'停用':'启用'}</button>")
+HTML = HTML.replace("<button onclick=\"baction(${b.id},'archive')\">归档</button>", "<button onclick=\"renameBinding(${b.id})\">改显示名</button><button onclick=\"renameFeishu(${b.id})\">改飞书群名</button><button onclick=\"baction(${b.id},'archive')\">归档</button>")
+HTML = HTML.replace('</script></body></html>', """async function loadSetup(){try{let x=await api('/api/setup');setupNotice.textContent=x.initialized?'运行数据已初始化：'+x.data_dir:'尚未完成初始化，请先运行 setup init；不会自动启动 Worker'}catch(e){setupNotice.textContent='初始化状态读取失败：'+e.message}}async function toggleProfile(name,enabled){if(!enabled&&!confirm('停用会停止该 Profile 的有效绑定，继续？'))return;await api('/api/profiles',{method:'POST',body:JSON.stringify({op:enabled?'enable':'disable',profile_name:name})});loadProfiles();loadBindings()}async function renameBinding(id){let w=prompt('新的微信群显示名');let f=prompt('新的飞书群显示名');if(w===null&&f===null)return;await api('/api/bindings',{method:'POST',body:JSON.stringify({op:'rename',id,wechat_chat_name:w,feishu_chat_name:f})});loadBindings()}async function renameFeishu(id){let n=prompt('新的飞书真实群名');if(!n||!confirm('确认修改飞书群真实名称？'))return;await api('/api/bindings',{method:'POST',body:JSON.stringify({op:'rename-feishu',id,name:n,confirm:true})});loadBindings()}loadSetup();</script></body></html>""")
+
 
 class Handler(BaseHTTPRequestHandler):
     store: MirrorStore
@@ -185,7 +257,9 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/bindings": self.send_json(self.store.list_bindings())
             elif parsed.path == "/api/people": self.send_json(self.store.list_people())
             elif parsed.path == "/api/confirmations": self.send_json(self.store.list_confirmations())
+            elif parsed.path == "/api/setup": self.send_json(setup_status(self.config_path, Path(self.store.path)))
             elif parsed.path == "/api/status": self.send_json({"bindings": self.store.list_bindings(), "confirmations": self.store.list_confirmations()})
+            elif parsed.path == "/api/media-failures": self.send_json(self.store.list_media_failures())
             elif parsed.path == "/api/search/wechat": self.send_json(search_wechat(urllib.parse.parse_qs(parsed.query).get("q", [""])[0]))
             elif parsed.path == "/api/search/feishu": self.send_json(search_feishu(urllib.parse.parse_qs(parsed.query).get("profile", [""])[0], urllib.parse.parse_qs(parsed.query).get("q", [""])[0]))
             else: self.send_json({"error": "not found"}, 404)
@@ -208,17 +282,31 @@ class Handler(BaseHTTPRequestHandler):
                     result = profile_list(self.store)
                 elif op == "rename":
                     result = run_cli(["lark-cli", "profile", "rename", data["old_name"], data["new_name"]]); result = profile_list(self.store)
+                elif op in {"disable", "enable"}:
+                    result = self.store.set_profile_enabled(data["profile_name"], op == "enable")
                 elif op == "remove":
                     p = next((x for x in self.store.list_profiles() if x["profile_name"] == data["profile_name"]), None)
                     if p and p["protected"]: raise ValueError("受保护 Profile 不能删除")
                     if self.store.profile_has_bindings(data["profile_name"]): raise ValueError("存在有效群绑定，不能删除")
                     result = run_cli(["lark-cli", "profile", "remove", data["profile_name"]]); result = profile_list(self.store)
                 else: raise ValueError("unsupported profile operation")
+            elif path == "/api/setup":
+                if data.get("op") != "init":
+                    raise ValueError("unsupported setup operation")
+                result = setup_init(self.config_path, Path(self.store.path), data.get("config"))
             elif path == "/api/bindings":
                 op = data.get("op")
                 if op == "create":
                     if len([x for x in self.store.list_bindings(False) if not x["archived"]]) >= 10: raise ValueError("最多支持 10 组有效绑定")
                     result = self.store.create_binding(data)
+                elif op == "rename":
+                    result = self.store.rename_binding(int(data["id"]), wechat_chat_name=data.get("wechat_chat_name"), feishu_chat_name=data.get("feishu_chat_name"))
+                elif op == "rename-feishu":
+                    if not data.get("confirm"): raise ValueError("修改飞书群名称需要 confirm=true")
+                    binding = self.store.get_binding(int(data["id"]))
+                    if not binding: raise ValueError("群绑定不存在")
+                    run_cli(["lark-cli", "--profile", binding["lark_profile"], "im", "+chat-update", "--as", "bot", "--chat-id", binding["feishu_chat_id"], "--name", data["name"], "--format", "json"])
+                    result = self.store.rename_binding(int(data["id"]), feishu_chat_name=data["name"])
                 elif op in {"start", "stop", "pause", "resume", "status", "archive"}: result = binding_action(self.store, self.config_path, int(data["id"]), op)
                 else: raise ValueError("unsupported binding operation")
             elif path == "/api/people":
@@ -247,10 +335,13 @@ def main() -> int:
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     sub = parser.add_subparsers(dest="command", required=True)
-    pr = sub.add_parser("profiles"); pr.add_argument("--health", action="store_true"); pr.add_argument("--op", choices=("sync", "add", "health", "rename", "remove"), default="sync"); pr.add_argument("--profile-name"); pr.add_argument("--app-id"); pr.add_argument("--app-secret"); pr.add_argument("--old-name"); pr.add_argument("--new-name")
+    pr = sub.add_parser("profiles"); pr.add_argument("--health", action="store_true"); pr.add_argument("--op", choices=("sync", "add", "health", "rename", "remove", "disable", "enable"), default="sync"); pr.add_argument("--profile-name"); pr.add_argument("--app-id"); pr.add_argument("--app-secret"); pr.add_argument("--old-name"); pr.add_argument("--new-name")
     b = sub.add_parser("bindings"); b.add_argument("action", choices=("list", "create", "start", "stop", "pause", "resume", "status", "archive")); b.add_argument("--id", type=int); b.add_argument("--data", help="JSON binding payload for create")
     p = sub.add_parser("people"); p.add_argument("action", choices=("list", "create", "rename", "confirm", "link-wechat", "link-feishu")); p.add_argument("--id", type=int); p.add_argument("--name"); p.add_argument("--data", help="JSON people payload")
     sub.add_parser("status")
+    setup = sub.add_parser("setup", help="检查或初始化本机运行数据")
+    setup.add_argument("action", choices=("status", "init", "check", "reset"), nargs="?", default="status")
+    setup.add_argument("--data", help="非交互 JSON 配置，不含 Secret")
     s = sub.add_parser("serve"); s.add_argument("--host", default="127.0.0.1"); s.add_argument("--port", type=int, default=0)
     # Accept global paths after the subcommand too, which is the natural form
     # when Codex invokes commands such as ``manage status --config ...``.
@@ -262,9 +353,28 @@ def main() -> int:
     db = db if db.is_absolute() else ROOT / db
     config_path = Path(args.config)
     config_path = config_path if config_path.is_absolute() else ROOT / config_path
-    config = read_config(config_path); config["sqlite_file"] = str(db)
-    store = MirrorStore(db); store.initialize(config)
-    if args.command == "profiles":
+    config = read_config(config_path)
+    config.setdefault("sqlite_file", str(db))
+    config = runtime_paths(config)
+    db = Path(config.get("sqlite_file", db)).expanduser()
+    seed_config = config if all(str(config.get(key) or "").strip() for key in ("wechat_talker", "feishu_chat_id", "lark_profile")) else {}
+    store = MirrorStore(db); store.initialize(seed_config)
+    if args.command == "setup":
+        if args.action == "status":
+            result = setup_status(config_path, db)
+        elif args.action == "check":
+            result = setup_status(config_path, db)
+            if not result["initialized"]:
+                raise ValueError("初始化未完成：" + ", ".join(result["missing"]))
+        elif args.action == "init":
+            payload = json.loads(args.data) if args.data else None
+            result = setup_init(config_path, db, payload)
+        else:
+            if db.exists():
+                backup = db.with_suffix(db.suffix + f".backup-{int(__import__('time').time())}")
+                db.replace(backup)
+            result = {"reset": True, **setup_status(config_path, db)}
+    elif args.command == "profiles":
         if args.op == "sync": result = profile_list(store)
         elif args.op == "health": result = profile_health(store, args.profile_name)
         elif args.op == "add":
@@ -274,6 +384,9 @@ def main() -> int:
         elif args.op == "rename":
             if not args.old_name or not args.new_name: raise ValueError("rename 需要 --old-name 和 --new-name")
             run_cli(["lark-cli", "profile", "rename", args.old_name, args.new_name]); result = profile_list(store)
+        elif args.op in {"disable", "enable"}:
+            if not args.profile_name: raise ValueError(f"{args.op} 需要 --profile-name")
+            result = store.set_profile_enabled(args.profile_name, args.op == "enable")
         else:
             if not args.profile_name: raise ValueError("remove 需要 --profile-name")
             p0 = next((x for x in store.list_profiles() if x["profile_name"] == args.profile_name), None)

@@ -15,6 +15,7 @@ import json
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -29,8 +30,10 @@ from PIL import Image
 
 try:
     from .storage import MirrorStore
+    from .paths import DATA_DIR, runtime_paths
 except ImportError:
     from storage import MirrorStore
+    from paths import DATA_DIR, runtime_paths
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,8 +41,8 @@ DEFAULT_CONFIG = ROOT / "config" / "wechat_feishu_mirror.json"
 WECHAT_READER = Path(os.environ.get("WECHAT_READER", str(Path.home() / ".codex/skills/wechat-cli/scripts/reader.sh")))
 STICKER_MAX_PX = 200
 STICKER_MAX_BYTES = 15 * 1024 * 1024
-STICKER_DIR = ROOT / "staging" / "stickers"
-MEDIA_DIR = ROOT / "staging" / "media"
+STICKER_DIR = DATA_DIR / "stickers"
+MEDIA_DIR = DATA_DIR / "media"
 
 
 def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
@@ -88,6 +91,11 @@ def notify_confirmation(config: dict[str, Any], store: MirrorStore, source_accou
 def clean_body(row: dict[str, Any]) -> str:
     kind = str(row.get("kind_name") or "text")
     raw = str(row.get("text") or row.get("content") or "").strip()
+    if is_forward_row(row):
+        items = forward_items(raw)
+        if items:
+            return format_forward_items(items)
+        return "[转发聊天记录内容暂不可用]"
     if kind in {"sticker", "emoji"}:
         return "[表情]"
     if kind in {"image", "video", "file", "voice", "audio", "media"}:
@@ -106,6 +114,72 @@ def clean_body(row: dict[str, Any]) -> str:
             return "\n".join(dict.fromkeys(pieces))
         return "[富文本消息]"
     return raw or "[空消息]"
+
+
+def is_forward_row(row: dict[str, Any]) -> bool:
+    kind = str(row.get("kind_name") or row.get("kind") or "").lower()
+    raw = str(row.get("text") or row.get("content") or "").lower()
+    return kind in {"forward", "merged_forward", "chat_history", "history"} or "<recorditem" in raw or "<datalist" in raw or "<type>19</type>" in raw
+
+
+def _xml_text(node: ET.Element | None, *tags: str) -> str:
+    if node is None:
+        return ""
+    for tag in tags:
+        value = node.findtext(f".//{tag}")
+        if value and value.strip():
+            return html.unescape(value).strip()
+    return ""
+
+
+def forward_items(raw: str, depth: int = 0) -> list[dict[str, Any]]:
+    """Extract readable entries from WeChat merged-forward XML.
+
+    WeChat has shipped both escaped and CDATA variants.  We intentionally
+    parse only allowlisted speaker/body/link/media fields and never forward
+    the original XML.
+    """
+    if depth > 3:
+        return [{"sender": "未知发言人", "body": "[嵌套转发层级过深]", "kind": "placeholder"}]
+    decoded = html.unescape(raw or "")
+    blocks = re.findall(r"<recorditem\b[^>]*>(.*?)</recorditem>", decoded, re.I | re.S)
+    if not blocks:
+        blocks = re.findall(r"<datalist\b[^>]*>(.*?)</datalist>", decoded, re.I | re.S)
+    if not blocks:
+        # Some readers already return the inner list without a wrapper.
+        blocks = [decoded] if re.search(r"<dataitem\b", decoded, re.I) else []
+    result: list[dict[str, Any]] = []
+    for block in blocks:
+        dataitems = re.findall(r"<dataitem\b[^>]*>.*?</dataitem>", block, re.I | re.S)
+        if not dataitems:
+            dataitems = re.findall(r"<item\b[^>]*>.*?</item>", block, re.I | re.S)
+        for item in dataitems or [block]:
+            try:
+                node = ET.fromstring(f"<root>{item}</root>")
+            except ET.ParseError:
+                node = None
+            sender = _xml_text(node, "sourcename", "displayname", "sendername", "fromusr") or "未知发言人"
+            body = _xml_text(node, "datadesc", "content", "title", "des")
+            url = _xml_text(node, "url", "lowurl")
+            msg_type = _xml_text(node, "type", "msgtype")
+            nested = body if "<recorditem" in body or "<datalist" in body else ""
+            if nested:
+                child = forward_items(nested, depth + 1)
+                result.append({"sender": sender, "body": format_forward_items(child, indent="  "), "kind": "nested"})
+                continue
+            if not body:
+                body = {"3": "[图片]", "4": "[语音]", "6": "[文件]", "43": "[视频]", "47": "[表情]"}.get(msg_type, "[原消息内容不可用]")
+            if body.startswith("<"):
+                body = re.sub(r"<[^>]+>", " ", body)
+                body = re.sub(r"\s+", " ", body).strip() or "[原消息内容不可用]"
+            if url and url not in body:
+                body = f"{body}\n{url}"
+            result.append({"sender": sender, "body": body, "kind": "media" if body.startswith("[") else "text"})
+    return result
+
+
+def format_forward_items(items: list[dict[str, Any]], indent: str = "") -> str:
+    return "\n".join(f"{indent}{item.get('sender') or '未知发言人'}：{item.get('body') or '[原消息内容不可用]'}" for item in items)
 
 
 def quote_info(row: dict[str, Any]) -> dict[str, str] | None:
@@ -151,8 +225,61 @@ def media_url(row: dict[str, Any]) -> str | None:
     return None
 
 
+def reader_media_paths(row: dict[str, Any]) -> list[Path]:
+    """Ask the read-only reader for local resources belonging to one message."""
+    talker = str(row.get("talker") or "")
+    local_id = str(row.get("local_id") or "")
+    if not talker or not local_id:
+        return []
+    cmd = [str(WECHAT_READER), "media", "--talker", talker, "--local-id", local_id, "--include-local-paths", "true"]
+    server_id = str(row.get("server_id") or "")
+    if server_id:
+        cmd.extend(["--server-id", server_id])
+    try:
+        proc = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, timeout=20)
+        if proc.returncode:
+            return []
+        payload = json.loads(proc.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+    found: list[Path] = []
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if "path" in str(key).lower() and isinstance(item, str) and item:
+                    path = Path(item).expanduser()
+                    if path.is_file():
+                        found.append(path)
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+    visit(payload)
+    # Preserve order while avoiding duplicate paths returned by debug fields.
+    return list(dict.fromkeys(found))
+
+
 def stage_media(row: dict[str, Any], kind: str) -> str | None:
-    """Download a normal image/video/file into the local retry staging area."""
+    """Stage a reader-provided local file, then fall back to a normal URL."""
+    local_candidates = reader_media_paths(row)
+    source_path = local_candidates[0] if local_candidates else None
+    media_dir = Path(os.environ.get("CHZ_MEDIA_DIR", str(MEDIA_DIR))).expanduser()
+    namespace = hashlib.sha1(str(row.get("talker") or "default").encode()).hexdigest()[:10]
+    local_id = int(row.get("local_id") or 0)
+    if source_path:
+        try:
+            media_dir.mkdir(parents=True, exist_ok=True)
+            suffix = source_path.suffix.lower() or {"image": ".jpg", "video": ".mp4", "voice": ".ogg", "file": ".bin"}.get(kind, ".bin")
+            path = media_dir / f"{namespace}-{local_id}{suffix}"
+            if kind == "image" and suffix == ".dat":
+                if not decode_wechat_dat(source_path, path):
+                    return None
+                path = next(media_dir.glob(f"{namespace}-{local_id}.*"), path)
+            else:
+                shutil.copy2(source_path, path)
+            return str(path)
+        except OSError as exc:
+            print(f"本地媒体暂存失败 local_id={local_id}: {exc}", file=sys.stderr, flush=True)
     url = media_url(row)
     if not url or not url.startswith(("http://", "https://")):
         return None
@@ -166,11 +293,10 @@ def stage_media(row: dict[str, Any], kind: str) -> str | None:
         ext = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "video/mp4": ".mp4", "audio/ogg": ".ogg"}.get(content_type)
         if not ext:
             ext = {"image": ".jpg", "video": ".mp4", "file": ".bin", "voice": ".ogg"}.get(kind, ".bin")
-        MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-        namespace = hashlib.sha1(str(row.get("talker") or "default").encode()).hexdigest()[:10]
-        path = MEDIA_DIR / f"{namespace}-{int(row.get('local_id') or 0)}{ext}"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        path = media_dir / f"{namespace}-{local_id}{ext}"
         path.write_bytes(payload)
-        return str(path.relative_to(ROOT))
+        return str(path)
     except Exception as exc:
         print(f"媒体下载失败 local_id={row.get('local_id')}: {exc}", file=sys.stderr, flush=True)
         return None
@@ -222,10 +348,43 @@ def stage_sticker(row: dict[str, Any]) -> str | None:
         else:
             path = STICKER_DIR / f"{namespace}-{local_id}.png"
             frames[0].save(path, format="PNG", optimize=True)
-        return str(path.relative_to(ROOT))
+        return str(path)
     except Exception as exc:
         print(f"贴图归一化失败 local_id={row.get('local_id')}: {exc}", file=sys.stderr, flush=True)
         return None
+
+
+def cleanup_staged(path: str | None) -> None:
+    if not path:
+        return
+    try:
+        Path(path).expanduser().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def decode_wechat_dat(source: Path, destination: Path) -> bool:
+    """Decode common one-byte-XOR WeChat image .dat files conservatively."""
+    try:
+        payload = source.read_bytes()
+    except OSError:
+        return False
+    signatures = ((b"\xff\xd8\xff", ".jpg"), (b"\x89PNG\r\n\x1a\n", ".png"), (b"GIF8", ".gif"), (b"RIFF", ".webp"))
+    for signature, extension in signatures:
+        if not payload:
+            break
+        key = payload[0] ^ signature[0]
+        decoded = bytes(byte ^ key for byte in payload)
+        if not decoded.startswith(signature):
+            continue
+        try:
+            image = Image.open(BytesIO(decoded))
+            image.verify()
+        except Exception:
+            continue
+        destination.with_suffix(extension).write_bytes(decoded)
+        return True
+    return False
 
 
 def message_key(row: dict[str, Any]) -> str:
@@ -280,6 +439,7 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
         if image_input:
             result = run_lark(config, ["+messages-send", "--chat-id", config["feishu_chat_id"], "--image", image_input, "--idempotency-key", key + "-image"])
             store.add_media_job(store.upsert_message(msg_key, row, kind, state="processing", binding_id=binding_id, source_account=source_account), kind, image_input, image_input, "uploaded")
+            cleanup_staged(image_input)
         else:
             result = run_lark(config, ["+messages-send", "--chat-id", config["feishu_chat_id"], "--text", f"{name}：[表情资源不可用]", "--idempotency-key", key + "-fallback"])
             store.add_media_job(store.upsert_message(msg_key, row, kind, state="processing", binding_id=binding_id, source_account=source_account), kind, None, None, "placeholder", "resource unavailable")
@@ -300,6 +460,7 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
             result = run_lark(config, ["+messages-send", "--chat-id", config["feishu_chat_id"], media_flag, media_input, "--idempotency-key", key + "-media"])
             message_id = store.upsert_message(msg_key, row, kind, state="processing", binding_id=binding_id, source_account=source_account)
             store.add_media_job(message_id, kind, media_url(row), media_input, "uploaded")
+            cleanup_staged(media_input)
         else:
             result = run_lark(config, ["+messages-send", "--chat-id", config["feishu_chat_id"], "--text", f"{name}：[资源不可用，待人工排查]", "--idempotency-key", key + "-fallback"])
             message_id = store.upsert_message(msg_key, row, kind, state="processing", binding_id=binding_id, source_account=source_account)
@@ -335,8 +496,8 @@ def stream(config: dict[str, Any], state: dict[str, Any]) -> None:
     while True:
         cursor = max(int(state.get("cursor", 0)), store.get_cursor())
         cmd = [str(WECHAT_READER), "tail", "--talker", config["wechat_talker"], "--since-local-id", str(cursor),
-               "--limit", "100", "--poll-interval", str(config.get("poll_interval", 2)), "--follow", "--jsonl",
-               "--include-media-paths", "false"]
+               "--limit", "100", "--poll-interval", str(config.get("poll_interval", 600)), "--follow", "--jsonl",
+               "--include-media-paths", "true"]
         proc = subprocess.Popen(cmd, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=1)
         assert proc.stdout is not None
         try:
@@ -384,14 +545,17 @@ def main() -> int:
     parser.add_argument("--binding-id", type=int, default=1, help="SQLite binding id")
     parser.add_argument("--once", action="store_true", help="启动一次 tail 快照，便于验收")
     args = parser.parse_args()
-    config = load_json(args.config, {})
-    state_path = Path(config.get("state_file", ROOT / "state" / "wechat_feishu_mirror.json"))
+    config = runtime_paths(load_json(args.config, {}))
+    if args.command in {"run", "start"} and not all(str(config.get(key) or "").strip() for key in ("wechat_talker", "feishu_chat_id", "lark_profile")):
+        print("尚未完成初始化，请先运行 python -m agents.manage setup init", file=sys.stderr)
+        return 2
+    state_path = Path(config.get("state_file", DATA_DIR / "state" / "wechat_feishu_mirror.json"))
     if not state_path.is_absolute():
         state_path = ROOT / state_path
     if args.binding_id != 1 and state_path.name == "wechat_feishu_mirror.json":
-        state_path = ROOT / "state" / "bindings" / f"{args.binding_id}.json"
+        state_path = state_path.parent / "bindings" / f"{args.binding_id}.json"
     config["state_file"] = str(state_path)
-    sqlite_path = Path(config.get("sqlite_file", ROOT / "state" / "wechat_feishu_mirror.sqlite3"))
+    sqlite_path = Path(config.get("sqlite_file", DATA_DIR / "wechat_feishu_mirror.sqlite3"))
     if not sqlite_path.is_absolute():
         sqlite_path = ROOT / sqlite_path
     config["sqlite_file"] = str(sqlite_path)
@@ -418,7 +582,7 @@ def main() -> int:
         config["poll_interval"] = 0.2
         # A bounded snapshot is useful in tests and never backfills history.
         cmd = [str(WECHAT_READER), "tail", "--talker", config["wechat_talker"], "--since-local-id", str(state.get("cursor", 0)),
-               "--limit", "10", "--mode", "snapshot", "--include-media-paths", "false"]
+               "--limit", "10", "--mode", "snapshot", "--include-media-paths", "true"]
         payload = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, check=True)
         print(payload.stdout, end="")
         return 0
@@ -455,7 +619,7 @@ def main() -> int:
             print(json.dumps(current, ensure_ascii=False, indent=2))
             return 0
         store.set_control(args.binding_id, "running", actor="codex", reason="manual start")
-        log_path = ROOT / "logs" / "wechat_feishu_mirror.log"
+        log_path = Path(config.get("log_dir", DATA_DIR / "logs")) / "wechat_feishu_mirror.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8") as log:
             child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "run", "--config", str(args.config.resolve()), "--binding-id", str(args.binding_id)], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)

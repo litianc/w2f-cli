@@ -270,6 +270,46 @@ class MirrorStore:
     def get_binding(self, binding_id: int) -> dict[str, Any] | None:
         return next((x for x in self.list_bindings() if int(x["id"]) == int(binding_id)), None)
 
+    def rename_binding(self, binding_id: int, *, wechat_chat_name: str | None = None, feishu_chat_name: str | None = None, actor: str = "codex") -> dict[str, Any]:
+        current = self.get_binding(binding_id)
+        if not current:
+            raise ValueError("群绑定不存在")
+        source = wechat_chat_name.strip() if wechat_chat_name is not None else current["wechat_chat_name"]
+        target = feishu_chat_name.strip() if feishu_chat_name is not None else current["feishu_chat_name"]
+        if not source or not target:
+            raise ValueError("群名称不能为空")
+        with self.connect() as db:
+            db.execute("UPDATE bindings SET wechat_chat_name=?,feishu_chat_name=?,updated_at=? WHERE id=?", (source, target, now(), binding_id))
+            db.execute("INSERT INTO management_actions(action,actor,binding_id,details_json,result,created_at) VALUES(?,?,?,?,?,?)", ("rename_binding", actor, binding_id, json.dumps({"before": {"wechat_chat_name": current["wechat_chat_name"], "feishu_chat_name": current["feishu_chat_name"]}, "after": {"wechat_chat_name": source, "feishu_chat_name": target}}, ensure_ascii=False), "accepted", now()))
+        return self.get_binding(binding_id) or {}
+
+    def set_profile_enabled(self, profile_name: str, enabled: bool, actor: str = "codex") -> dict[str, Any]:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM profiles WHERE profile_name=?", (profile_name,)).fetchone()
+            if not row:
+                raise ValueError("Profile 不存在")
+            db.execute("UPDATE profiles SET enabled=?,updated_at=? WHERE profile_name=?", (int(enabled), now(), profile_name))
+            if not enabled:
+                binding_ids = [int(r[0]) for r in db.execute("SELECT id FROM bindings WHERE lark_profile=? AND archived=0", (profile_name,)).fetchall()]
+            else:
+                binding_ids = []
+        for binding_id in binding_ids:
+            self.set_control(binding_id, "stopped", actor=actor, reason="Profile 已停用")
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM profiles WHERE profile_name=?", (profile_name,)).fetchone()
+        return dict(row) if row else {}
+
+    def list_media_failures(self, binding_id: int | None = None) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            query = "SELECT m.*,x.binding_id,x.wechat_message_key,x.local_id,x.sender_name FROM media_jobs m JOIN messages x ON x.id=m.message_id"
+            args: tuple[Any, ...] = ()
+            if binding_id is not None:
+                query += " WHERE x.binding_id=?"
+                args = (binding_id,)
+            query += " AND" if " WHERE " in query else " WHERE "
+            query += " m.state IN ('failed','manual','placeholder') ORDER BY m.updated_at DESC"
+            return [dict(row) for row in db.execute(query, args).fetchall()]
+
     def create_binding(self, data: dict[str, Any]) -> dict[str, Any]:
         required = ("wechat_chat_name", "wechat_talker", "feishu_chat_name", "feishu_chat_id", "lark_profile")
         missing = [x for x in required if not str(data.get(x) or "").strip()]
