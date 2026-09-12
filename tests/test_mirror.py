@@ -93,6 +93,16 @@ class MirrorFormattingTest(unittest.TestCase):
             self.assertEqual(store.message_state("talker:1"), "sent")
             self.assertEqual(store.status()["pending_senders"], 1)
 
+    def test_channel_video_uses_stable_page_link_without_signed_cdn_urls(self):
+        xml = '''<msg><appmsg><title>当前微信版本不支持展示该内容，请升级到最新版本。</title><type>51</type><url>https://support.weixin.qq.com/update/</url><finderFeed><objectId><![CDATA[14978452874204420608]]></objectId><objectNonceId><![CDATA[7434433790648304237_0_39_26_1_1789212716173352_b063c2da]]></objectNonceId><nickname><![CDATA[视频号作者]]></nickname><desc><![CDATA[京郊避暑天堂来了😀]]></desc><mediaList><media><url><![CDATA[https://wxapp.tc.qq.com/251/20302/stodownload?encfilekey=secret&token=short-lived]]></url></media></mediaList></finderFeed></appmsg></msg>'''
+        body = mirror.channel_video_body(xml)
+        self.assertIn('京郊避暑天堂来了😀', body)
+        self.assertIn('https://channels.weixin.qq.com/web/pages/feed?oid=', body)
+        self.assertIn('作者：视频号作者', body)
+        self.assertNotIn('encfilekey', body)
+        self.assertNotIn('stodownload', body)
+        self.assertNotIn('support.weixin.qq.com/update', body)
+
     def test_quote_info_extracts_parent_and_sends_fallback_context(self):
         xml = '<msg><appmsg><title>回复</title><refermsg><type>1</type><svrid>12345</svrid><fromusr>talker</fromusr><displayname>原作者</displayname><content>原消息</content></refermsg></appmsg></msg>'
         self.assertEqual(mirror.quote_info({"text": xml}), {"key": "talker:12345", "sender": "原作者", "content": "原消息", "server_id": "12345"})

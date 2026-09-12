@@ -149,6 +149,8 @@ def clean_body(row: dict[str, Any]) -> str:
         return "[转发聊天记录内容暂不可用]"
     if kind in {"sticker", "emoji"}:
         return "[表情]"
+    if kind == "channel_video":
+        return channel_video_body(raw)
     if kind in {"image", "video", "file", "voice", "audio", "media"}:
         labels = {"image": "图片", "video": "视频", "file": "文件", "voice": "语音", "audio": "语音", "media": "媒体"}
         return f"[{labels.get(kind, '媒体')}]"
@@ -165,6 +167,56 @@ def clean_body(row: dict[str, Any]) -> str:
             return "\n".join(dict.fromkeys(pieces))
         return "[富文本消息]"
     return raw or "[空消息]"
+
+
+def _cdata(value: str) -> str:
+    value = html.unescape(str(value or ""))
+    value = re.sub(r"^<!\[CDATA\[(.*?)\]\]>$", r"\1", value, flags=re.S)
+    return value.strip()
+
+
+def channel_video_body(raw: str) -> str:
+    """Render a WeChat Channels share as a stable page link.
+
+    Type-51 XML contains several signed CDN URLs (video, thumbnail, avatar),
+    often mixed with an upgrade/help URL. Those URLs expire and must not be
+    forwarded. ``objectId`` + ``objectNonceId`` gives a stable page address;
+    a short ``weixin.qq.com/sph/`` share URL is the fallback when available.
+    """
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        root = None
+    def values(tag: str) -> list[str]:
+        if root is None:
+            return []
+        return [_cdata(node.text or "") for node in root.findall(f".//{tag}") if _cdata(node.text or "")]
+    object_id = next(iter(values("objectId")), "")
+    nonce = next(iter(values("objectNonceId")), "")
+    share = next((u for u in re.findall(r"https?://[^\s<>\"']+", raw) if re.search(r"(?:weixin\.qq\.com/sph/|channels\.weixin\.qq\.com/)", u)), "")
+    if object_id and nonce:
+        url = "https://channels.weixin.qq.com/web/pages/feed?oid=" + urllib.parse.quote(object_id, safe="") + "&nid=" + urllib.parse.quote(nonce, safe="")
+    elif share:
+        url = html.unescape(share)
+    else:
+        url = ""
+    desc = next(iter(values("desc")), "")
+    title = next(iter(values("title")), "")
+    # Old clients use an upgrade notice as title while the real description is
+    # still present in finderFeed.
+    if not desc or "升级" in desc or "版本不支持" in desc:
+        desc = ""
+    if not desc and title and "升级" not in title and "版本不支持" not in title:
+        desc = title
+    creator = next(iter(values("nickname")), "")
+    lines = ["视频号" + (f"：{desc}" if desc else "")]
+    if creator:
+        lines.append(f"作者：{creator}")
+    if url:
+        lines.append(url)
+    else:
+        lines.append("[视频号链接暂不可用，待人工排查]")
+    return "\n".join(lines)
 
 
 def is_forward_row(row: dict[str, Any]) -> bool:
