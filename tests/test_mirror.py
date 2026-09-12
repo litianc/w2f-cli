@@ -22,7 +22,7 @@ class MirrorStoreTest(unittest.TestCase):
             config_text = config.read_text(encoding="utf-8")
             self.assertNotIn("must-not-persist", config_text)
             manage.setup_init(config, db, {"wechat_chat_name": "新源", "wechat_talker": "talker", "feishu_chat_id": "chat", "lark_profile": "profile"})
-            self.assertTrue(list(db.parent.glob("mirror.sqlite3.backup-*")))
+            self.assertTrue(list((db.parent / "backups").glob("mirror.sqlite3.*.bak")))
 
     def test_cursor_control_lease_and_idempotent_message(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -30,15 +30,14 @@ from PIL import Image
 
 try:
     from .storage import MirrorStore
-    from .paths import DATA_DIR, runtime_paths
+    from .paths import DATA_DIR, DEFAULT_CONFIG, runtime_paths
 except ImportError:
     from storage import MirrorStore
-    from paths import DATA_DIR, runtime_paths
+    from paths import DATA_DIR, DEFAULT_CONFIG, runtime_paths
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = ROOT / "config" / "wechat_feishu_mirror.json"
-WECHAT_READER = Path(os.environ.get("WECHAT_READER", str(Path.home() / ".codex/skills/wechat-cli/scripts/reader.sh")))
+WECHAT_READER = Path(os.environ.get("WECHAT_READER", str(Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "skills/wechat-cli/scripts/reader.sh")))
 STICKER_MAX_PX = 200
 STICKER_MAX_BYTES = 15 * 1024 * 1024
 STICKER_DIR = DATA_DIR / "stickers"
@@ -58,12 +57,64 @@ def save_json(path: Path, value: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+class CliError(RuntimeError):
+    def __init__(self, message, uncertain=False):
+        super().__init__(message)
+        self.uncertain = uncertain
+
+
+class DeliveryUncertain(RuntimeError):
+    pass
+
+
+class ControlChanged(RuntimeError):
+    pass
+
+
+def safe_error(exc):
+    text = str(exc)
+    text = re.sub(r'https?://[^\s"<>]+', '[链接已隐藏]', text)
+    text = re.sub(r'(?i)(aeskey|app.?secret|access.?token|refresh.?token)[\s:=\"\']+[^\s,<>]+', r'\1=[已隐藏]', text)
+    return text[:600]
+
+
 def run_lark(config: dict[str, Any], args: list[str]) -> dict[str, Any]:
-    cmd = ["lark-cli", "--profile", config["lark_profile"], "im", *args, "--as", "bot", "--format", "json"]
-    proc = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True)
+    # CLI local file flags require paths beneath cwd. Keep cwd in local data,
+    # never copy private media back into the source checkout.
+    arguments = list(args)
+    cwd = Path(config.get('data_dir', DATA_DIR)).expanduser().resolve()
+    cwd.mkdir(parents=True, exist_ok=True)
+    files = []
+    for i, argument in enumerate(arguments[:-1]):
+        if argument in {'--image','--file','--audio','--video','--video-cover'}:
+            value = Path(arguments[i+1])
+            if value.is_absolute():
+                files.append((i+1, value.resolve()))
+    if files:
+        cwd = Path(os.path.commonpath([str(value.parent) for _, value in files]))
+        for i, value in files:
+            arguments[i] = str(value.relative_to(cwd))
+    cmd = ['lark-cli','--profile',config['lark_profile'],'im',*arguments,'--as','bot','--format','json']
+    try:
+        proc = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, timeout=180,
+                              env={**os.environ,'LARKSUITE_CLI_NO_UPDATE_NOTIFIER':'1','LARKSUITE_CLI_NO_SKILLS_NOTIFIER':'1'})
+    except subprocess.TimeoutExpired:
+        raise CliError('飞书响应超时，发送结果待确认', uncertain=True) from None
     if proc.returncode:
-        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or f"lark-cli exit {proc.returncode}")
-    return json.loads(proc.stdout)
+        try:
+            error = json.loads(proc.stderr).get('error', {})
+        except ValueError:
+            error = {}
+        # A structured API rejection proves the operation was rejected. A
+        # transport/process failure does not prove it was never accepted.
+        raise CliError(safe_error(error.get('message') or '飞书 CLI 失败'), uncertain=not bool(error.get('code') or error.get('type') in {'validation','confirmation_required'}))
+    try:
+        result = json.loads(proc.stdout)
+    except ValueError:
+        raise CliError('飞书返回了不可识别的响应', uncertain=True) from None
+    if result.get('ok') is False:
+        raise CliError(safe_error(result.get('error')))
+    return result
 
 
 def notify_confirmation(config: dict[str, Any], store: MirrorStore, source_account: str, sender_id: str) -> None:
@@ -75,22 +126,22 @@ def notify_confirmation(config: dict[str, Any], store: MirrorStore, source_accou
     if not item:
         return
     groups = store.list_confirmations()
-    group_names = ", ".join(sorted({str(x.get("wechat_chat_name") or "") for x in groups if x.get("wechat_sender_id") == sender_id and x.get("wechat_chat_name")}))
+    group_names = ', '.join(sorted({g['wechat_chat_name'] for x in groups if x['source_account']==source_account and x['wechat_sender_id']==sender_id for g in (x.get('groups') or [{'wechat_chat_name':x.get('wechat_chat_name') or ''}])}))
     text = f"微信群镜像待确认：编号 {item['id']}，昵称「{item.get('display_name') or '未知'}」，微信 ID {sender_id}"
     if group_names:
         text += f"，出现于：{group_names}"
     try:
-        run_lark(config, ["+messages-send", "--user-id", user_id, "--text", text, "--idempotency-key", f"mirror-confirm-{item['id']}"])
+        run_lark({**config, "lark_profile": config.get("admin_profile") or "wechat-mirror"}, ["+messages-send", "--user-id", user_id, "--text", text, "--idempotency-key", f"mirror-confirm-{item['id']}"])
     except Exception as exc:
-        store.finish_confirmation_notification(int(item["id"]), error=str(exc)[:500])
-        print(f"身份提醒发送失败 confirmation_id={item['id']}: {exc}", file=sys.stderr, flush=True)
+        store.finish_confirmation_notification(int(item["id"]), error=safe_error(exc))
+        print(f"身份提醒发送失败 confirmation_id={item['id']}: {safe_error(exc)}", file=sys.stderr, flush=True)
     else:
         store.finish_confirmation_notification(int(item["id"]))
 
 
 def clean_body(row: dict[str, Any]) -> str:
     kind = str(row.get("kind_name") or "text")
-    raw = str(row.get("text") or row.get("content") or "").strip()
+    raw = str(row.get("text") or row.get("content") or "")
     if is_forward_row(row):
         items = forward_items(raw)
         if items:
@@ -119,7 +170,7 @@ def clean_body(row: dict[str, Any]) -> str:
 def is_forward_row(row: dict[str, Any]) -> bool:
     kind = str(row.get("kind_name") or row.get("kind") or "").lower()
     raw = str(row.get("text") or row.get("content") or "").lower()
-    return kind in {"forward", "merged_forward", "chat_history", "history"} or "<recorditem" in raw or "<datalist" in raw or "<type>19</type>" in raw
+    return kind in {"forward", "forward_chat", "merged_forward", "chat_history", "history"} or "<recorditem" in raw or "<datalist" in raw or "<type>19</type>" in raw
 
 
 def _xml_text(node: ET.Element | None, *tags: str) -> str:
@@ -133,49 +184,8 @@ def _xml_text(node: ET.Element | None, *tags: str) -> str:
 
 
 def forward_items(raw: str, depth: int = 0) -> list[dict[str, Any]]:
-    """Extract readable entries from WeChat merged-forward XML.
-
-    WeChat has shipped both escaped and CDATA variants.  We intentionally
-    parse only allowlisted speaker/body/link/media fields and never forward
-    the original XML.
-    """
-    if depth > 3:
-        return [{"sender": "未知发言人", "body": "[嵌套转发层级过深]", "kind": "placeholder"}]
-    decoded = html.unescape(raw or "")
-    blocks = re.findall(r"<recorditem\b[^>]*>(.*?)</recorditem>", decoded, re.I | re.S)
-    if not blocks:
-        blocks = re.findall(r"<datalist\b[^>]*>(.*?)</datalist>", decoded, re.I | re.S)
-    if not blocks:
-        # Some readers already return the inner list without a wrapper.
-        blocks = [decoded] if re.search(r"<dataitem\b", decoded, re.I) else []
-    result: list[dict[str, Any]] = []
-    for block in blocks:
-        dataitems = re.findall(r"<dataitem\b[^>]*>.*?</dataitem>", block, re.I | re.S)
-        if not dataitems:
-            dataitems = re.findall(r"<item\b[^>]*>.*?</item>", block, re.I | re.S)
-        for item in dataitems or [block]:
-            try:
-                node = ET.fromstring(f"<root>{item}</root>")
-            except ET.ParseError:
-                node = None
-            sender = _xml_text(node, "sourcename", "displayname", "sendername", "fromusr") or "未知发言人"
-            body = _xml_text(node, "datadesc", "content", "title", "des")
-            url = _xml_text(node, "url", "lowurl")
-            msg_type = _xml_text(node, "type", "msgtype")
-            nested = body if "<recorditem" in body or "<datalist" in body else ""
-            if nested:
-                child = forward_items(nested, depth + 1)
-                result.append({"sender": sender, "body": format_forward_items(child, indent="  "), "kind": "nested"})
-                continue
-            if not body:
-                body = {"3": "[图片]", "4": "[语音]", "6": "[文件]", "43": "[视频]", "47": "[表情]"}.get(msg_type, "[原消息内容不可用]")
-            if body.startswith("<"):
-                body = re.sub(r"<[^>]+>", " ", body)
-                body = re.sub(r"\s+", " ", body).strip() or "[原消息内容不可用]"
-            if url and url not in body:
-                body = f"{body}\n{url}"
-            result.append({"sender": sender, "body": body, "kind": "media" if body.startswith("[") else "text"})
-    return result
+    from integrations.forward_records import parse_record
+    return parse_record(raw, depth)
 
 
 def format_forward_items(items: list[dict[str, Any]], indent: str = "") -> str:
@@ -242,20 +252,17 @@ def reader_media_paths(row: dict[str, Any]) -> list[Path]:
         payload = json.loads(proc.stdout)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return []
-    found: list[Path] = []
-    def visit(value: Any) -> None:
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if "path" in str(key).lower() and isinstance(item, str) and item:
-                    path = Path(item).expanduser()
-                    if path.is_file():
-                        found.append(path)
-                visit(item)
-        elif isinstance(value, list):
-            for item in value:
-                visit(item)
-    visit(payload)
-    # Preserve order while avoiding duplicate paths returned by debug fields.
+    found = []
+    for resource in payload.get('data', payload).get('resources', []):
+        for value in resource.get('local_paths', []):
+            path = Path(value).expanduser()
+            if path.is_file():
+                found.append(path)
+        # Older reader versions used one local_path.
+        if resource.get('local_path'):
+            path = Path(resource['local_path']).expanduser()
+            if path.is_file():
+                found.append(path)
     return list(dict.fromkeys(found))
 
 
@@ -263,8 +270,8 @@ def stage_media(row: dict[str, Any], kind: str) -> str | None:
     """Stage a reader-provided local file, then fall back to a normal URL."""
     local_candidates = reader_media_paths(row)
     source_path = local_candidates[0] if local_candidates else None
-    media_dir = Path(os.environ.get("CHZ_MEDIA_DIR", str(MEDIA_DIR))).expanduser()
-    namespace = hashlib.sha1(str(row.get("talker") or "default").encode()).hexdigest()[:10]
+    media_dir = Path(os.environ.get("CHZ_MEDIA_DIR", str(row.get("media_dir") or MEDIA_DIR))).expanduser()
+    namespace = str(row.get("binding_id",1)) + "-" + hashlib.sha1(str(row.get("talker") or "default").encode()).hexdigest()[:10]
     local_id = int(row.get("local_id") or 0)
     if source_path:
         try:
@@ -273,23 +280,23 @@ def stage_media(row: dict[str, Any], kind: str) -> str | None:
             path = media_dir / f"{namespace}-{local_id}{suffix}"
             if kind == "image" and suffix == ".dat":
                 if not decode_wechat_dat(source_path, path):
-                    return None
-                path = next(media_dir.glob(f"{namespace}-{local_id}.*"), path)
+                    raise CliError('decode_failed: 无法解码本机图片资源')
+                path = next((media_dir / f"{namespace}-{local_id}{ext}" for ext in (".png",".jpg",".gif",".webp") if (media_dir / f"{namespace}-{local_id}{ext}").is_file()), path)
             else:
                 shutil.copy2(source_path, path)
             return str(path)
         except OSError as exc:
-            print(f"本地媒体暂存失败 local_id={local_id}: {exc}", file=sys.stderr, flush=True)
+            print(f"本地媒体暂存失败 local_id={local_id}: {type(exc).__name__}", file=sys.stderr, flush=True)
     url = media_url(row)
     if not url or not url.startswith(("http://", "https://")):
         return None
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "wechat-feishu-mirror/1.0"})
         with urllib.request.urlopen(request, timeout=20) as response:
-            payload = response.read(STICKER_MAX_BYTES + 1)
+            payload = response.read(100 * 1024 * 1024 + 1)
             content_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0].lower()
-        if len(payload) > STICKER_MAX_BYTES:
-            return None
+        if len(payload) > 100 * 1024 * 1024:
+            raise CliError('resource_too_large: 媒体下载超过 100 MB，等待人工处理')
         ext = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "video/mp4": ".mp4", "audio/ogg": ".ogg"}.get(content_type)
         if not ext:
             ext = {"image": ".jpg", "video": ".mp4", "file": ".bin", "voice": ".ogg"}.get(kind, ".bin")
@@ -298,8 +305,8 @@ def stage_media(row: dict[str, Any], kind: str) -> str | None:
         path.write_bytes(payload)
         return str(path)
     except Exception as exc:
-        print(f"媒体下载失败 local_id={row.get('local_id')}: {exc}", file=sys.stderr, flush=True)
-        return None
+        if isinstance(exc,CliError):raise
+        raise CliError('download_failed: 媒体下载失败 '+type(exc).__name__) from None
 
 
 def stage_sticker(row: dict[str, Any]) -> str | None:
@@ -335,22 +342,23 @@ def stage_sticker(row: dict[str, Any]) -> str | None:
             return None
 
         local_id = int(row.get("local_id") or 0)
-        namespace = hashlib.sha1(str(row.get("talker") or "default").encode()).hexdigest()[:10]
-        STICKER_DIR.mkdir(parents=True, exist_ok=True)
+        namespace = str(row.get("binding_id",1)) + "-" + hashlib.sha1(str(row.get("talker") or "default").encode()).hexdigest()[:10]
+        sticker_dir = Path(row.get("media_dir") or STICKER_DIR) / "stickers"
+        sticker_dir.mkdir(parents=True, exist_ok=True)
         # GIF preserves animated stickers. Other formats are emitted as PNG
         # because Feishu's image upload path accepts it consistently.
         if source_format == "GIF" and len(frames) > 1:
-            path = STICKER_DIR / f"{namespace}-{local_id}.gif"
+            path = sticker_dir / f"{namespace}-{local_id}.gif"
             frames[0].convert("P", palette=Image.Palette.ADAPTIVE).save(
                 path, save_all=True, append_images=[f.convert("P", palette=Image.Palette.ADAPTIVE) for f in frames[1:]],
                 duration=durations, loop=int(source.info.get("loop", 0) or 0), disposal=2, optimize=True,
             )
         else:
-            path = STICKER_DIR / f"{namespace}-{local_id}.png"
+            path = sticker_dir / f"{namespace}-{local_id}.png"
             frames[0].save(path, format="PNG", optimize=True)
         return str(path)
     except Exception as exc:
-        print(f"贴图归一化失败 local_id={row.get('local_id')}: {exc}", file=sys.stderr, flush=True)
+        print(f"贴图归一化失败 local_id={row.get('local_id')}: {type(exc).__name__}", file=sys.stderr, flush=True)
         return None
 
 
@@ -391,262 +399,376 @@ def message_key(row: dict[str, Any]) -> str:
     return f"{row.get('talker', '')}:{row.get('local_id', row.get('server_id', ''))}"
 
 
-def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any], store: MirrorStore) -> None:
-    msg_key = message_key(row)
-    kind = str(row.get("kind_name") or "text")
-    quote = quote_info(row)
-    # Store only the allowlisted fields selected by MirrorStore; message rows
-    # can contain large base64/media fields that should not enter SQLite logs.
-    binding_id = int(config.get("binding_id", 1))
-    source_account = str(config.get("source_account", "default"))
-    store.upsert_message(msg_key, row, kind, binding_id=binding_id, source_account=source_account, quoted_message_key=quote.get("key") if quote else None)
-    if store.message_state(msg_key, binding_id) in {"sent", "placeholder"}:
-        print(f"已跳过已完成消息 local_id={row.get('local_id')}", flush=True)
+def delivery_key(config, key, part):
+    scope = f"{config.get('source_account','default')}:{config.get('binding_id',1)}:{config.get('lark_app_id','')}:{config['feishu_chat_id']}:{key}:{part}"
+    return 'wx-' + hashlib.sha256(scope.encode()).hexdigest()[:40]
+
+
+def check_control(config, store):
+    if not config.get('_guard'):
         return
-    sender_id = str(row.get("sender_wxid") or "")
-    sender_record = store.resolve_sender(source_account, sender_id) if sender_id else None
-    mapped_name = (sender_record or {}).get("confirmed_name") or config.get("sender_map", {}).get(sender_id)
-    display_name = str(row.get("sender") or "").strip()
-    name = mapped_name or display_name or "未知发言人"
-    if not mapped_name:
-        # Continue mirroring with WeChat's display name while Codex asks the
-        # administrator to confirm the person for future messages.
-        pending_key = sender_id or f"unknown:{display_name or 'empty'}"
-        store.record_sender(source_account, pending_key, display_name, None, binding_id=binding_id)
-        notify_confirmation(config, store, source_account, pending_key)
-        state.setdefault("pending_senders", {})[pending_key] = {
-            "display_name": row.get("sender", ""),
-            "last_local_id": row.get("local_id"),
-        }
-        print(f"身份待确认，先使用显示名同步 local_id={row.get('local_id')} display={name}", file=sys.stderr, flush=True)
-    else:
-        store.record_sender(source_account, sender_id, display_name, name, binding_id=binding_id)
-    body = clean_body(row)
-    quoted_parent = store.find_message_by_server_id(binding_id, quote["server_id"]) if quote and quote.get("server_id") else None
-    quoted_key = quote.get("key") if quote else None
-    if quote:
-        body = f"{body}\n> {quote['sender']}：{quote['content']}"
-    # Feishu limits idempotency keys to 50 bytes; reserve room for the
-    # per-part suffix used by a sticker's name/image pair.
-    key = "wechat-mirror-" + hashlib.sha256(msg_key.encode()).hexdigest()[:26]
-    store.mark_message(msg_key, "processing", binding_id=binding_id, idempotency_key=key)
+    bid = int(config['binding_id'])
+    binding = store.get_binding(bid)
+    profile = next((p for p in store.list_profiles() if p['app_id'] == binding['lark_app_id']), None) if binding else None
+    if not binding or binding['archived'] or not binding['enabled'] or not profile or not profile['enabled'] or store.get_control(bid)['status'] != 'running':
+        raise ControlChanged('绑定已暂停、停止或应用不可用')
+    config.update(binding)
+    config['lark_profile'] = profile['profile_name']
+
+
+def send_part(config, store, message, part, arguments):
+    check_control(config, store)
+    record = store.prepare_delivery(message['id'], part, arguments, delivery_key(config, message['wechat_message_key'], part))
+    if record['state'] == 'sent':
+        return {'data': {'message_id': record['feishu_message_id']}}
+    if record['state'] in {'sending','uncertain'} and time.time() - (record['attempted_at'] or 0) > 3500:
+        store.set_delivery(message['id'], part, 'uncertain', error='发送回执缺失且已超过飞书去重窗口；请核对飞书消息后确认回执')
+        raise DeliveryUncertain('发送回执不确定，已停止后续发送，等待核对')
+    arguments = json.loads(record['payload_json'])
+    store.set_delivery(message['id'], part, 'sending')
     try:
-      if kind in {"sticker", "emoji"}:
-        # A Feishu image message cannot carry a text caption. Send the sender
-        # name as the adjacent text bubble, then upload the original sticker.
-        run_lark(config, ["+messages-send", "--chat-id", config["feishu_chat_id"], "--text", f"{name}：", "--idempotency-key", key + "-name"])
-        image_input = stage_sticker(row)
-        if image_input:
-            result = run_lark(config, ["+messages-send", "--chat-id", config["feishu_chat_id"], "--image", image_input, "--idempotency-key", key + "-image"])
-            store.add_media_job(store.upsert_message(msg_key, row, kind, state="processing", binding_id=binding_id, source_account=source_account), kind, image_input, image_input, "uploaded")
-            cleanup_staged(image_input)
-        else:
-            result = run_lark(config, ["+messages-send", "--chat-id", config["feishu_chat_id"], "--text", f"{name}：[表情资源不可用]", "--idempotency-key", key + "-fallback"])
-            store.add_media_job(store.upsert_message(msg_key, row, kind, state="processing", binding_id=binding_id, source_account=source_account), kind, None, None, "placeholder", "resource unavailable")
-            store.mark_message(msg_key, "placeholder", binding_id=binding_id, feishu_message_id=str((result.get("data") or {}).get("message_id") or ""), idempotency_key=key)
-            print(f"已同步 local_id={row.get('local_id')} sender={name} kind={kind}", flush=True)
-            return
-      elif kind in {"image", "video", "file", "voice", "audio", "media"}:
-        # Media messages have no reliable caption channel; keep the required
-        # real-name attribution as an adjacent text bubble.
-        run_lark(config, ["+messages-send", "--chat-id", config["feishu_chat_id"], "--text", f"{name}：", "--idempotency-key", key + "-name"])
-        media_input = stage_media(row, kind)
-        if media_input:
-            media_flag = "--audio" if kind in {"voice", "audio"} else "--video" if kind == "video" else "--image" if kind == "image" else "--file"
-            # Feishu video messages require a cover. Without a local cover,
-            # send the downloaded video as a file so the content is retained.
-            if media_flag == "--video":
-                media_flag = "--file"
-            result = run_lark(config, ["+messages-send", "--chat-id", config["feishu_chat_id"], media_flag, media_input, "--idempotency-key", key + "-media"])
-            message_id = store.upsert_message(msg_key, row, kind, state="processing", binding_id=binding_id, source_account=source_account)
-            store.add_media_job(message_id, kind, media_url(row), media_input, "uploaded")
-            cleanup_staged(media_input)
-        else:
-            result = run_lark(config, ["+messages-send", "--chat-id", config["feishu_chat_id"], "--text", f"{name}：[资源不可用，待人工排查]", "--idempotency-key", key + "-fallback"])
-            message_id = store.upsert_message(msg_key, row, kind, state="processing", binding_id=binding_id, source_account=source_account)
-            store.add_media_job(message_id, kind, media_url(row), None, "placeholder", "resource unavailable")
-            store.mark_message(msg_key, "placeholder", binding_id=binding_id, feishu_message_id=str((result.get("data") or {}).get("message_id") or ""), idempotency_key=key)
-            print(f"已同步 local_id={row.get('local_id')} sender={name} kind={kind}（占位符）", flush=True)
-            return
-      else:
-        if quote and quoted_parent and quoted_parent.get("feishu_message_id"):
-            result = run_lark(config, ["+messages-reply", "--message-id", str(quoted_parent["feishu_message_id"]), "--text", f"{name}：{clean_body(row)}", "--idempotency-key", key])
-        else:
-            result = run_lark(config, ["+messages-send", "--chat-id", config["feishu_chat_id"], "--text", f"{name}：{body}", "--idempotency-key", key])
-      store.mark_message(msg_key, "sent", binding_id=binding_id, feishu_message_id=str((result.get("data") or {}).get("message_id") or ""), idempotency_key=key)
+        result = run_lark(config, [*arguments, '--idempotency-key', record['idempotency_key']])
     except Exception as exc:
-      store.mark_message(msg_key, "failed", binding_id=binding_id, idempotency_key=key, error=str(exc)[:2000])
-      raise
-    print(f"已同步 local_id={row.get('local_id')} sender={name} kind={row.get('kind_name', 'text')}", flush=True)
+        # Retrying a definitive rejection is safe even beyond the remote UUID
+        # window. Unknown outcomes must preserve the original attempt time.
+        definite = isinstance(exc, CliError) and not exc.uncertain
+        store.set_delivery(message['id'], part, 'pending' if definite else 'uncertain', error=safe_error(exc))
+        if definite:
+            with store.connect() as db:
+                db.execute('UPDATE deliveries SET attempted_at=NULL WHERE message_id=? AND part=?', (message['id'],part))
+        raise
+    remote_id = str((result.get('data') or {}).get('message_id') or '')
+    if not remote_id:
+        store.set_delivery(message['id'], part, 'uncertain', error='飞书未返回消息 ID')
+        raise DeliveryUncertain('发送回执缺少消息 ID')
+    store.set_delivery(message['id'], part, 'sent', remote_id)
+    return result
 
 
-def stream(config: dict[str, Any], state: dict[str, Any]) -> None:
-    store = MirrorStore(config["sqlite_file"])
-    store.initialize(config)
-    binding_id = int(config.get("binding_id", 1))
-    source_account = str(config.get("source_account", "default"))
-    token = store.acquire_lease(binding_id)
-    atexit.register(store.release_lease, token, binding_id)
-    stop_heartbeat = threading.Event()
-    def heartbeat() -> None:
-        while not stop_heartbeat.wait(5):
-            store.heartbeat(token, binding_id)
-    heartbeat_thread = threading.Thread(target=heartbeat, name="mirror-heartbeat", daemon=True)
-    heartbeat_thread.start()
-    while True:
-        cursor = max(int(state.get("cursor", 0)), store.get_cursor())
-        cmd = [str(WECHAT_READER), "tail", "--talker", config["wechat_talker"], "--since-local-id", str(cursor),
-               "--limit", "100", "--poll-interval", str(config.get("poll_interval", 600)), "--follow", "--jsonl",
-               "--include-media-paths", "true"]
-        proc = subprocess.Popen(cmd, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=1)
-        assert proc.stdout is not None
-        try:
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                    if row.get("ok") is False:
-                        error = row.get("error", {})
-                        print(f"微信读取失败 code={error.get('code', 'unknown')}，从已保存游标重试", file=sys.stderr, flush=True)
-                        break
-                    if row.get("talker") != config["wechat_talker"] or not isinstance(row.get("local_id"), int):
-                        print("忽略非消息输出", file=sys.stderr, flush=True)
-                        continue
-                    while store.get_control(binding_id).get("status") == "paused":
-                        time.sleep(1)
-                    send_row(config, row, state, store)
-                    state["cursor"] = max(int(state.get("cursor", 0)), int(row.get("local_id") or 0))
-                    store.set_cursor(state["cursor"], binding_id)
-                    store.heartbeat(token, binding_id)
-                    save_json(Path(config["state_file"]), state)
-                except Exception as exc:  # keep tail alive; retry later
-                    print(f"处理消息失败：{exc}", file=sys.stderr, flush=True)
-                    # Restart from the last successful cursor instead of letting
-                    # a later success advance past this failed message.
-                    break
-        finally:
-            if proc.poll() is None:
-                proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-        print("微信 tail 已退出，5 秒后重连", file=sys.stderr, flush=True)
-        time.sleep(5)
+def resolve_name(store, config, sender_id, nickname, unique_key):
+    source = str(config.get('source_account','default'))
+    identity = store.resolve_sender(source, sender_id) if sender_id else None
+    if identity and identity.get('confirmed_name'):
+        return identity['confirmed_name'], identity.get('person_id')
+    # Without a stable ID, each observation stays separate from namesakes.
+    pending = sender_id or 'unidentified:' + unique_key
+    store.record_sender(source, pending, nickname, binding_id=int(config.get('binding_id',1)))
+    notify_confirmation(config, store, source, pending)
+    return nickname or '未知发言人', None
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("command", nargs="?", choices=("run", "start", "stop", "pause", "resume", "status"), default="run")
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--binding-id", type=int, default=1, help="SQLite binding id")
-    parser.add_argument("--once", action="store_true", help="启动一次 tail 快照，便于验收")
-    args = parser.parse_args()
-    config = runtime_paths(load_json(args.config, {}))
-    if args.command in {"run", "start"} and not all(str(config.get(key) or "").strip() for key in ("wechat_talker", "feishu_chat_id", "lark_profile")):
-        print("尚未完成初始化，请先运行 python -m agents.manage setup init", file=sys.stderr)
-        return 2
-    state_path = Path(config.get("state_file", DATA_DIR / "state" / "wechat_feishu_mirror.json"))
-    if not state_path.is_absolute():
-        state_path = ROOT / state_path
-    if args.binding_id != 1 and state_path.name == "wechat_feishu_mirror.json":
-        state_path = state_path.parent / "bindings" / f"{args.binding_id}.json"
-    config["state_file"] = str(state_path)
-    sqlite_path = Path(config.get("sqlite_file", DATA_DIR / "wechat_feishu_mirror.sqlite3"))
-    if not sqlite_path.is_absolute():
-        sqlite_path = ROOT / sqlite_path
-    config["sqlite_file"] = str(sqlite_path)
-    store = MirrorStore(sqlite_path)
-    store.initialize(config)
-    binding = store.get_binding(args.binding_id)
-    if binding:
-        config.update({
-            "binding_id": int(binding["id"]),
-            "source_account": binding["source_account"],
-            "wechat_chat_name": binding["wechat_chat_name"],
-            "wechat_talker": binding["wechat_talker"],
-            "feishu_chat_name": binding["feishu_chat_name"],
-            "feishu_chat_id": binding["feishu_chat_id"],
-            "lark_profile": binding["lark_profile"],
-            "lark_app_id": binding.get("lark_app_id"),
-        })
-    if args.once:
-        state = load_json(state_path, {"cursor": store.get_cursor(args.binding_id), "pending_senders": {}})
-        # Migrate the prototype JSON cursor on the first formal start so the
-        # SQLite store does not backfill messages already mirrored by it.
-        if int(state.get("cursor", 0)) > store.get_cursor(args.binding_id):
-            store.set_cursor(int(state["cursor"]), args.binding_id)
-        config["poll_interval"] = 0.2
-        # A bounded snapshot is useful in tests and never backfills history.
-        cmd = [str(WECHAT_READER), "tail", "--talker", config["wechat_talker"], "--since-local-id", str(state.get("cursor", 0)),
-               "--limit", "10", "--mode", "snapshot", "--include-media-paths", "true"]
-        payload = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, check=True)
-        print(payload.stdout, end="")
-        return 0
-    if args.command == "status":
-        print(json.dumps(store.status(args.binding_id), ensure_ascii=False, indent=2))
-        return 0
-    if args.command in {"pause", "resume"}:
-        store.set_control(args.binding_id, "paused" if args.command == "pause" else "running", actor="codex", reason=f"manual {args.command}")
-        print(json.dumps(store.status(args.binding_id), ensure_ascii=False, indent=2))
-        return 0
-    if args.command == "stop":
-        lease = store.get_lease(args.binding_id)
-        if lease and lease.get("stopped_at") is None:
-            pid = int(lease["pid"])
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+def split_text(text, byte_limit=12000):
+    parts, current, length = [], [], 0
+    for char in text:
+        size = len(char.encode('utf-8'))
+        if length + size > byte_limit:
+            parts.append(''.join(current)); current = []; length = 0
+        current.append(char); length += size
+    if current:
+        parts.append(''.join(current))
+    return parts or ['']
+
+
+def forward_body(row, config, store):
+    items = row.get('forward_items') or forward_items(str(row.get('text') or row.get('content') or ''))
+    def render(records, prefix=''):
+        lines=[]
+        for i,item in enumerate(records):
+            name,_ = resolve_name(store, config, item.get('sender_id',''), item.get('sender',''), f"{message_key(row)}:forward:{prefix}{i}")
+            lines.append(f"{name}：{item.get('body') or '[转发记录]'}")
+            if item.get('children'):
+                lines.extend('  '+line for line in render(item['children'], prefix+str(i)+'.'))
+        return lines
+    return '\n'.join(render(items)) if items else '[转发聊天记录内容暂不可用]'
+
+
+def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any], store: MirrorStore) -> None:
+    key = message_key(row); bid = int(config.get('binding_id',1))
+    kind = str(row.get('kind_name') or 'text')
+    store.upsert_message(key,row,kind,binding_id=bid,source_account=str(config.get('source_account','default')))
+    message = store.message(key,bid)
+    if message['state'] in {'sent','placeholder'} and not config.get('_retry_media'):
+        return
+    if config.get('_guard') and config.get('_check_profile'):
+        from agents.manage import profile_list
+        profile_list(store)
+    check_control(config,store)
+    # Freeze attribution on the first send attempt so a partially delivered
+    # message does not change names when it resumes.
+    if str(message.get('idempotency_key') or '').startswith('wx-'):
+        name, person = message['sender_name'], message.get('sender_person_id')
+    else:
+        name,person = resolve_name(store,config,str(row.get('sender_wxid') or ''),str(row.get('sender') or ''),key)
+    store.mark_message(key,'processing',binding_id=bid,sender_name=name,sender_person_id=person,idempotency_key=delivery_key(config,key,'message'))
+    message = store.message(key,bid)
+    send = lambda part,args: send_part(config,store,message,part,args)
+    target = ['+messages-send','--chat-id',config['feishu_chat_id']]
+    if config.get('_retry_media') and message.get('feishu_message_id'):
+        target=['+messages-reply','--message-id',message['feishu_message_id']]
+    placeholder = False
+    try:
+        if kind in {'sticker','emoji','image','video','file','voice','audio','media'}:
+            # A saved receipt lets an upload survive a crash after the file was
+            # deleted, without attempting to download an expired URL again.
+            sent_media = store.delivery(message['id'],'media')
+            fallback = store.delivery(message['id'],'fallback')
+            media_input = None
+            if sent_media and sent_media['state']=='sent':
+                result = {'data':{'message_id':sent_media['feishu_message_id']}}
+            elif fallback and fallback['state']=='sent' and not config.get('_retry_media'):
+                result = {'data':{'message_id':fallback['feishu_message_id']}}; placeholder=True
             else:
-                deadline = time.time() + 8
-                while time.time() < deadline:
+                label = {'sticker':'表情','emoji':'表情','image':'图片','video':'视频','file':'文件','voice':'语音','audio':'语音'}.get(kind,'媒体')
+                enriched = {**row,'binding_id':bid,'media_dir':config.get('media_dir', str(MEDIA_DIR))}
+                try:
+                    media_input = stage_sticker(enriched) if kind in {'sticker','emoji'} else stage_media(enriched,kind)
+                    if not media_input:
+                        raise CliError('resource_missing: 本机未找到可上传资源')
+                    if not config.get('_retry_media'):
+                        send('name',target+['--text',f'{name}：'])
+                    flag='--image' if kind in {'image','sticker','emoji'} else '--file'
+                    media_args = [flag,media_input]
+                    if kind=='video':
+                        cover = video_cover(Path(media_input))
+                        if cover:
+                            media_args=['--video',media_input,'--video-cover',str(cover)]
+                    elif kind in {'audio','voice'} and Path(media_input).suffix in {'.opus','.ogg'}:
+                        media_args=['--audio',media_input]
+                    result=send('media',target+media_args)
+                    store.add_media_job(message['id'],kind,None,media_input,'uploaded')
+                    cleanup_staged(media_input)
+                    if kind=='video' and cover: cleanup_staged(str(cover))
+                except CliError as exc:
+                    if exc.uncertain: raise
+                    result=send('fallback',target+['--text',f'{name}：[{label}资源不可用，待人工排查]'])
+                    store.add_media_job(message['id'],kind,None,media_input,'placeholder',safe_error(exc))
+                    placeholder=True
+        else:
+            plan_key=f'render:{message["id"]}'
+            plan=store.setting(plan_key)
+            if not plan:
+                body = forward_body(row,config,store) if is_forward_row(row) else clean_body(row)
+                quote=quote_info(row)
+                parent=store.find_message_by_server_id(bid,quote['server_id']) if quote and quote.get('server_id') else None
+                if quote and parent and parent.get('feishu_message_id'):
+                    target=['+messages-reply','--message-id',parent['feishu_message_id']]
+                elif quote:
+                    raw=str(row.get('text') or row.get('content') or '')
                     try:
-                        os.kill(pid, 0)
-                    except ProcessLookupError:
-                        break
-                    time.sleep(0.2)
-            store.release_lease(str(lease["token"]), args.binding_id)
-        store.set_control(args.binding_id, "stopped", actor="codex", reason="manual stop")
-        print(json.dumps(store.status(args.binding_id), ensure_ascii=False, indent=2))
+                        node=ET.fromstring(raw).find('.//refermsg')
+                        sender_id=node.findtext('chatusr') or node.findtext('fromusr') or ''
+                        if sender_id.endswith('@chatroom'): sender_id=''
+                    except (ET.ParseError,AttributeError): sender_id=''
+                    quoted_name,_=resolve_name(store,config,sender_id,quote['sender'],key+':quote')
+                    body += f"\n> {quoted_name}：{quote['content']}"
+                plan={'target':target,'parts':split_text(f'{name}：{body}'),'placeholder':is_forward_row(row) and body=='[转发聊天记录内容暂不可用]'}
+                store.save_setting(plan_key,plan)
+            for index,part in enumerate(plan['parts']):
+                result=send(f'text-{index}',plan['target']+['--text',part])
+            placeholder=plan['placeholder']
+        store.mark_message(key,'placeholder' if placeholder else 'sent',binding_id=bid,feishu_message_id=message['feishu_message_id'] if config.get('_retry_media') else str(result['data']['message_id']))
+    except Exception as exc:
+        store.mark_message(key,'failed',binding_id=bid,error=safe_error(exc))
+        raise
+    print(f'已同步 binding={bid} local_id={row.get("local_id")} kind={kind}',flush=True)
+
+
+def video_cover(path):
+    if not shutil.which('ffmpeg'):
+        return None
+    cover = path.with_suffix('.cover.jpg')
+    try:
+        result=subprocess.run(['ffmpeg','-v','error','-y','-i',str(path),'-frames:v','1','-vf','scale=640:-2',str(cover)],capture_output=True,timeout=30)
+        return cover if result.returncode==0 and cover.exists() else None
+    except (OSError,subprocess.TimeoutExpired): return None
+
+
+def source_page(config, cursor, high=None, after=None):
+    args=[str(WECHAT_READER),'sync-page','--talker',config['wechat_talker'],'--after-local-id',str(cursor),'--limit',str(config.get('page_size',100))]
+    if high is not None: args+=['--through-local-id',str(high)]
+    if after: args+=['--page-after-time',str(after['time']),'--page-after-local-id',str(after['local_id'])]
+    try:
+        proc=subprocess.run(args,cwd=ROOT,capture_output=True,text=True,timeout=60)
+        value=json.loads(proc.stdout)
+    except (OSError,subprocess.TimeoutExpired,ValueError):
+        raise RuntimeError('微信读取失败，请检查 CLI 和 sync-page 扩展') from None
+    if proc.returncode or value.get('ok') is False:
+        raise RuntimeError(safe_error(value.get('error',{})))
+    data=value.get('data',{})
+    if data.get('contract')!='ordered_sync_v1':
+        raise RuntimeError('读取器缺少完整分页契约，保留游标并停止补发')
+    return data
+
+
+def recover_once(config,store,reader=source_page):
+    """Ingest a fixed source interval durably, drain it, then advance cursor.
+
+    Both normal polling and offline recovery use this exact pipeline. No
+    sleeps between backlog pages, and no newer snapshot overtakes this one.
+    """
+    bid=int(config['binding_id']); check_control(config,store)
+    state=store.recovery(bid); base=store.get_cursor(bid)
+    if not state['initialized']:
+        page=reader(config,0)
+        store.initialize_cursor(bid,int(page['through_local_id']))
+        store.update_recovery(bid,phase='idle',remaining=0,last_scan_at=time.time())
         return 0
-    if args.command == "start":
-        current = store.status(args.binding_id)
-        if current["worker"]["alive"]:
-            print(json.dumps(current, ensure_ascii=False, indent=2))
-            return 0
-        store.set_control(args.binding_id, "running", actor="codex", reason="manual start")
-        log_path = Path(config.get("log_dir", DATA_DIR / "logs")) / "wechat_feishu_mirror.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a", encoding="utf-8") as log:
-            child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "run", "--config", str(args.config.resolve()), "--binding-id", str(args.binding_id)], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-        time.sleep(0.4)
-        print(json.dumps({"started_pid": child.pid, **store.status()}, ensure_ascii=False, indent=2))
-        return 0
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    with state_path.with_suffix(".lock").open("a") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            print("已有同步进程正在运行", file=sys.stderr)
-            return 1
-        state = load_json(state_path, {"cursor": store.get_cursor(args.binding_id), "pending_senders": {}})
-        if store.get_control(args.binding_id).get("status") == "stopped":
-            store.set_control(args.binding_id, "running", actor="worker", reason="worker started")
-        state.get("pending_senders", {}).pop("", None)
-        save_json(state_path, state)
-        def stop(_signum: int, _frame: Any) -> None:
-            raise KeyboardInterrupt
-        signal.signal(signal.SIGTERM, stop)
-        try:
-            stream(config, state)
-        except KeyboardInterrupt:
-            return 0
+    high=state.get('high'); after=state.get('after')
+    if not state.get('scan_complete'):
+        while True:
+            check_control(config,store)
+            page=reader(config,base,high,after)
+            if page.get('contract')!='ordered_sync_v1': raise RuntimeError('无完整分页契约')
+            high=int(page['through_local_id'])
+            rows=page['messages']
+            if high < base or (page['has_more'] and (not rows or page.get('next')==after)):
+                raise RuntimeError('源分页游标没有推进；保留同步位置')
+            for row in rows:
+                if row.get('talker')!=config['wechat_talker'] or not base < int(row['local_id']) <= high:
+                    raise RuntimeError('分页源群或消息范围不匹配')
+                store.upsert_message(message_key(row),row,row.get('kind_name','text'),binding_id=bid,source_account=config.get('source_account','default'))
+            after=page.get('next') or after
+            # Persist pagination only after every row in this page is durable.
+            store.update_recovery(bid,phase='scanning',high=high,after=after,scan_complete=not page['has_more'],remaining=len(store.pending_messages(bid)),last_scan_at=time.time(),error=None)
+            if not page['has_more']: break
+    pending=store.pending_messages(bid)
+    store.update_recovery(bid,phase='catching_up' if pending else 'idle',remaining=len(pending))
+    delivered=0
+    for item in pending:
+        check_control(config,store)
+        row=json.loads(item['payload_json'])
+        send_row(config,row,{},store)
+        delivered+=1
+        store.update_recovery(bid,phase='catching_up',remaining=len(pending)-delivered,last_delivery_at=time.time())
+    # No cursor can jump over an unsent row. A crash before this commit replays
+    # the same interval, whose saved receipts suppress duplicates.
+    store.set_cursor(int(high if high is not None else base),bid)
+    store.update_recovery(bid,phase='idle',remaining=0,high=None,after=None,scan_complete=False,error=None,completed_at=time.time())
+    return delivered
+
+
+def retry_media_jobs(config,store):
+    with store.connect() as db:
+        jobs=[dict(r) for r in db.execute("SELECT m.id,m.message_id,x.payload_json FROM media_jobs m JOIN messages x ON x.id=m.message_id WHERE x.binding_id=? AND m.state IN ('pending','processing') ORDER BY m.id",(config['binding_id'],))]
+    for job in jobs:
+        check_control(config,store)
+        with store.connect() as db:db.execute("UPDATE media_jobs SET state='processing' WHERE id=?",(job['id'],))
+        try:send_row({**config,'_retry_media':True},json.loads(job['payload_json']),{},store)
+        except Exception as exc:
+            with store.connect() as db:db.execute("UPDATE media_jobs SET state='failed',error=?,updated_at=? WHERE id=?",(safe_error(exc),time.time(),job['id']))
+            raise
+
+
+def expire_failed_media(config,store):
+    root=Path(config.get('media_dir',MEDIA_DIR)).resolve()
+    with store.connect() as db:
+        jobs=db.execute("SELECT id,staging_path FROM media_jobs WHERE state IN ('failed','placeholder','manual') AND updated_at<? AND staging_path IS NOT NULL",(time.time()-7*86400,)).fetchall()
+        for job in jobs:
+            path=Path(job['staging_path']).resolve()
+            if path.is_relative_to(root):path.unlink(missing_ok=True)
+            db.execute('UPDATE media_jobs SET staging_path=NULL WHERE id=?',(job['id'],))
+
+
+def stream(config, state=None):
+    store=MirrorStore(config['sqlite_file']); store.initialize()
+    bid=int(config['binding_id']); token=store.acquire_lease(bid)
+    stopped=threading.Event()
+    def heartbeat():
+        while not stopped.wait(5): store.heartbeat(token,bid)
+    thread=threading.Thread(target=heartbeat,daemon=True);thread.start()
+    try:
+        wait_until=0
+        while True:
+            binding=store.get_binding(bid)
+            control=store.get_control(bid)['status']
+            if control=='stopped' or binding['archived'] or not binding['enabled']: return
+            if control=='paused':
+                store.update_recovery(bid,phase='paused');time.sleep(0.5);wait_until=0;continue
+            if time.monotonic()<wait_until: time.sleep(0.5);continue
+            try:
+                # Reconcile CLI profile names/App IDs before each source pass.
+                from agents.manage import profile_list
+                profile_list(store)
+                check_control(config,store)
+                delivered = recover_once(config,store)
+                retry_media_jobs(config,store)
+                expire_failed_media(config,store)
+                wait_until=time.monotonic()+(0 if delivered else float(config.get('poll_interval',600)))
+            except ControlChanged:
+                wait_until=0
+            except Exception as exc:
+                phase='needs_review' if isinstance(exc,DeliveryUncertain) else 'disconnected'
+                store.update_recovery(bid,phase=phase,error=safe_error(exc),failed_at=time.time())
+                print(f'同步暂缓 binding={bid}: {safe_error(exc)}',file=sys.stderr,flush=True)
+                wait_until=time.monotonic()+min(60,float(config.get('poll_interval',600)))
+    finally:
+        stopped.set();thread.join(timeout=1);store.release_lease(token,bid)
+
+
+def worker_lock(store,bid):
+    directory=store.path.resolve().parent/'locks';directory.mkdir(parents=True,exist_ok=True)
+    return directory/f'binding-{bid}.lock'
+
+
+def main():
+    parser=argparse.ArgumentParser()
+    parser.add_argument('command',nargs='?',choices=('run','start','stop','pause','resume','status'),default='run')
+    parser.add_argument('--config',type=Path,default=DEFAULT_CONFIG)
+    parser.add_argument('--db',type=Path)
+    parser.add_argument('--binding-id',type=int,default=1)
+    parser.add_argument('--once',action='store_true',help='Read one source page without sending or advancing cursor')
+    args=parser.parse_args();config=runtime_paths(load_json(args.config,{}))
+    if args.db: config['sqlite_file']=str(args.db.resolve())
+    store=MirrorStore(config['sqlite_file']);store.initialize(config)
+    bid=args.binding_id;binding=store.get_binding(bid)
+    if not binding:
+        print(json.dumps({'error':'绑定不存在，请先完成管理台引导'},ensure_ascii=False));return 2
+    config.update(binding);config['binding_id']=bid;config['_guard']=True;config['_check_profile']=True
+    if args.once:
+        print(json.dumps(source_page(config,store.get_cursor(bid)),ensure_ascii=False));return 0
+    if args.command=='status':
+        print(json.dumps(store.status(bid),ensure_ascii=False,indent=2));return 0
+    if args.command in {'stop','pause','resume'}:
+        value={'stop':'stopped','pause':'paused','resume':'running'}[args.command]
+        store.set_control(bid,value,reason='manual '+args.command)
+        # Worker checks control between rows and while idle. No blind PID kill
+        # (a stale PID may refer to a different process).
+        if args.command=='stop':
+            deadline=time.monotonic()+8
+            while time.monotonic()<deadline and store.status(bid)['worker']['alive']: time.sleep(0.2)
+        print(json.dumps(store.status(bid),ensure_ascii=False,indent=2));return 0
+    if binding['archived'] or not binding['enabled']:
+        raise ValueError('已归档或停用的绑定不能启动')
+    profile=next((p for p in store.list_profiles() if p['app_id']==binding['lark_app_id']),None)
+    if not profile or not profile['enabled']: raise ValueError('发送应用已停用或缺失')
+    if args.command=='start':
+        # A launch lock serializes simultaneous UI/CLI starts while the child
+        # acquires its lifetime lock. Dead leases never defeat the file lock.
+        with worker_lock(store,bid).with_suffix('.launch').open('a') as launch:
+            fcntl.flock(launch,fcntl.LOCK_EX)
+            with worker_lock(store,bid).open('a') as check:
+                try: fcntl.flock(check,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                except BlockingIOError:
+                    print(json.dumps(store.status(bid),ensure_ascii=False));return 0
+                fcntl.flock(check,fcntl.LOCK_UN)
+            store.set_control(bid,'running',reason='manual start')
+            log=Path(config['log_dir'])/f'binding-{bid}.log';log.parent.mkdir(parents=True,exist_ok=True)
+            with log.open('a') as out:
+                child=subprocess.Popen([sys.executable,'-m','agents.wechat_feishu_mirror','run','--config',str(args.config.resolve()),'--db',str(store.path.resolve()),'--binding-id',str(bid)],cwd=ROOT,stdout=out,stderr=subprocess.STDOUT,start_new_session=True)
+            deadline=time.monotonic()+5
+            while time.monotonic()<deadline:
+                if child.poll() is not None: raise RuntimeError('Worker 启动失败，请查看绑定日志')
+                if store.status(bid)['worker']['alive']: break
+                time.sleep(0.1)
+            print(json.dumps(store.status(bid),ensure_ascii=False));return 0
+    with worker_lock(store,bid).open('a') as lock:
+        try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: return 1
+        def stop(signum, frame): raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM,stop)
+        try: stream(config)
+        except KeyboardInterrupt: pass
     return 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__=='__main__': raise SystemExit(main())
