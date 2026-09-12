@@ -80,6 +80,8 @@ def setup_init(config_path: Path, db_path: Path, payload: dict[str, Any] | None 
             ("feishu_chat_id", "飞书群 chat_id", values.get("feishu_chat_id", "")),
             ("lark_profile", "lark-cli Profile 名称", values.get("lark_profile", "wechat-mirror")),
             ("lark_app_id", "飞书 App ID", values.get("lark_app_id", "")),
+            ("feishu_app_link", "飞书应用开放平台链接（可留空）", values.get("feishu_app_link", "")),
+            ("feishu_assistant_link", "飞书助手链接（可留空）", values.get("feishu_assistant_link", "")),
             ("admin_feishu_user_id", "管理员飞书 open_id（可留空）", values.get("admin_feishu_user_id", "")),
         )
         for key, label, default in prompts:
@@ -198,6 +200,30 @@ def search_feishu(profile: str, query: str) -> Any:
     return run_cli(["lark-cli", "--profile", profile, "im", "+chat-search", "--as", "bot", "--query", query, "--format", "json"])
 
 
+def preflight_binding(data: dict[str, Any]) -> dict[str, Any]:
+    """Read-only checks before a binding is created or started."""
+    result: dict[str, Any] = {"source_readable": False, "target_visible": False, "profile_ready": False, "errors": []}
+    try:
+        source = run_command([str(READER), "timeline", "--talker", data["wechat_talker"], "--limit", "1", "--display-order", "desc"])
+        result["source_readable"] = bool(source.get("ok", True))
+    except Exception as exc:
+        result["errors"].append(f"微信源群不可读：{str(exc)[:200]}")
+    try:
+        remote = run_cli(["lark-cli", "--profile", data["lark_profile"], "im", "+chat-list", "--as", "bot", "--format", "json", "--page-size", "100"])
+        result["target_visible"] = data["feishu_chat_id"] in json.dumps(remote, ensure_ascii=False)
+        if not result["target_visible"]:
+            result["errors"].append("机器人当前看不到目标飞书群")
+    except Exception as exc:
+        result["errors"].append(f"飞书目标群检查失败：{str(exc)[:200]}")
+    try:
+        profile_health_payload = profile_health(MirrorStore(Path(data.get("sqlite_file", DEFAULT_DB))), data["lark_profile"])
+        result["profile_ready"] = profile_health_payload.get("bot_status") == "ready"
+    except Exception as exc:
+        result["errors"].append(f"Profile 检查失败：{str(exc)[:200]}")
+    result["ok"] = not result["errors"]
+    return result
+
+
 def run_command(argv: list[str]) -> Any:
     proc = subprocess.run(argv, cwd=ROOT, text=True, capture_output=True)
     if proc.returncode:
@@ -258,7 +284,7 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/people": self.send_json(self.store.list_people())
             elif parsed.path == "/api/confirmations": self.send_json(self.store.list_confirmations())
             elif parsed.path == "/api/setup": self.send_json(setup_status(self.config_path, Path(self.store.path)))
-            elif parsed.path == "/api/status": self.send_json({"bindings": self.store.list_bindings(), "confirmations": self.store.list_confirmations()})
+            elif parsed.path == "/api/status": self.send_json({"bindings": self.store.list_bindings(), "confirmations": self.store.list_confirmations(), "media_failures": self.store.list_media_failures()})
             elif parsed.path == "/api/media-failures": self.send_json(self.store.list_media_failures())
             elif parsed.path == "/api/search/wechat": self.send_json(search_wechat(urllib.parse.parse_qs(parsed.query).get("q", [""])[0]))
             elif parsed.path == "/api/search/feishu": self.send_json(search_feishu(urllib.parse.parse_qs(parsed.query).get("profile", [""])[0], urllib.parse.parse_qs(parsed.query).get("q", [""])[0]))
@@ -296,7 +322,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = setup_init(self.config_path, Path(self.store.path), data.get("config"))
             elif path == "/api/bindings":
                 op = data.get("op")
-                if op == "create":
+                if op == "preflight": result = preflight_binding(data)
+                elif op == "create":
                     if len([x for x in self.store.list_bindings(False) if not x["archived"]]) >= 10: raise ValueError("最多支持 10 组有效绑定")
                     result = self.store.create_binding(data)
                 elif op == "rename":
@@ -336,7 +363,7 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     sub = parser.add_subparsers(dest="command", required=True)
     pr = sub.add_parser("profiles"); pr.add_argument("--health", action="store_true"); pr.add_argument("--op", choices=("sync", "add", "health", "rename", "remove", "disable", "enable"), default="sync"); pr.add_argument("--profile-name"); pr.add_argument("--app-id"); pr.add_argument("--app-secret"); pr.add_argument("--old-name"); pr.add_argument("--new-name")
-    b = sub.add_parser("bindings"); b.add_argument("action", choices=("list", "create", "start", "stop", "pause", "resume", "status", "archive")); b.add_argument("--id", type=int); b.add_argument("--data", help="JSON binding payload for create")
+    b = sub.add_parser("bindings"); b.add_argument("action", choices=("list", "create", "check", "start", "stop", "pause", "resume", "status", "archive")); b.add_argument("--id", type=int); b.add_argument("--data", help="JSON binding payload for create/check")
     p = sub.add_parser("people"); p.add_argument("action", choices=("list", "create", "rename", "confirm", "link-wechat", "link-feishu")); p.add_argument("--id", type=int); p.add_argument("--name"); p.add_argument("--data", help="JSON people payload")
     sub.add_parser("status")
     setup = sub.add_parser("setup", help="检查或初始化本机运行数据")
@@ -396,9 +423,10 @@ def main() -> int:
         if args.health and args.op == "sync": result = [profile_health(store, x["profile_name"]) for x in result]
     elif args.command == "bindings":
         if args.action == "list": result = store.list_bindings()
-        elif args.action == "create":
+        elif args.action in {"create", "check"}:
             if not args.data: raise ValueError("create 需要 --data JSON")
-            result = store.create_binding(json.loads(args.data))
+            payload = json.loads(args.data)
+            result = preflight_binding(payload) if args.action == "check" else store.create_binding(payload)
         else: result = binding_action(store, config_path, args.id or 1, args.action)
     elif args.command == "people":
         if args.action == "list": result = {"people": store.list_people(), "wechat": store.list_wechat_identities(), "feishu": store.list_feishu_identities(), "confirmations": store.list_confirmations()}

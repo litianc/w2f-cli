@@ -8,9 +8,22 @@ from PIL import Image
 
 from agents.storage import MirrorStore
 from agents import wechat_feishu_mirror as mirror
+from agents import manage
 
 
 class MirrorStoreTest(unittest.TestCase):
+    def test_setup_init_writes_non_secret_runtime_config_and_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config" / "mirror.json"
+            db = root / "data" / "mirror.sqlite3"
+            first = manage.setup_init(config, db, {"wechat_talker": "talker", "feishu_chat_id": "chat", "lark_profile": "profile", "app_secret": "must-not-persist"})
+            self.assertTrue(first["initialized"])
+            config_text = config.read_text(encoding="utf-8")
+            self.assertNotIn("must-not-persist", config_text)
+            manage.setup_init(config, db, {"wechat_chat_name": "新源", "wechat_talker": "talker", "feishu_chat_id": "chat", "lark_profile": "profile"})
+            self.assertTrue(list(db.parent.glob("mirror.sqlite3.backup-*")))
+
     def test_cursor_control_lease_and_idempotent_message(self):
         with tempfile.TemporaryDirectory() as directory:
             store = MirrorStore(Path(directory) / "mirror.sqlite3")
