@@ -94,7 +94,8 @@ def run_lark(config: dict[str, Any], args: list[str]) -> dict[str, Any]:
         cwd = Path(os.path.commonpath([str(value.parent) for _, value in files]))
         for i, value in files:
             arguments[i] = str(value.relative_to(cwd))
-    cmd = ['lark-cli','--profile',config['lark_profile'],'im',*arguments,'--as','bot','--format','json']
+    lark = shutil.which('lark-cli') or str(Path.home()/'.local/bin/lark-cli')
+    cmd = [lark,'--profile',config['lark_profile'],'im',*arguments,'--as','bot','--format','json']
     try:
         proc = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, timeout=180,
                               env={**os.environ,'LARKSUITE_CLI_NO_UPDATE_NOTIFIER':'1','LARKSUITE_CLI_NO_SKILLS_NOTIFIER':'1'})

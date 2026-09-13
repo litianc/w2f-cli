@@ -6,6 +6,7 @@ import ipaddress
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -36,6 +37,8 @@ def write_runtime_config(value,path):
 def run_cli(argv,*,stdin=None):
     from .wechat_feishu_mirror import safe_error
     try:
+        if argv and argv[0] == 'lark-cli':
+            argv = [shutil.which('lark-cli') or str(Path.home()/'.local/bin/lark-cli'), *argv[1:]]
         p=subprocess.run(argv,cwd=ROOT,input=stdin,text=True,capture_output=True,timeout=60,
                          env={**os.environ,'LARKSUITE_CLI_NO_UPDATE_NOTIFIER':'1','LARKSUITE_CLI_NO_SKILLS_NOTIFIER':'1'})
     except subprocess.TimeoutExpired: raise RuntimeError('CLI 请求超时，请稍后重试') from None

@@ -66,6 +66,8 @@ Codex 负责服务控制和维护，Worker 负责持续读取与发送。项目�
 
 Node.js 只用于网页脚本检查和可选的 Remotion 宣传片制作，不是同步服务的运行依赖。
 
+在 macOS 上，Worker 会优先使用 PATH 中的 `lark-cli`；如果 PATH 未包含本地用户程序目录，也会自动检查 `~/.local/bin/lark-cli`。可用官方 CLI 仓库的发布包安装，启动前用 `lark-cli --version` 验证。
+
 在项目根目录安装依赖：
 
 ```bash
