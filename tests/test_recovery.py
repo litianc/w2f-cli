@@ -186,7 +186,11 @@ class OfflineAcceptance(unittest.TestCase):
         with self.assertRaises(m.CliError):m.recover_once(self.config,self.store,History(rows))
         self.store.rename_person(self.store.list_people()[0]['id'],'新实名')
         m.recover_once(self.config,self.store,History(rows))
-        self.assertEqual(''.join(self.texts()[:-1]),'已确认姓名：已确认姓名：'+'😀长记录'*4000)
+        parts=self.texts()[:-1]
+        self.assertEqual(len(parts),5)
+        self.assertTrue(parts[0].startswith('已确认姓名转发聊天记录（第 1/5 段）'))
+        self.assertTrue(parts[-1].startswith('已确认姓名转发聊天记录（第 5/5 段）'))
+        self.assertEqual(''.join(p.split('\n',1)[1] for p in parts),'已确认姓名：'+'😀长记录'*4000)
         self.assertEqual(self.texts()[-1],'新实名：'+rows[1]['text'])
 
     def test_T54_placeholder_keeps_position_manual_repair_replies_to_it(self):
@@ -231,4 +235,4 @@ class OfflineAcceptance(unittest.TestCase):
         flags=[next(k for k in ('--text','--image','--video','--file','--audio') if k in a) for a in offline]
         self.assertEqual(flags,['--text','--text','--text','--image','--text','--video','--text','--file','--text','--audio','--text','--image','--text','--text'])
         self.assertEqual(offline[-2][0],'+messages-reply')
-        self.assertEqual(offline[-1][offline[-1].index('--text')+1],'已确认姓名：已确认姓名： 转发😀\n正文 \n已确认姓名：[图片]')
+        self.assertEqual(offline[-1][offline[-1].index('--text')+1],'已确认姓名转发聊天记录（第 1/1 段）\n已确认姓名： 转发😀\n正文 \n已确认姓名：[图片]')

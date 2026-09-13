@@ -138,6 +138,28 @@ class MirrorFormattingTest(unittest.TestCase):
         self.assertEqual(str(paths[0]), "/tmp/example.jpg")
         self.assertIn("--include-local-paths", run.call_args.args[0])
 
+    def test_wechat_cache_fallback_matches_message_identifier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            match = root / "ImageTemp" / "901_1700000000_thumb.jpg"
+            unrelated = root / "ImageTemp" / "1901_1700000000_thumb.jpg"
+            match.parent.mkdir()
+            match.write_bytes(b"jpg")
+            unrelated.write_bytes(b"jpg")
+            paths = mirror.wechat_cache_paths({"local_id": 901, "server_id": "s901", "wechat_cache_dirs": [str(root)]})
+            self.assertEqual(paths, [match])
+
+    def test_stage_media_uses_cache_when_reader_has_no_resource(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "901_thumb.jpg"
+            source.write_bytes(b"image")
+            destination = root / "staging"
+            with patch.object(mirror, "reader_media_paths", return_value=[]):
+                staged = mirror.stage_media({"binding_id": 1, "talker": "room", "local_id": 901, "wechat_cache_dirs": [str(root)], "media_dir": str(destination)}, "image")
+            self.assertTrue(staged)
+            self.assertEqual(Path(staged).read_bytes(), b"image")
+
     def test_wechat_dat_decoder_accepts_xor_image(self):
         image = Image.new("RGB", (2, 2), (255, 0, 0))
         buf = BytesIO(); image.save(buf, format="JPEG")

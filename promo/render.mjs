@@ -13,7 +13,7 @@ const serveUrl=await bundle({entryPoint:path.join(root,'src/index.tsx'),publicDi
 const composition=await selectComposition({serveUrl,id:'Preview29'});
 const stills=process.argv.includes('--stills');
 if(stills){
- for(const frame of [45,120,240,390,510,660,810,869]){
+ for(const frame of [45,120,240,350,390,510,660,810,869]){
   await renderStill({serveUrl,composition,frame,output:path.join(data,'frames',`${frame}.png`)});
   console.log(`Frame ${frame} ready`);
  }

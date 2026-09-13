@@ -318,9 +318,67 @@ def reader_media_paths(row: dict[str, Any]) -> list[Path]:
     return list(dict.fromkeys(found))
 
 
+def wechat_cache_paths(row: dict[str, Any]) -> list[Path]:
+    """Find already-cached WeChat media without treating CDN tickets as URLs.
+
+    The cache layout differs between WeChat releases, so callers may provide
+    ``wechat_cache_dirs`` or ``WECHAT_CACHE_DIRS``.  Matching requires the
+    stable local/server message identifier and never searches by a bare
+    filename from an unrelated group.
+    """
+    roots = row.get("wechat_cache_dirs") or os.environ.get("WECHAT_CACHE_DIRS", "")
+    if isinstance(roots, str):
+        roots = [item for item in roots.split(os.pathsep) if item]
+    local_id = str(row.get("local_id") or "")
+    server_id = str(row.get("server_id") or "")
+    if not roots or not (local_id or server_id):
+        return []
+    identifiers = tuple(value for value in (local_id, server_id) if value)
+    found: list[Path] = []
+    for root_value in roots:
+        root = Path(root_value).expanduser()
+        if not root.is_dir():
+            continue
+        try:
+            for path in root.rglob("*"):
+                if not path.is_file() or path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".dat", ".mp4"}:
+                    continue
+                if not any((re.search(rf"(?<!\d){re.escape(identifier)}(?!\d)", path.stem) if identifier.isdigit() else identifier in path.name) for identifier in identifiers):
+                    continue
+                found.append(path)
+        except OSError:
+            continue
+    found = list(dict.fromkeys(found))
+    talker = str(row.get("talker") or row.get("wechat_talker") or "")
+    if talker and len(found) > 1:
+        # Current desktop WeChat uses an MD5(talker) directory. Prefer that
+        # namespace when present, while keeping flat fixture/cache layouts
+        # usable for older clients.
+        talker_hash = hashlib.md5(talker.encode()).hexdigest()
+        scoped = [path for path in found if talker_hash in str(path)]
+        if scoped:
+            found = scoped
+    return found
+
+
+def media_doctor(row: dict[str, Any]) -> dict[str, Any]:
+    """Report actual media availability; configuration flags alone are not enough."""
+    reader_paths = reader_media_paths(row)
+    cache_paths = wechat_cache_paths(row)
+    return {
+        "reader_configured": bool(WECHAT_READER),
+        "reader_paths": [str(path) for path in reader_paths],
+        "cache_paths": [str(path) for path in cache_paths],
+        "available": bool(reader_paths or cache_paths),
+        "status": "available" if reader_paths or cache_paths else "resource_missing",
+    }
+
+
 def stage_media(row: dict[str, Any], kind: str) -> str | None:
     """Stage a reader-provided local file, then fall back to a normal URL."""
     local_candidates = reader_media_paths(row)
+    if not local_candidates:
+        local_candidates = wechat_cache_paths(row)
     source_path = local_candidates[0] if local_candidates else None
     media_dir = Path(os.environ.get("CHZ_MEDIA_DIR", str(row.get("media_dir") or MEDIA_DIR))).expanduser()
     namespace = str(row.get("binding_id",1)) + "-" + hashlib.sha1(str(row.get("talker") or "default").encode()).hexdigest()[:10]
@@ -613,7 +671,10 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
                     except (ET.ParseError,AttributeError): sender_id=''
                     quoted_name,_=resolve_name(store,config,sender_id,quote['sender'],key+':quote')
                     body += f"\n> {quoted_name}：{quote['content']}"
-                plan={'target':target,'parts':split_text(f'{name}：{body}'),'placeholder':is_forward_row(row) and body=='[转发聊天记录内容暂不可用]'}
+                raw_parts=split_text(body)
+                total=len(raw_parts)
+                parts=[f'{name}转发聊天记录（第 {i}/{total} 段）\n{part}' for i,part in enumerate(raw_parts,1)] if is_forward_row(row) else [f'{name}：{part}' for part in raw_parts]
+                plan={'target':target,'parts':parts,'placeholder':is_forward_row(row) and body=='[转发聊天记录内容暂不可用]'}
                 store.save_setting(plan_key,plan)
             for index,part in enumerate(plan['parts']):
                 result=send(f'text-{index}',plan['target']+['--text',part])
@@ -701,14 +762,26 @@ def recover_once(config,store,reader=source_page):
 
 def retry_media_jobs(config,store):
     with store.connect() as db:
-        jobs=[dict(r) for r in db.execute("SELECT m.id,m.message_id,x.payload_json FROM media_jobs m JOIN messages x ON x.id=m.message_id WHERE x.binding_id=? AND m.state IN ('pending','processing') ORDER BY m.id",(config['binding_id'],))]
+        jobs=[dict(r) for r in db.execute("SELECT m.id,m.message_id,m.attempts,x.payload_json FROM media_jobs m JOIN messages x ON x.id=m.message_id WHERE x.binding_id=? AND m.state IN ('pending','processing') ORDER BY m.id",(config['binding_id'],))]
     for job in jobs:
+        if job['attempts'] >= 3:
+            with store.connect() as db: db.execute("UPDATE media_jobs SET state='manual',error=COALESCE(error,'自动重试已达到 3 次'),updated_at=? WHERE id=?",(time.time(),job['id']))
+            continue
         check_control(config,store)
+        # Back off automatically: attempts 1/2 wait 30s/120s; tests and
+        # explicit management retries can bypass this by setting updated_at.
+        delay=(30,120)[min(job['attempts'],2)-1] if job['attempts'] else 0
+        with store.connect() as db:
+            updated=db.execute('SELECT updated_at FROM media_jobs WHERE id=?',(job['id'],)).fetchone()[0]
+        if delay and time.time()-updated < delay:
+            continue
         with store.connect() as db:db.execute("UPDATE media_jobs SET state='processing' WHERE id=?",(job['id'],))
         try:send_row({**config,'_retry_media':True},json.loads(job['payload_json']),{},store)
         except Exception as exc:
-            with store.connect() as db:db.execute("UPDATE media_jobs SET state='failed',error=?,updated_at=? WHERE id=?",(safe_error(exc),time.time(),job['id']))
-            raise
+            with store.connect() as db:
+                attempts=db.execute('SELECT attempts FROM media_jobs WHERE id=?',(job['id'],)).fetchone()[0]
+                state='manual' if attempts >= 3 else 'pending'
+                db.execute("UPDATE media_jobs SET state=?,error=?,updated_at=? WHERE id=?",(state,safe_error(exc),time.time(),job['id']))
 
 
 def expire_failed_media(config,store):

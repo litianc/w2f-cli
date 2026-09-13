@@ -1,6 +1,7 @@
 """Check current publishable files, without printing matched private values.
 
-Git history is intentionally not rewritten or claimed clean by this script.
+This is a current-tree check; the Git history is cleaned separately before a
+public push.
 """
 import hashlib
 import re
@@ -11,8 +12,10 @@ ROOT=Path(__file__).resolve().parents[1]
 # User-selected README media, reviewed as rendered output. A replacement must
 # be reviewed again; never exempt an entire directory or media extension.
 REVIEWED_MEDIA={
-    'docs/media/w2f-cli-preview.gif': 'a3beb679b5f490f18102efd37f75c871f99db45fcab5bb8145812406a7e9ab08',
-    'docs/media/w2f-cli-preview.mp4': 'c020e23c6e7ff67b0a297e45184a733fbb6c6058e2cdab7c41fe9bf805489566',
+    'docs/media/w2f-cli-preview.gif': '627fe57baba84a3fad1d49e32006abc0bb2ef51a0b5225bf2332a8206b36ff42',
+    'docs/media/w2f-cli-preview.mp4': '97024b59a55f425fe85619c4dd82fa8d3697ca909a835cdd67bef71b14052bc6',
+    'docs/media/wechat-sanitized.png': '5d035418d1c91abc09524f75bade2f2659ff4437a59b35995f64b9c310a3fa92',
+    'docs/media/feishu-sanitized.png': '4bb5800ec1190046d58c8c7812a7da47f49db3f35d5a22495a980e80973d3067',
 }
 PATTERNS=[re.compile(r'(?<![A-Za-z0-9_])(?:cli_[a-f0-9]{16}|(?:oc|ou)_[a-f0-9]{24,}|\d{8,}@chatroom)(?![A-Za-z0-9_])'),
           re.compile(r'/Users/[A-Za-z0-9_.-]+/'),
