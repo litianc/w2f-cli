@@ -18,3 +18,9 @@ __pycache__/
 venv/
 env/
 .DS_Store
+
+# Remotion promo: dependencies and private capture/render assets
+promo/node_modules/
+promo/public/
+promo/out/
+promo/.cache/
