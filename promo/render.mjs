@@ -6,7 +6,7 @@ import {fileURLToPath} from 'node:url';
 import {mkdir} from 'node:fs/promises';
 
 const root=path.dirname(fileURLToPath(import.meta.url));
-const data=process.env.CHZ_PROMO_DIR || path.join(os.homedir(),'.local/share/w2f-cli/promo-preview-20260913');
+const data=process.env.W2F_PROMO_DIR || process.env.CHZ_PROMO_DIR || path.join(os.homedir(),'.local/share/w2f-cli/promo-preview-20260913');
 const publicDir=path.join(data,'assets');
 await mkdir(path.join(data,'frames'),{recursive:true});
 const serveUrl=await bundle({entryPoint:path.join(root,'src/index.tsx'),publicDir});

@@ -380,7 +380,7 @@ def stage_media(row: dict[str, Any], kind: str) -> str | None:
     if not local_candidates:
         local_candidates = wechat_cache_paths(row)
     source_path = local_candidates[0] if local_candidates else None
-    media_dir = Path(os.environ.get("CHZ_MEDIA_DIR", str(row.get("media_dir") or MEDIA_DIR))).expanduser()
+    media_dir = Path(os.environ.get("W2F_MEDIA_DIR", os.environ.get("CHZ_MEDIA_DIR", str(row.get("media_dir") or MEDIA_DIR)))).expanduser()
     namespace = str(row.get("binding_id",1)) + "-" + hashlib.sha1(str(row.get("talker") or "default").encode()).hexdigest()[:10]
     local_id = int(row.get("local_id") or 0)
     if source_path:

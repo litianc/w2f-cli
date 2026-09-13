@@ -9,8 +9,8 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = Path(os.environ.get("CHZ_DATA_DIR", "~/.local/share/w2f-cli")).expanduser()
-CONFIG_DIR = Path(os.environ.get("CHZ_CONFIG_DIR", "~/.config/w2f-cli")).expanduser()
+DATA_DIR = Path(os.environ.get("W2F_DATA_DIR", os.environ.get("CHZ_DATA_DIR", "~/.local/share/w2f-cli"))).expanduser()
+CONFIG_DIR = Path(os.environ.get("W2F_CONFIG_DIR", os.environ.get("CHZ_CONFIG_DIR", "~/.config/w2f-cli"))).expanduser()
 DEFAULT_CONFIG = CONFIG_DIR / "wechat_feishu_mirror.json"
 EXAMPLE_CONFIG = ROOT / "config" / "wechat_feishu_mirror.json"
 

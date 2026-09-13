@@ -140,7 +140,7 @@ python3 -m agents.manage status
 | 可复制的配置示例 | [`config/wechat_feishu_mirror.json`](config/wechat_feishu_mirror.json) |
 | README 展示素材 | [`docs/media/`](docs/media/README.md) |
 
-通过 `CHZ_CONFIG_DIR`、`CHZ_DATA_DIR` 可切换到隔离的配置和数据目录。`WECHAT_READER` 用于覆盖微信 CLI 入口。
+通过 `W2F_CONFIG_DIR`、`W2F_DATA_DIR` 可切换到隔离的配置和数据目录；旧版 `CHZ_CONFIG_DIR`、`CHZ_DATA_DIR` 仍作为兼容 fallback。`W2F_MEDIA_DIR` 可指定媒体暂存目录，`WECHAT_READER` 用于覆盖微信 CLI 入口。
 
 管理员私聊提醒需要在其所属 `admin_profile` 下核实 `admin_feishu_user_id`，不能复制另一应用的 `open_id`。当前已有绑定的管理员配置由 Codex 修改本地配置；网页“保存进度”只保存引导草稿。
 
