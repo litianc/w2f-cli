@@ -135,8 +135,8 @@ python3 -m agents.manage status
 
 | 内容 | 默认位置 |
 | --- | --- |
-| 本机配置 | `~/.config/chz-cli/wechat_feishu_mirror.json` |
-| SQLite、日志、媒体、备份、管理会话 | `~/.local/share/chz-cli/` |
+| 本机配置 | `~/.config/w2f-cli/wechat_feishu_mirror.json` |
+| SQLite、日志、媒体、备份、管理会话 | `~/.local/share/w2f-cli/` |
 | 可复制的配置示例 | [`config/wechat_feishu_mirror.json`](config/wechat_feishu_mirror.json) |
 | README 展示素材 | [`docs/media/`](docs/media/README.md) |
 

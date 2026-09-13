@@ -18,7 +18,7 @@ Remotion 工程，1920 × 1080、30 fps，H.264 + AAC。当前已交付 29 秒�
 
 ## 文件与复现
 
-代码进入项目目录；工作渲染结果留在本机数据目录。用户选定的 W2F CLI 成片及其动图预览另外复制到 [`docs/media/`](../docs/media/README.md)，用于项目 README 展示。默认素材位置为 `~/.local/share/chz-cli/promo-preview-20260913/assets`；可通过 `CHZ_PROMO_DIR` 指定另一数据目录。
+代码进入项目目录；工作渲染结果留在本机数据目录。用户选定的 W2F CLI 成片及其动图预览另外复制到 [`docs/media/`](../docs/media/README.md)，用于项目 README 展示。默认素材位置为 `~/.local/share/w2f-cli/promo-preview-20260913/assets`；可通过 `CHZ_PROMO_DIR` 指定另一数据目录。
 
 ```bash
 cd promo

@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-root = Path(os.environ.get('CHZ_PROMO_DIR', Path.home() / '.local/share/chz-cli/promo-preview-20260913'))
+root = Path(os.environ.get('CHZ_PROMO_DIR', Path.home() / '.local/share/w2f-cli/promo-preview-20260913'))
 assets = root / 'assets'
 assets.mkdir(parents=True, exist_ok=True)
 
