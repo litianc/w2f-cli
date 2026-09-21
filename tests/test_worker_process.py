@@ -80,7 +80,7 @@ class WorkerProcessAcceptance(unittest.TestCase):
             cfg.write_text(json.dumps(config),encoding='utf-8');store=MirrorStore(db);store.initialize(config)
             env={**os.environ,'PATH':str(bin_dir)+os.pathsep+os.environ['PATH'],'WECHAT_READER':str(reader),'TEST_SOURCE':str(source),'TEST_SINK':str(sink)}
             def command(op):
-                p=subprocess.run([sys.executable,'-m','agents.wechat_feishu_mirror',op,'--config',str(cfg)],cwd=ROOT,env=env,text=True,capture_output=True,timeout=20)
+                p=subprocess.run([sys.executable,'-m','agents.wechat_feishu_mirror',op,'--config',str(cfg)],cwd=ROOT,env=env,text=True,encoding='utf-8',capture_output=True,timeout=20)
                 if p.returncode:raise AssertionError(p.stderr+p.stdout)
                 return json.loads(p.stdout)
             def until(predicate):

@@ -123,7 +123,7 @@ def run_lark(config: dict[str, Any], args: list[str]) -> dict[str, Any]:
     lark = shutil.which('lark-cli') or str(Path.home()/'.local/bin/lark-cli')
     cmd = [lark,'--profile',config['lark_profile'],'im',*arguments,'--as','bot','--format','json']
     try:
-        proc = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, timeout=180,
+        proc = subprocess.run(cmd, cwd=cwd, text=True, encoding="utf-8", capture_output=True, timeout=180,
                               env={**os.environ,'LARKSUITE_CLI_NO_UPDATE_NOTIFIER':'1','LARKSUITE_CLI_NO_SKILLS_NOTIFIER':'1'})
     except subprocess.TimeoutExpired:
         raise CliError('飞书响应超时，发送结果待确认', uncertain=True) from None
@@ -325,7 +325,7 @@ def reader_media_paths(row: dict[str, Any]) -> list[Path]:
     if server_id:
         cmd.extend(["--server-id", server_id])
     try:
-        proc = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, timeout=20)
+        proc = subprocess.run(cmd, cwd=ROOT, text=True, encoding="utf-8", capture_output=True, timeout=20)
         if proc.returncode:
             return []
         payload = json.loads(proc.stdout)
@@ -728,7 +728,7 @@ def source_page(config, cursor, high=None, after=None):
     if high is not None: args+=['--through-local-id',str(high)]
     if after: args+=['--page-after-time',str(after['time']),'--page-after-local-id',str(after['local_id'])]
     try:
-        proc=subprocess.run(args,cwd=ROOT,capture_output=True,text=True,timeout=60)
+        proc=subprocess.run(args,cwd=ROOT,capture_output=True,text=True,encoding='utf-8',timeout=60)
         value=json.loads(proc.stdout)
     except (OSError,subprocess.TimeoutExpired,ValueError):
         raise RuntimeError('微信读取失败，请检查 CLI 和 sync-page 扩展') from None
@@ -863,6 +863,11 @@ def worker_lock(store,bid):
 
 
 def main():
+    # JSON on stdout must be stable UTF-8 for every consumer; Windows pipes
+    # would otherwise fall back to the local code page.
+    for pipe in (sys.stdout, sys.stderr):
+        if hasattr(pipe, 'reconfigure'):
+            pipe.reconfigure(encoding='utf-8', errors='replace')
     parser=argparse.ArgumentParser()
     parser.add_argument('command',nargs='?',choices=('run','start','stop','pause','resume','status'),default='run')
     parser.add_argument('--config',type=Path,default=DEFAULT_CONFIG)
@@ -905,7 +910,7 @@ def main():
                 _unlock(check)
             store.set_control(bid,'running',reason='manual start')
             log=Path(config['log_dir'])/f'binding-{bid}.log';log.parent.mkdir(parents=True,exist_ok=True)
-            with log.open('a') as out:
+            with log.open('a', encoding='utf-8', errors='replace') as out:
                 child=subprocess.Popen([sys.executable,'-m','agents.wechat_feishu_mirror','run','--config',str(args.config.resolve()),'--db',str(store.path.resolve()),'--binding-id',str(bid)],cwd=ROOT,stdout=out,stderr=subprocess.STDOUT,start_new_session=True)
             deadline=time.monotonic()+5
             while time.monotonic()<deadline:

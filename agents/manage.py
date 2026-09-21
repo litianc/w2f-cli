@@ -39,7 +39,7 @@ def run_cli(argv,*,stdin=None):
     try:
         if argv and argv[0] == 'lark-cli':
             argv = [shutil.which('lark-cli') or str(Path.home()/'.local/bin/lark-cli'), *argv[1:]]
-        p=subprocess.run(argv,cwd=ROOT,input=stdin,text=True,capture_output=True,timeout=60,
+        p=subprocess.run(argv,cwd=ROOT,input=stdin,text=True,encoding='utf-8',capture_output=True,timeout=60,
                          env={**os.environ,'LARKSUITE_CLI_NO_UPDATE_NOTIFIER':'1','LARKSUITE_CLI_NO_SKILLS_NOTIFIER':'1'})
     except subprocess.TimeoutExpired: raise RuntimeError('CLI 请求超时，请稍后重试') from None
     try: value=json.loads(p.stdout if p.returncode==0 else p.stderr)
@@ -358,6 +358,9 @@ def serve(store,config_path,host,port,token=None):
 
 
 def main():
+    for pipe in (sys.stdout, sys.stderr):
+        if hasattr(pipe, 'reconfigure'):
+            pipe.reconfigure(encoding='utf-8', errors='replace')
     p=argparse.ArgumentParser();p.add_argument('--config',type=Path,default=DEFAULT_CONFIG);p.add_argument('--db',type=Path)
     sub=p.add_subparsers(dest='command',required=True)
     for name in ('profiles','bindings','people','confirmations','media-failures','uncertain','setup'):

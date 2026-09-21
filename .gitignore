@@ -27,3 +27,6 @@ promo/node_modules/
 promo/public/
 promo/out/
 promo/.cache/
+
+# Windows reader adapter shim (machine-specific venv path)
+integrations/wda_reader.cmd
