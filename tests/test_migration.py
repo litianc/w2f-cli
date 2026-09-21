@@ -31,8 +31,11 @@ class MigrationAcceptance(unittest.TestCase):
                 self.assertEqual(db.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0],'2')
                 self.assertNotIn('initialized',{r[1] for r in db.execute('PRAGMA table_info(runtime_state)')})
             backup=next((store.path.parent/'backups').glob('*.bak'))
-            with sqlite3.connect(backup) as db:
-                self.assertEqual(db.execute('SELECT cursor FROM runtime_state').fetchone()[0],89)
+            reader=sqlite3.connect(backup)
+            try:
+                self.assertEqual(reader.execute('SELECT cursor FROM runtime_state').fetchone()[0],89)
+            finally:
+                reader.close()
             store.initialize({'wechat_talker':'room','feishu_chat_id':'chat','initial_cursor':1})
             self.assertEqual(store.get_cursor(),89)
             self.assertTrue(store.recovery(1)['initialized'])

@@ -17,6 +17,7 @@ class ReaderPagingAcceptance(unittest.TestCase):
                 db.execute('CREATE TABLE Name2Id(user_name TEXT)');db.execute("INSERT INTO Name2Id VALUES('wx')")
                 db.execute(f'CREATE TABLE {table}(local_id INTEGER PRIMARY KEY,server_id INTEGER,real_sender_id INTEGER,create_time INTEGER,local_type INTEGER,message_content TEXT)')
                 db.executemany(f'INSERT INTO {table} VALUES(?,?,1,?,1,?)',[(i,90000+i,1000+i//3,f'第{i}句 😀') for i in range(1,5504)])
+            db.close()
             def connect(path):
                 c=sqlite3.connect(f'file:{path}?mode=ro',uri=True);c.row_factory=sqlite3.Row;return c
             database=SimpleNamespace(message_dbs=[db_path],connect=connect,contact_index=lambda:{},self_username='self')

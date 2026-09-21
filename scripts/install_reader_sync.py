@@ -10,7 +10,7 @@ from pathlib import Path
 
 def install(engine):
     engine = Path(engine).expanduser()
-    text = engine.read_text()
+    text = engine.read_text(encoding="utf-8")
     replacements = {
         '    sub = parser.add_subparsers(dest="command", required=True)':
         '    sub = parser.add_subparsers(dest="command", required=True)\n    from reader_sync import register\n    register(sub)',

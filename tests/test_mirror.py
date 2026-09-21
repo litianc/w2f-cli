@@ -135,7 +135,7 @@ class MirrorFormattingTest(unittest.TestCase):
         with patch.object(mirror.subprocess, "run", return_value=completed) as run:
             with patch.object(Path, "is_file", return_value=True):
                 paths = mirror.reader_media_paths({"talker": "talker", "local_id": 9, "server_id": "s9"})
-        self.assertEqual(str(paths[0]), "/tmp/example.jpg")
+        self.assertEqual(paths[0], Path("/tmp/example.jpg"))
         self.assertIn("--include-local-paths", run.call_args.args[0])
 
     def test_wechat_cache_fallback_matches_message_identifier(self):

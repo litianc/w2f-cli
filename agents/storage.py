@@ -17,6 +17,28 @@ def now() -> float:
     return time.time()
 
 
+class _Connection(sqlite3.Connection):
+    """Connection that closes on context exit.
+
+    sqlite3's own context manager only commits or rolls back; on Windows an
+    unclosed handle keeps the file locked, so temporary state directories
+    cannot be cleaned up. All callers use ``with store.connect() as db:``.
+    """
+
+    def __enter__(self) -> sqlite3.Connection:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        try:
+            if exc_type is None:
+                self.commit()
+            else:
+                self.rollback()
+        finally:
+            self.close()
+        return False
+
+
 class MirrorStore:
     """Shared state store used by the manager API and each worker process."""
 
@@ -25,7 +47,7 @@ class MirrorStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def connect(self) -> sqlite3.Connection:
-        db = sqlite3.connect(self.path, timeout=10)
+        db = _Connection(self.path, timeout=10)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA synchronous=NORMAL")
@@ -57,8 +79,14 @@ class MirrorStore:
     def backup(self) -> Path:
         destination = self.path.parent / "backups" / f"{self.path.name}.{time.time_ns()}.bak"
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.path) as source, sqlite3.connect(destination) as target:
+        source = sqlite3.connect(self.path)
+        target = sqlite3.connect(destination)
+        try:
             source.backup(target)
+            target.commit()
+        finally:
+            source.close()
+            target.close()
         return destination
 
     def _upgrade_v3(self, db):

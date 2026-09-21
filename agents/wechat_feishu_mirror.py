@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import atexit
-import fcntl
 import html
 import hashlib
 import json
@@ -27,6 +26,33 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image
+
+if sys.platform == 'win32':
+    import msvcrt
+
+    def _lock_exclusive(handle, blocking: bool) -> None:
+        """Whole-file advisory lock; blocking waits indefinitely like flock."""
+        handle.seek(0)
+        while True:
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                if not blocking:
+                    raise
+                time.sleep(0.1)
+
+    def _unlock(handle) -> None:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+else:
+    import fcntl
+
+    def _lock_exclusive(handle, blocking: bool) -> None:
+        fcntl.flock(handle, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+
+    def _unlock(handle) -> None:
+        fcntl.flock(handle, fcntl.LOCK_UN)
 
 try:
     from .storage import MirrorStore
@@ -871,12 +897,12 @@ def main():
         # A launch lock serializes simultaneous UI/CLI starts while the child
         # acquires its lifetime lock. Dead leases never defeat the file lock.
         with worker_lock(store,bid).with_suffix('.launch').open('a') as launch:
-            fcntl.flock(launch,fcntl.LOCK_EX)
+            _lock_exclusive(launch,blocking=True)
             with worker_lock(store,bid).open('a') as check:
-                try: fcntl.flock(check,fcntl.LOCK_EX|fcntl.LOCK_NB)
-                except BlockingIOError:
+                try: _lock_exclusive(check,blocking=False)
+                except OSError:
                     print(json.dumps(store.status(bid),ensure_ascii=False));return 0
-                fcntl.flock(check,fcntl.LOCK_UN)
+                _unlock(check)
             store.set_control(bid,'running',reason='manual start')
             log=Path(config['log_dir'])/f'binding-{bid}.log';log.parent.mkdir(parents=True,exist_ok=True)
             with log.open('a') as out:
@@ -888,8 +914,8 @@ def main():
                 time.sleep(0.1)
             print(json.dumps(store.status(bid),ensure_ascii=False));return 0
     with worker_lock(store,bid).open('a') as lock:
-        try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError: return 1
+        try: _lock_exclusive(lock,blocking=False)
+        except OSError: return 1
         def stop(signum, frame): raise KeyboardInterrupt
         signal.signal(signal.SIGTERM,stop)
         try: stream(config)

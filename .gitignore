@@ -7,6 +7,9 @@ state/*.lock
 data/
 config/*.local.json
 
+# Local planning workspace (wayfinder maps and tickets)
+.scratch/
+
 # Logs and downloaded media
 logs/*.log
 staging/

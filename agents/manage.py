@@ -23,7 +23,7 @@ SETUP_FIELDS={'source_account','wechat_chat_name','wechat_talker','feishu_chat_n
 
 
 def read_config(path):
-    return runtime_paths(json.loads(Path(path).read_text()) if Path(path).exists() else {})
+    return runtime_paths(json.loads(Path(path).read_text(encoding='utf-8')) if Path(path).exists() else {})
 
 
 def write_runtime_config(value,path):
@@ -31,7 +31,7 @@ def write_runtime_config(value,path):
     # paths are supplied only by local config/CLI, never arbitrary HTTP bodies.
     value={k:v for k,v in value.items() if k in SETUP_FIELDS|{'sqlite_file','data_dir','media_dir','log_dir','state_file'}}
     path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
-    tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(value,ensure_ascii=False,indent=2)+'\n');tmp.chmod(0o600);tmp.replace(path)
+    tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(value,ensure_ascii=False,indent=2)+'\n',encoding='utf-8');tmp.chmod(0o600);tmp.replace(path)
 
 
 def run_cli(argv,*,stdin=None):
@@ -339,7 +339,7 @@ def serve(store,config_path,host,port,token=None):
     handler=type('LocalHandler',(Handler,),{'manager':manager,'token':token})
     server=ThreadingHTTPServer((host,port),handler)
     state={'url':f'http://{host}:{server.server_port}/#token={token}','pid':os.getpid(),'port':server.server_port,'token':token}
-    state_file=store.path.parent/'manager-session.json';state_file.write_text(json.dumps(state));state_file.chmod(0o600)
+    state_file=store.path.parent/'manager-session.json';state_file.write_text(json.dumps(state),encoding='utf-8');state_file.chmod(0o600)
     print(json.dumps({'url':state['url'],'port':server.server_port}),flush=True)
     stopped=threading.Event()
     def reminders():

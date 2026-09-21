@@ -4,6 +4,7 @@ Installed next to rion_wechat_reader.py by scripts/install_reader_sync.py.
 No keys, credentials or machine-specific configuration are shipped here.
 """
 import sys
+from contextlib import closing
 
 
 def register(sub):
@@ -22,7 +23,7 @@ def read_page(reader, db, args):
     contacts = db.contact_index()
     sources, latest, anchor_exists = [], 0, args.after_local_id == 0
     for source in db.message_dbs:
-        with db.connect(source) as conn:
+        with closing(db.connect(source)) as conn:
             if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
                 continue
             sources.append(source)
@@ -36,7 +37,7 @@ def read_page(reader, db, args):
     limit = max(1, min(500, args.limit))
     result = {}
     for source in sources:
-        with db.connect(source) as conn:
+        with closing(db.connect(source)) as conn:
             names = {int(r['rowid']): str(r['user_name']) for r in conn.execute('SELECT rowid,user_name FROM Name2Id')}
             clauses, params = ['local_id > ?', 'local_id <= ?'], [args.after_local_id, high]
             if args.page_after_time is not None:
