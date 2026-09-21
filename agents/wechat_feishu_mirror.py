@@ -821,13 +821,41 @@ def expire_failed_media(config,store):
             db.execute('UPDATE media_jobs SET staging_path=NULL WHERE id=?',(job['id'],))
 
 
+def realtime_wakeup_loop(config: dict[str, Any], wakeup: threading.Event, stopped: threading.Event) -> None:
+    """Wake the worker as soon as the reader reports source changes.
+
+    Subscribes to the adapter's SSE change stream (WeChatDataAnalysis on
+    Windows; other readers may expose the same shape). The event only skips
+    the remaining poll wait — every scan still runs the regular cursor and
+    receipt pipeline via recover_once. Reconnects periodically on failure.
+    """
+    base = str(config.get('realtime_stream_url') or os.environ.get('WDA_BASE', 'http://localhost:10392')).rstrip('/')
+    url = base + '/api/chat/realtime/stream'
+    while not stopped.wait(5):
+        try:
+            request = urllib.request.Request(url, headers={'Accept': 'text/event-stream'})
+            with urllib.request.urlopen(request, timeout=600) as response:
+                wakeup.set()  # a fresh stream counts as one immediate scan
+                for raw in response:
+                    if stopped.is_set():
+                        return
+                    line = raw.decode('utf-8', 'replace').strip()
+                    if line.startswith('data:'):
+                        wakeup.set()
+        except (OSError, ValueError):
+            continue  # dropped stream; retry after the wait above
+
+
 def stream(config, state=None):
     store=MirrorStore(config['sqlite_file']); store.initialize()
     bid=int(config['binding_id']); token=store.acquire_lease(bid)
     stopped=threading.Event()
+    wakeup=threading.Event()
     def heartbeat():
         while not stopped.wait(5): store.heartbeat(token,bid)
     thread=threading.Thread(target=heartbeat,daemon=True);thread.start()
+    if config.get('realtime_wakeup'):
+        threading.Thread(target=realtime_wakeup_loop,args=(config,wakeup,stopped),daemon=True).start()
     try:
         wait_until=0
         while True:
@@ -835,8 +863,11 @@ def stream(config, state=None):
             control=store.get_control(bid)['status']
             if control=='stopped' or binding['archived'] or not binding['enabled']: return
             if control=='paused':
-                store.update_recovery(bid,phase='paused');time.sleep(0.5);wait_until=0;continue
-            if time.monotonic()<wait_until: time.sleep(0.5);continue
+                store.update_recovery(bid,phase='paused');stopped.wait(0.5);wait_until=0;continue
+            if time.monotonic()<wait_until:
+                stopped.wait(0.5)
+                if wakeup.is_set(): wakeup.clear();wait_until=0
+                continue
             try:
                 # Reconcile CLI profile names/App IDs before each source pass.
                 from agents.manage import profile_list
