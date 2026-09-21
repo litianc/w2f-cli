@@ -217,9 +217,78 @@ def cmd_resolve_chat(args: argparse.Namespace) -> dict:
     return {"ok": True, "data": {"candidates": candidates}}
 
 
+def find_message(talker: str, local_id: int) -> dict | None:
+    """Locate one message in the newest window (recent-media retry case)."""
+    for message in fetch_window(talker, want=500):
+        if int(message.get("localId") or 0) == local_id:
+            return message
+    return None
+
+
+CONTENT_TYPES = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
+    "video/mp4": ".mp4", "video/quicktime": ".mov",
+    "audio/aac": ".aac", "audio/mp4": ".m4a", "audio/amr": ".amr", "audio/silk": ".silk",
+}
+
+
+def fetch_media(path: str, **params) -> tuple[bytes, str] | None:
+    """Download decrypted media bytes; None on 404/absent resource."""
+    query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+    request = urllib.request.Request(f"{WDA_BASE}{path}?{query}", headers=UA)
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            if response.status != 200:
+                return None
+            return response.read(), (response.headers.get("Content-Type") or "").split(";")[0].strip()
+    except urllib.error.HTTPError:
+        return None
+    except (urllib.error.URLError, OSError) as exc:
+        raise WdaError(f"WDA 不可达（{WDA_BASE}）：{exc}") from None
+
+
 def cmd_media(args: argparse.Namespace) -> dict:
-    # Ticket 05 fills this in; an empty result keeps w2f on its
-    # placeholder/manual-retry path instead of fabricating paths.
+    """Real local file for one message's media, per the HTTP-staging route.
+
+    Empty resources keep w2f on its placeholder + media_jobs retry path;
+    we never fabricate a path. Errors on WDA reach stay fatal (exit 1) so
+    the worker surfaces the disconnect instead of mass-placeholdering.
+    """
+    talker = args.talker
+    local_id = int(args.local_id)
+    message = find_message(talker, local_id)
+    if not message:
+        return {"ok": True, "data": {"resources": []}}
+
+    wda_type = int(message.get("type") or 0)
+    base = wda_type & 0xFFFFFFFF
+    server_id = str(message.get("serverId") or args.server_id or "")
+    attempts: list[tuple[str, dict, str]] = []
+    if message.get("imageMd5"):
+        attempts.append(("/api/chat/media/image", {"md5": message["imageMd5"], "deep_scan": "true"}, message["imageMd5"]))
+    if message.get("emojiMd5"):
+        attempts.append(("/api/chat/media/emoji", {"md5": message["emojiMd5"], "username": talker}, message["emojiMd5"]))
+    if message.get("videoMd5"):
+        attempts.append(("/api/chat/media/video", {"md5": message["videoMd5"], "username": talker,
+                                                   "server_id": server_id or None}, message["videoMd5"]))
+    if message.get("fileMd5"):
+        attempts.append((f"/api/media/resource/{message['fileMd5']}", {}, message["fileMd5"]))
+    if base == 34 and server_id.isdigit():
+        attempts.append(("/api/chat/media/voice", {"server_id": int(server_id)}, f"voice-{server_id}"))
+
+    root = Path(os.environ.get("W2F_WDA_CACHE", str(Path.home() / ".local/share/w2f-cli/wda-cache")))
+    root.mkdir(parents=True, exist_ok=True)
+    for path, params, cache_key in attempts:
+        cached = next((p for p in root.glob(f"{cache_key}.*") if p.is_file() and p.stat().st_size > 0), None)
+        if cached:
+            return {"ok": True, "data": {"resources": [{"local_paths": [str(cached)]}]}}
+        fetched = fetch_media(path, **params)
+        if not fetched or not fetched[0]:
+            continue
+        payload, content_type = fetched
+        target = root / f"{cache_key}{CONTENT_TYPES.get(content_type, '.bin')}"
+        target.write_bytes(payload)
+        return {"ok": True, "data": {"resources": [{"local_paths": [str(target)]}]}}
     return {"ok": True, "data": {"resources": []}}
 
 
