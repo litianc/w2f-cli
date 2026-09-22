@@ -107,13 +107,31 @@ def profile_health(store,name):
     return {'profile':name,'bot_status':bot_status,'user_status':user_status,'error':'; '.join(errors) or None}
 
 
-def search_wechat(query):
-    return payload_items(run_cli([str(READER),'resolve-chat',query,'--type-filter','group','--limit','30']),'candidates')
+def search_wechat(query,limit=30):
+    return payload_items(run_cli([str(READER),'resolve-chat',query,'--type-filter','group','--limit',str(limit)]),'candidates')
 
 
 def search_feishu(profile,query):
     args=['lark-cli','--profile',profile,'im','+chat-search','--as','bot','--query',query,'--format','json'] if query else ['lark-cli','--profile',profile,'im','+chat-list','--as','bot','--page-size','100','--format','json']
     return payload_items(run_cli(args),'items','chats')
+
+
+def check_target(profile_name,chat_id,store=None):
+    """Feishu-side half of a preflight: app enabled, group visible, bot inside."""
+    checks={};errors=[]
+    profile=next((p for p in (store.list_profiles() if store else []) if p['profile_name']==profile_name),None)
+    checks['profile_ready']=bool(profile and profile['enabled'])
+    if not checks['profile_ready']:errors.append('请先接入并启用发送应用');return {'checks':checks,'errors':errors}
+    try:
+        result=run_cli(['lark-cli','--profile',profile_name,'im','chats','get','--chat-id',chat_id,'--as','bot','--format','json'])
+        checks['target_visible']=True;checks['target_name']=result.get('data',{}).get('name','')
+        members=run_cli(['lark-cli','--profile',profile_name,'im','+chat-members-list','--chat-id',chat_id,'--member-types','bot','--page-all','--as','bot','--format','json'])
+        bots=payload_items(members,'bots','items')
+        # API schemas vary: list bot IDs explicitly; no substring matching.
+        checks['bot_in_chat']=any(str(p.get('app_id') or p.get('id') or p.get('member_id') or '')==str(profile['app_id'] if profile else '') for p in bots)
+        if not checks['bot_in_chat']:errors.append('未在目标群机器人列表中确认该 App ID')
+    except Exception as exc:checks['target_visible']=False;errors.append(str(exc))
+    return {'checks':checks,'errors':errors}
 
 
 def preflight_binding(data,store=None):
@@ -126,15 +144,8 @@ def preflight_binding(data,store=None):
         result=source_page({**data,'page_size':1},0)
         checks['source_readable']=result.get('contract')=='ordered_sync_v1'
     except Exception as exc:checks['source_readable']=False;errors.append(str(exc))
-    try:
-        result=run_cli(['lark-cli','--profile',data['lark_profile'],'im','chats','get','--chat-id',data['feishu_chat_id'],'--as','bot','--format','json'])
-        checks['target_visible']=True;checks['target_name']=result.get('data',{}).get('name','')
-        members=run_cli(['lark-cli','--profile',data['lark_profile'],'im','+chat-members-list','--chat-id',data['feishu_chat_id'],'--member-types','bot','--page-all','--as','bot','--format','json'])
-        bots=payload_items(members,'bots','items')
-        # API schemas vary: list bot IDs explicitly; no substring matching.
-        checks['bot_in_chat']=any(str(p.get('app_id') or p.get('id') or p.get('member_id') or '')==str(profile['app_id'] if profile else '') for p in bots)
-        if not checks['bot_in_chat']:errors.append('未在目标群机器人列表中确认该 App ID')
-    except Exception as exc:checks['target_visible']=False;errors.append(str(exc))
+    target=check_target(data.get('lark_profile',''),data.get('feishu_chat_id',''),store)
+    checks.update(target['checks']);errors.extend(target['errors'])
     if store:
         for b in store.list_bindings(False):
             if b['id']==data.get('id'):continue
@@ -186,6 +197,13 @@ class Manager:
         if resource=='setup':return setup_status(self.config_path,s.path)
         if resource=='search/wechat':return search_wechat(query.get('q',''))
         if resource=='search/feishu':return search_feishu(query.get('profile',''),query.get('q',''))
+        if resource=='wizard/wechat':return search_wechat('',200)
+        if resource=='wizard/feishu':return search_feishu(query.get('profile',''),'')
+        if resource=='wizard/check-source':
+            from .wechat_feishu_mirror import source_page
+            result=source_page({'wechat_talker':query.get('talker',''),'page_size':1},0)
+            return {'ok':result.get('contract')=='ordered_sync_v1'}
+        if resource=='wizard/check-target':return check_target(query.get('profile',''),query.get('chat_id',''),s)
         if resource=='status':
             return {'version':'0.3','started_at':self.started,'bindings':[{**b,**s.status(b['id'])} for b in s.list_bindings()], 'confirmations':len(s.list_confirmations()),'media_failures':len(s.list_media_failures()),'actions':s.actions()[:20]}
         raise ValueError('接口不存在')
