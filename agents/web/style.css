@@ -7,3 +7,6 @@
 /* Wizard loading skeleton */
 .wzSkeleton{height:64px;border-radius:8px;background:linear-gradient(90deg,rgba(127,127,127,.15) 25%,rgba(127,127,127,.28) 37%,rgba(127,127,127,.15) 63%);background-size:400% 100%;animation:wzPulse 1.2s ease infinite;margin:8px 0}
 @keyframes wzPulse{0%{background-position:100% 0}100%{background-position:0 0}}
+/* Wizard create-group form */
+.wzCheck{display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer}
+.wzCheck input{width:auto;margin:0}

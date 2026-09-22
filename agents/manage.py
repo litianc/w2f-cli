@@ -287,6 +287,20 @@ class Manager:
                 if not data.get('confirm'):raise ValueError('请确认重置引导草稿；已启动绑定和凭证不会删除')
                 s.save_setting('setup_draft',{});result=self.get('setup')
             else:raise ValueError('不支持的初始化操作')
+        elif resource=='wizard' and op=='create-target':
+            profile=str(data.get('profile') or '');name=str(data.get('name') or '').strip()
+            if not profile:raise ValueError('请先选择发送 Profile')
+            if not name:raise ValueError('请填写新群名称')
+            if len(name)>60:raise ValueError('群名称最长 60 字')
+            args=['lark-cli','--profile',profile,'im','+chat-create','--name',name,'--as','bot','--format','json']
+            if data.get('add_owner'):
+                owner=str(data.get('owner_open_id') or '').strip()
+                if not owner.startswith('ou_'):raise ValueError('勾选「拉我进群」时需填写本人 open_id（ou_ 开头）')
+                args+=['--users',owner]
+            payload=run_cli(args)
+            chat_id=str((payload.get('data') or {}).get('chat_id') or payload.get('chat_id') or '')
+            if not chat_id:raise ValueError('飞书未返回 chat_id；请先到飞书确认群是否已建成，再刷新列表选择')
+            result={'chat_id':chat_id,'name':name,'profile':profile}
         elif resource=='media-failures' and op=='retry':
             with s.connect() as db:
                 row=db.execute('SELECT * FROM media_jobs WHERE id=?',(int(data['id']),)).fetchone()
