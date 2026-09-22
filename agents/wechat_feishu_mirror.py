@@ -865,7 +865,7 @@ def stream(config, state=None):
             if control=='paused':
                 store.update_recovery(bid,phase='paused');stopped.wait(0.5);wait_until=0;continue
             if time.monotonic()<wait_until:
-                stopped.wait(0.5)
+                stopped.wait(0.1)
                 if wakeup.is_set(): wakeup.clear();wait_until=0
                 continue
             try:
@@ -906,6 +906,13 @@ def main():
     parser.add_argument('--binding-id',type=int,default=1)
     parser.add_argument('--once',action='store_true',help='Read one source page without sending or advancing cursor')
     args=parser.parse_args();config=runtime_paths(load_json(args.config,{}))
+    # A configured reader path must hold for every process in the chain
+    # (manager, spawner, worker) regardless of inherited environment.
+    reader_override = str(config.get('wechat_reader') or '').strip()
+    if reader_override:
+        global WECHAT_READER
+        os.environ['WECHAT_READER'] = reader_override
+        WECHAT_READER = Path(reader_override)
     if args.db: config['sqlite_file']=str(args.db.resolve())
     store=MirrorStore(config['sqlite_file']);store.initialize(config)
     bid=args.binding_id;binding=store.get_binding(bid)

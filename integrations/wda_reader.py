@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -161,14 +162,26 @@ def _forward_items(content: str) -> list:
 def cmd_sync_page(args: argparse.Namespace) -> dict:
     talker = args.talker
     after = int(args.after_local_id)
-    names = member_names(talker)
     high = latest_local_id(talker)
     if args.through_local_id is not None:
         high = min(high, int(args.through_local_id))
     if high <= after:
         return _page([], high, False, None)
 
-    pending = fetch_window(talker, want=high - after)
+    # Member names and the message window are independent lookups; the WDA
+    # API costs ~2s per call, so overlap them on the delivery path.
+    names: dict[str, str] = {}
+    window: list[dict] = []
+    def load_names() -> None:
+        nonlocal names
+        names = member_names(talker)
+    def load_window() -> None:
+        nonlocal window
+        window = fetch_window(talker, want=high - after)
+    threads = [threading.Thread(target=load_names), threading.Thread(target=load_window)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    pending = window
     after_time = args.page_after_time
     after_local = int(args.page_after_local_id or 0)
 

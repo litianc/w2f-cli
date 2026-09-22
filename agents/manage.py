@@ -369,6 +369,13 @@ def main():
     for child in sub.choices.values():
         child.add_argument('--config',default=argparse.SUPPRESS,type=Path);child.add_argument('--db',default=argparse.SUPPRESS,type=Path)
     args=p.parse_args();config=read_config(args.config)
+    # Reader overrides from the runtime config apply to manager-side reader
+    # calls (group search, preflight) the same way they do for workers.
+    reader_override = str(config.get('wechat_reader') or '').strip()
+    if reader_override:
+        global READER
+        os.environ['WECHAT_READER'] = reader_override
+        READER = Path(reader_override)
     db=args.db or Path(config['sqlite_file']);store=MirrorStore(db);store.initialize(config);manager=Manager(store,args.config)
     if args.command=='serve':serve(store,args.config,args.host,args.port);return 0
     if args.command=='status':result=manager.get('status')
