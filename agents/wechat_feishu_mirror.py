@@ -314,25 +314,32 @@ def media_url(row: dict[str, Any]) -> str | None:
     return None
 
 
-def reader_media_paths(row: dict[str, Any]) -> list[Path]:
-    """Ask the read-only reader for local resources belonging to one message."""
+def reader_media_result(row: dict[str, Any]) -> tuple[list[Path], bool]:
+    """Ask the read-only reader for local resources belonging to one message.
+
+    Returns (paths, thumbnail_only); the optional contract field
+    "thumbnail_only" marks a degraded image the reader could only find at
+    preview quality, so the sender can flag it on the mirrored message.
+    """
     talker = str(row.get("talker") or "")
     local_id = str(row.get("local_id") or "")
     if not talker or not local_id:
-        return []
+        return [], False
     cmd = [str(WECHAT_READER), "media", "--talker", talker, "--local-id", local_id, "--include-local-paths", "true"]
     server_id = str(row.get("server_id") or "")
     if server_id:
         cmd.extend(["--server-id", server_id])
     try:
-        proc = subprocess.run(cmd, cwd=ROOT, text=True, encoding="utf-8", capture_output=True, timeout=20)
+        proc = subprocess.run(cmd, cwd=ROOT, text=True, encoding="utf-8", capture_output=True, timeout=45)
         if proc.returncode:
-            return []
+            return [], False
         payload = json.loads(proc.stdout)
     except (OSError, ValueError, subprocess.TimeoutExpired):
-        return []
+        return [], False
     found = []
+    thumbnail_only = False
     for resource in payload.get('data', payload).get('resources', []):
+        thumbnail_only = thumbnail_only or bool(resource.get('thumbnail_only'))
         for value in resource.get('local_paths', []):
             path = Path(value).expanduser()
             if path.is_file():
@@ -342,7 +349,12 @@ def reader_media_paths(row: dict[str, Any]) -> list[Path]:
             path = Path(resource['local_path']).expanduser()
             if path.is_file():
                 found.append(path)
-    return list(dict.fromkeys(found))
+    return list(dict.fromkeys(found)), thumbnail_only
+
+
+def reader_media_paths(row: dict[str, Any]) -> list[Path]:
+    """Local reader resources for one message (see reader_media_result)."""
+    return reader_media_result(row)[0]
 
 
 def wechat_cache_paths(row: dict[str, Any]) -> list[Path]:
@@ -401,11 +413,20 @@ def media_doctor(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def stage_media(row: dict[str, Any], kind: str) -> str | None:
-    """Stage a reader-provided local file, then fall back to a normal URL."""
-    local_candidates = reader_media_paths(row)
+def stage_media(row: dict[str, Any], kind: str) -> tuple[str | None, bool]:
+    """Stage a reader-provided local file, then fall back to a normal URL.
+
+    Returns (path, thumbnail_only). When several local candidates exist the
+    largest file wins: the desktop WeChat cache often keeps a thumbnail next
+    to the original, and size reliably prefers the original.
+    """
+    local_candidates, thumbnail_only = reader_media_result(row)
     if not local_candidates:
         local_candidates = wechat_cache_paths(row)
+    try:
+        local_candidates = sorted(local_candidates, key=lambda item: item.stat().st_size, reverse=True)
+    except OSError:
+        pass
     source_path = local_candidates[0] if local_candidates else None
     media_dir = Path(os.environ.get("W2F_MEDIA_DIR", os.environ.get("CHZ_MEDIA_DIR", str(row.get("media_dir") or MEDIA_DIR)))).expanduser()
     namespace = str(row.get("binding_id",1)) + "-" + hashlib.sha1(str(row.get("talker") or "default").encode()).hexdigest()[:10]
@@ -421,12 +442,12 @@ def stage_media(row: dict[str, Any], kind: str) -> str | None:
                 path = next((media_dir / f"{namespace}-{local_id}{ext}" for ext in (".png",".jpg",".gif",".webp") if (media_dir / f"{namespace}-{local_id}{ext}").is_file()), path)
             else:
                 shutil.copy2(source_path, path)
-            return str(path)
+            return str(path), thumbnail_only
         except OSError as exc:
             print(f"本地媒体暂存失败 local_id={local_id}: {type(exc).__name__}", file=sys.stderr, flush=True)
     url = media_url(row)
     if not url or not url.startswith(("http://", "https://")):
-        return None
+        return None, thumbnail_only
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "wechat-feishu-mirror/1.0"})
         with urllib.request.urlopen(request, timeout=20) as response:
@@ -440,7 +461,7 @@ def stage_media(row: dict[str, Any], kind: str) -> str | None:
         media_dir.mkdir(parents=True, exist_ok=True)
         path = media_dir / f"{namespace}-{local_id}{ext}"
         path.write_bytes(payload)
-        return str(path)
+        return str(path), thumbnail_only
     except Exception as exc:
         if isinstance(exc,CliError):raise
         raise CliError('download_failed: 媒体下载失败 '+type(exc).__name__) from None
@@ -658,11 +679,15 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
                 label = {'sticker':'表情','emoji':'表情','image':'图片','video':'视频','file':'文件','voice':'语音','audio':'语音'}.get(kind,'媒体')
                 enriched = {**row,'binding_id':bid,'media_dir':config.get('media_dir', str(MEDIA_DIR))}
                 try:
-                    media_input = stage_sticker(enriched) if kind in {'sticker','emoji'} else stage_media(enriched,kind)
+                    if kind in {'sticker','emoji'}:
+                        media_input,thumbnail_only = stage_sticker(enriched),False
+                    else:
+                        media_input,thumbnail_only = stage_media(enriched,kind)
                     if not media_input:
                         raise CliError('resource_missing: 本机未找到可上传资源')
                     if not config.get('_retry_media'):
-                        send('name',target+['--text',f'{name}：'])
+                        note='（原图未同步，已发送缩略图）' if thumbnail_only else ''
+                        send('name',target+['--text',f'{name}：{note}'])
                     flag='--image' if kind in {'image','sticker','emoji'} else '--file'
                     media_args = [flag,media_input]
                     if kind=='video':

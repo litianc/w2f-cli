@@ -116,7 +116,7 @@ class OfflineAcceptance(unittest.TestCase):
         rows=self.rows(2);rows[0]['kind_name']='image'
         image=self.root/'photo.png';image.write_bytes(b'fixture')
         self.sink.fail_at=1
-        with patch.object(m,'stage_media',return_value=str(image)):
+        with patch.object(m,'stage_media',return_value=(str(image),False)):
             with self.assertRaises(m.CliError):m.recover_once(self.config,self.store,History(rows))
             m.recover_once(self.config,self.store,History(rows))
         self.assertEqual(sum('--image' in args for _,args in self.sink.sent),1)
@@ -203,7 +203,7 @@ class OfflineAcceptance(unittest.TestCase):
             db.execute("UPDATE media_jobs SET state='pending'")
         self.store.rename_person(self.store.list_people()[0]['id'],'新实名')
         image=self.root/'repair.png';image.write_bytes(b'fixture')
-        with patch.object(m,'stage_media',return_value=str(image)):
+        with patch.object(m,'stage_media',return_value=(str(image),False)):
             m.retry_media_jobs(self.config,self.store)
         args=self.sink.sent[-1][1]
         self.assertEqual(args[0],'+messages-reply')
@@ -223,7 +223,7 @@ class OfflineAcceptance(unittest.TestCase):
         def stage(row,*args):
             suffix={'image':'.png','video':'.mp4','file':'.pdf','voice':'.ogg','sticker':'.gif'}[row['kind_name']]
             path=self.root/(str(row['local_id'])+suffix);path.write_bytes(b'fixture');return str(path)
-        with patch.object(m,'stage_media',side_effect=stage),patch.object(m,'stage_sticker',side_effect=stage),patch.object(m,'video_cover',return_value=self.root/'cover.jpg'):
+        with patch.object(m,'stage_media',side_effect=lambda row,kind:(stage(row,kind),False)),patch.object(m,'stage_sticker',side_effect=stage),patch.object(m,'video_cover',return_value=self.root/'cover.jpg'):
             m.recover_once(self.config,self.store,History(rows,2))
             offline=[a for _,a in self.sink.sent]
             # A separate fresh database receives one source arrival per poll.

@@ -155,10 +155,31 @@ class MirrorFormattingTest(unittest.TestCase):
             source = root / "901_thumb.jpg"
             source.write_bytes(b"image")
             destination = root / "staging"
-            with patch.object(mirror, "reader_media_paths", return_value=[]):
-                staged = mirror.stage_media({"binding_id": 1, "talker": "room", "local_id": 901, "wechat_cache_dirs": [str(root)], "media_dir": str(destination)}, "image")
+            with patch.object(mirror, "reader_media_result", return_value=([], False)):
+                staged, thumbnail_only = mirror.stage_media({"binding_id": 1, "talker": "room", "local_id": 901, "wechat_cache_dirs": [str(root)], "media_dir": str(destination)}, "image")
             self.assertTrue(staged)
+            self.assertFalse(thumbnail_only)
             self.assertEqual(Path(staged).read_bytes(), b"image")
+
+    def test_stage_media_prefers_largest_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            thumb = root / "901_thumb.jpg"
+            original = root / "901_original.jpg"
+            thumb.write_bytes(b"thumb")
+            original.write_bytes(b"original-image-bytes")
+            with patch.object(mirror, "reader_media_result", return_value=([thumb, original], False)):
+                staged, thumbnail_only = mirror.stage_media({"binding_id": 1, "talker": "room", "local_id": 901, "media_dir": str(root / "staging")}, "image")
+            self.assertEqual(Path(staged).read_bytes(), b"original-image-bytes")
+            self.assertFalse(thumbnail_only)
+
+    def test_reader_media_result_reports_thumbnail_only(self):
+        completed = type("Completed", (), {"returncode": 0, "stdout": '{"data":{"resources":[{"local_paths":["/tmp/example.jpg"],"thumbnail_only":true}]}}', "stderr": ""})()
+        with patch.object(mirror.subprocess, "run", return_value=completed):
+            with patch.object(Path, "is_file", return_value=True):
+                paths, thumbnail_only = mirror.reader_media_result({"talker": "talker", "local_id": 9})
+        self.assertEqual(paths, [Path("/tmp/example.jpg")])
+        self.assertTrue(thumbnail_only)
 
     def test_wechat_dat_decoder_accepts_xor_image(self):
         image = Image.new("RGB", (2, 2), (255, 0, 0))

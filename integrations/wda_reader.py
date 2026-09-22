@@ -260,12 +260,28 @@ def fetch_media(path: str, **params) -> tuple[bytes, str] | None:
         raise WdaError(f"WDA 不可达（{WDA_BASE}）：{exc}") from None
 
 
+def _cached_file(root: Path, key: str) -> Path | None:
+    return next((p for p in root.glob(f"{key}.*") if p.is_file() and p.stat().st_size > 0), None)
+
+
+def _media_result(target: Path, thumbnail_only: bool) -> dict:
+    resource: dict = {"local_paths": [str(target)]}
+    if thumbnail_only:
+        resource["thumbnail_only"] = True
+    return {"ok": True, "data": {"resources": [resource]}}
+
+
 def cmd_media(args: argparse.Namespace) -> dict:
     """Real local file for one message's media, per the HTTP-staging route.
 
-    Empty resources keep w2f on its placeholder + media_jobs retry path;
-    we never fabricate a path. Errors on WDA reach stay fatal (exit 1) so
-    the worker surfaces the disconnect instead of mass-placeholdering.
+    Images prefer the original: the desktop cache usually holds only a
+    thumbnail, so the first attempt asks WDA to fetch the original from CDN
+    (fetch_remote); when that fails (expired/absent) we fall back to the
+    thumbnail and flag it "thumbnail_only" so the worker can say so on the
+    mirrored message. Empty resources keep w2f on its placeholder +
+    media_jobs retry path; we never fabricate a path. Errors on WDA reach
+    stay fatal (exit 1) so the worker surfaces the disconnect instead of
+    mass-placeholdering.
     """
     talker = args.talker
     local_id = int(args.local_id)
@@ -276,32 +292,45 @@ def cmd_media(args: argparse.Namespace) -> dict:
     wda_type = int(message.get("type") or 0)
     base = wda_type & 0xFFFFFFFF
     server_id = str(message.get("serverId") or args.server_id or "")
-    attempts: list[tuple[str, dict, str]] = []
+    attempts: list[tuple[str, dict, str, bool]] = []
     if message.get("imageMd5"):
-        attempts.append(("/api/chat/media/image", {"md5": message["imageMd5"], "deep_scan": "true"}, message["imageMd5"]))
+        md5 = message["imageMd5"]
+        attempts.append(("/api/chat/media/image",
+                         {"md5": md5, "deep_scan": "true", "fetch_remote": "true"},
+                         f"{md5}.orig", False))
+        attempts.append(("/api/chat/media/image",
+                         {"md5": md5, "deep_scan": "true"},
+                         f"{md5}.thumb", True))
     if message.get("emojiMd5"):
-        attempts.append(("/api/chat/media/emoji", {"md5": message["emojiMd5"], "username": talker}, message["emojiMd5"]))
+        attempts.append(("/api/chat/media/emoji", {"md5": message["emojiMd5"], "username": talker}, message["emojiMd5"], False))
     if message.get("videoMd5"):
         attempts.append(("/api/chat/media/video", {"md5": message["videoMd5"], "username": talker,
-                                                   "server_id": server_id or None}, message["videoMd5"]))
+                                                   "server_id": server_id or None}, message["videoMd5"], False))
     if message.get("fileMd5"):
-        attempts.append((f"/api/media/resource/{message['fileMd5']}", {}, message["fileMd5"]))
+        attempts.append((f"/api/media/resource/{message['fileMd5']}", {}, message["fileMd5"], False))
     if base == 34 and server_id.isdigit():
-        attempts.append(("/api/chat/media/voice", {"server_id": int(server_id)}, f"voice-{server_id}"))
+        attempts.append(("/api/chat/media/voice", {"server_id": int(server_id)}, f"voice-{server_id}", False))
 
     root = Path(os.environ.get("W2F_WDA_CACHE", str(Path.home() / ".local/share/w2f-cli/wda-cache")))
     root.mkdir(parents=True, exist_ok=True)
-    for path, params, cache_key in attempts:
-        cached = next((p for p in root.glob(f"{cache_key}.*") if p.is_file() and p.stat().st_size > 0), None)
+    for path, params, cache_key, thumbnail_only in attempts:
+        if thumbnail_only:
+            # An earlier run may already have staged the original; serve it.
+            # Match the .orig suffix exactly — a bare prefix would also hit
+            # this attempt's own .thumb cache file.
+            original = _cached_file(root, cache_key.removesuffix(".thumb") + ".orig")
+            if original:
+                return _media_result(original, False)
+        cached = _cached_file(root, cache_key)
         if cached:
-            return {"ok": True, "data": {"resources": [{"local_paths": [str(cached)]}]}}
+            return _media_result(cached, thumbnail_only)
         fetched = fetch_media(path, **params)
         if not fetched or not fetched[0]:
             continue
         payload, content_type = fetched
         target = root / f"{cache_key}{CONTENT_TYPES.get(content_type, '.bin')}"
         target.write_bytes(payload)
-        return {"ok": True, "data": {"resources": [{"local_paths": [str(target)]}]}}
+        return _media_result(target, thumbnail_only)
     return {"ok": True, "data": {"resources": []}}
 
 
