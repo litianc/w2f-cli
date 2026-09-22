@@ -57,34 +57,54 @@ Codex 负责服务控制和维护，Worker 负责持续读取与发送。项目�
 
 ### 1. 准备环境
 
-当前接入方式面向已安装并登录微信的 macOS 电脑。需要：
+支持 macOS 与 Windows 两类接入，微信侧依赖不同、其余完全同一套代码：
+
+| 能力 | macOS | Windows |
+| --- | --- | --- |
+| 微信读取器 | `rion-wechat-cli` | [WeChatDataAnalysis](https://github.com/LifeArchiveProject/WeChatDataAnalysis) + 内置适配层 |
+| 近实时唤醒 | 常规轮询 | 可选 `realtime_wakeup`（SSE 事件） |
+| 媒体管线 | 读取器本地路径 | WDA 解密接口 + 本地暂存缓存 |
+| Worker / 管理台 / CLI / 飞书发送 | ✅ 同一套 | ✅ 同一套 |
+
+两个平台共同需要：
 
 - Python 3.10+。
-- 已获本机只读授权的微信读取 CLI（`rion-wechat-cli`）。
-- 已安装的 `lark-cli`，以及具备目标群访问、消息发送和所需媒体权限的飞书机器人应用。
-- `ffmpeg`：用于生成视频封面；缺少时使用文件附件。
+- 已安装并登录微信。
+- `lark-cli`，以及具备目标群访问、消息发送和所需媒体权限的飞书机器人应用（Worker 优先用 PATH 中的 `lark-cli`，找不到时自动检查 `~/.local/bin/lark-cli`）。
+- `ffmpeg`（可选）：用于生成视频封面；缺少时使用文件附件。
 
 Node.js 只用于网页脚本检查和可选的 Remotion 宣传片制作，不是同步服务的运行依赖。
-
-在 macOS 上，Worker 会优先使用 PATH 中的 `lark-cli`；如果 PATH 未包含本地用户程序目录，也会自动检查 `~/.local/bin/lark-cli`。可用官方 CLI 仓库的发布包安装，启动前用 `lark-cli --version` 验证。
 
 在项目根目录安装依赖：
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 python3 -m pip install -r requirements.txt
 ```
 
 ### 2. 接入微信读取器
 
-按微信读取 CLI 的首次接入流程授权，并确认 `reader.sh access-plan` 可读。然后为已安装读取器增加完整分页扩展，将下列路径替换为实际的引擎文件：
+**macOS**：按微信读取 CLI 的首次接入流程授权，并确认 `reader.sh access-plan` 可读。然后为已安装读取器增加完整分页扩展，将下列路径替换为实际的引擎文件：
 
 ```bash
 python3 scripts/install_reader_sync.py /实际路径/rion_wechat_reader.py
 ```
 
 脚本保留引擎备份，只添加 `sync-page`，不修改微信数据库。重新安装读取器后需要重新应用扩展；可通过 `WECHAT_READER` 指定兼容的 CLI 入口。
+
+**Windows**：安装并登录桌面版微信（4.x），保持 [WeChatDataAnalysis](https://github.com/LifeArchiveProject/WeChatDataAnalysis) 运行（本地 API 默认 `http://localhost:10392`，首次使用需在其界面内完成密钥提取与数据库解密）。然后生成适配层垫片并在运行配置中登记：
+
+```powershell
+.venv\Scripts\python scripts\install_wda_reader.py
+```
+
+```json
+"wechat_reader": "C:\\...\\integrations\\wda_reader.cmd",
+"realtime_wakeup": true
+```
+
+两个平台的读取器都必须实现[读取器契约](docs/读取器契约.md)（`sync-page` / `resolve-chat` / `media`，`ordered_sync_v1` 有序分页）。
 
 ### 3. 打开管理台，完成引导
 
@@ -148,11 +168,12 @@ python3 -m agents.manage status
 
 ## 当前边界
 
-- **时效性**：默认定时检查为 10 分钟，不保证秒级同步。
+- **时效性**：默认定时检查为 10 分钟，不保证秒级同步；Windows 端可开启 `realtime_wakeup` 事件唤醒。
 - **媒体可用性**：新格式加密图片、转发记录内独立媒体和超过 100 MB 的文件仍需后续适配；源端缺失的资源会保留占位。
 - **视频号**：卡片与链接已做解析处理，跨应用跳转仍待完善，不能保证在飞书中直接播放或打开。
 - **恢复条件**：续传依赖微信历史仍可读取；已删除的历史或缺失的原文件无法凭空重建。
 - **不确定回执**：发送结果不确定且超过平台去重窗口时暂停等待核对，避免盲目重复发送。
+- **Windows 读取器依赖**：Windows 端读取依赖第三方项目 WeChatDataAnalysis（本项目不维护其解密能力；微信大版本更新可能需要其跟进适配，密钥提取需要微信保持登录）。适配层以 WDA v2.6.0 实测为准；WDA 不可用时自动回落为断线重连，游标不丢。
 
 ## 开发与验证
 
@@ -176,5 +197,6 @@ git diff --check
 - [Agent 运行规范](docs/微信飞书镜像%20Agent%20运行规范.md)
 - [宣传片 Remotion 工程](promo/README.md)
 - [新机器部署前置准备](docs/新机器部署前置准备.md)
+- [读取器契约](docs/读取器契约.md)
 
 当前文件检查不覆盖 Git 历史。旧历史中仍有早期个人接入记录和配置，公开推送前需清理历史或从脱敏工作树新建公开仓库；项目不会自动推送或重写历史。
