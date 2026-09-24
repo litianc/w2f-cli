@@ -643,10 +643,16 @@ def forward_body(row, config, store):
 def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any], store: MirrorStore) -> None:
     key = message_key(row); bid = int(config.get('binding_id',1))
     kind = str(row.get('kind_name') or 'text')
+    transcript = str(row.get('voice_transcript') or '').strip() if kind in {'voice','audio'} else ''
     store.upsert_message(key,row,kind,binding_id=bid,source_account=str(config.get('source_account','default')))
     message = store.message(key,bid)
     if message['state'] in {'sent','placeholder'} and not config.get('_retry_media'):
         return
+    if transcript:
+        # 转写优先（Spec P1）：行内转写就是这条语音的文本形态，按文本投递，
+        # 不再进入媒体链路；存储类型保持 voice 如实记录来源。
+        row = {**row, 'kind_name': 'text', 'text': transcript}
+        kind = 'text'
     if config.get('_guard') and config.get('_check_profile'):
         from agents.manage import profile_list
         profile_list(store)

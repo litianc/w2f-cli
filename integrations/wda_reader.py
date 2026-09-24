@@ -119,6 +119,10 @@ def map_row(talker: str, message: dict, names: dict[str, str]) -> dict:
         kind, text = "image", content          # XML with cdnurl -> w2f media_url
     elif base == 34:
         kind, text = "voice", content
+        # 行内转写（微信自带）作为契约可选字段透传；交付决策在 worker。
+        transcript = str(message.get("voiceTranscript") or "").strip()
+        if transcript:
+            row["voice_transcript"] = transcript
     elif base == 43 or wda_type == 62:
         kind, text = "video", content
     elif base == 47:
