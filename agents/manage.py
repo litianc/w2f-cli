@@ -184,6 +184,54 @@ def binding_action(store,config_path,binding_id,action):
     return run_cli(args)
 
 
+class Watchdog:
+    """Restart dead workers of running bindings (Spec 最小守护集）。
+
+    Only control-state 'running' bindings are touched: a clean stop or pause
+    flips the control state first, so user-stopped bindings are never
+    resurrected. Restart attempts back off per binding; after max_fails
+    consecutive failures the binding is parked as stopped with a visible
+    reason instead of flapping forever. The mirror-side start path is
+    idempotent under its launch/lifetime locks, so a racing restart is safe.
+    """
+    def __init__(self,store,config_path,restart=None,min_gap=60.0,max_fails=5):
+        self.store=store;self.config_path=Path(config_path)
+        self.restart=restart or (lambda bid:binding_action(store,self.config_path,bid,'start'))
+        self.min_gap=min_gap;self.max_fails=max_fails;self.last={};self.fails={}
+    def once(self,now=None):
+        now=time.time() if now is None else now;restarted=[]
+        for binding in self.store.list_bindings(False):
+            bid=binding['id']
+            if not binding.get('enabled'):continue
+            st=self.store.status(bid)
+            if st['control'].get('status')!='running':
+                self.fails.pop(bid,None);self.last.pop(bid,None);continue
+            if st['worker']['alive']:
+                self.fails.pop(bid,None);self.last.pop(bid,None);continue
+            if now-self.last.get(bid,0.0)<self.min_gap:continue
+            self.last[bid]=now
+            try:self.restart(bid)
+            except Exception as exc:
+                self.fails[bid]=self.fails.get(bid,0)+1
+                print(f"watchdog: 绑定 {bid} 第 {self.fails[bid]} 次重启失败: {exc}",file=sys.stderr,flush=True)
+                if self.fails[bid]>=self.max_fails:
+                    self.store.set_control(bid,'stopped',reason='watchdog 放弃：连续重启失败，请人工排查')
+                    self.store.audit('watchdog.give_up',after={'binding_id':bid},actor='watchdog',binding_id=bid)
+                    self.fails.pop(bid,None);self.last.pop(bid,None)
+                continue
+            # A user stop may land while the restart is in flight; the worker
+            # honours the control state on its own, only annotate when running.
+            if self.store.status(bid)['control'].get('status')=='running':
+                self.store.set_control(bid,'running',reason='watchdog restart')
+            self.store.audit('watchdog.restart',after={'binding_id':bid},actor='watchdog',binding_id=bid)
+            self.fails.pop(bid,None);restarted.append(bid)
+        return restarted
+    def loop(self,interval=15.0,stop=None):
+        stop=stop or threading.Event()
+        print(json.dumps({'watchdog':'started','interval':interval}),flush=True)
+        while not stop.wait(interval):self.once()
+
+
 class Manager:
     def __init__(self,store,config_path):self.store=store;self.config_path=Path(config_path);self.started=time.time()
     def get(self,resource,query=None):
@@ -398,6 +446,7 @@ def main():
     for name in ('profiles','bindings','people','confirmations','media-failures','uncertain','setup'):
         child=sub.add_parser(name);child.add_argument('action',nargs='?',default='list');child.add_argument('--op');child.add_argument('--id',type=int);child.add_argument('--data');child.add_argument('--name');child.add_argument('--profile-name');child.add_argument('--app-id');child.add_argument('--new-name');child.add_argument('--health',action='store_true');child.add_argument('--app-secret-stdin',action='store_true')
     sub.add_parser('status');sv=sub.add_parser('serve');sv.add_argument('--port',type=int,default=0);sv.add_argument('--host',default='127.0.0.1')
+    wd=sub.add_parser('watchdog');wd.add_argument('--interval',type=float,default=15.0);wd.add_argument('--once',action='store_true')
     for child in sub.choices.values():
         child.add_argument('--config',default=argparse.SUPPRESS,type=Path);child.add_argument('--db',default=argparse.SUPPRESS,type=Path)
     args=p.parse_args();config=read_config(args.config)
@@ -410,6 +459,11 @@ def main():
         READER = Path(reader_override)
     db=args.db or Path(config['sqlite_file']);store=MirrorStore(db);store.initialize(config);manager=Manager(store,args.config)
     if args.command=='serve':serve(store,args.config,args.host,args.port);return 0
+    if args.command=='watchdog':
+        dog=Watchdog(store,args.config)
+        if args.once:print(json.dumps({'restarted':dog.once()},ensure_ascii=False))
+        else:dog.loop(args.interval)
+        return 0
     if args.command=='status':result=manager.get('status')
     else:
         op=args.op or args.action

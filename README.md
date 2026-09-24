@@ -51,7 +51,7 @@ flowchart LR
 
 首次启动一条新绑定时，从当前最新消息开始。后续启动、恢复或重连使用保存的进度，先完整读取离线区间，再按源时间与消息序号依次发送。姓名和群配置由数据库统一提供。
 
-Codex 负责服务控制和维护，Worker 负责持续读取与发送。项目不安装开机任务或进程异常自动重启服务；Worker 异常退出后，由用户通知 Codex 重新启动。
+Codex 负责服务控制和维护，Worker 负责持续读取与发送。按产品 Spec 的最小守护集：`python3 -m agents.manage watchdog` 自动拉起异常退出的 Worker（连续重启失败会停机并留痕，等待人工排查）；开机自启与更重的进程管家不在范围内。
 
 ## 快速开始
 
@@ -145,6 +145,7 @@ python3 -m agents.manage status
 | 查看人员档案 | `python3 -m agents.manage people list` |
 | 查看待确认事项 | `python3 -m agents.manage confirmations list` |
 | 启动 / 异常退出后重启 | `python3 -m agents.manage bindings start --id 1` |
+| 守护运行（自动拉起异常退出的 Worker） | `python3 -m agents.manage watchdog` |
 | 暂停 | `python3 -m agents.manage bindings pause --id 1` |
 | 恢复暂停中的 Worker | `python3 -m agents.manage bindings resume --id 1` |
 | 停止 | `python3 -m agents.manage bindings stop --id 1` |
