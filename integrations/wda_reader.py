@@ -78,6 +78,26 @@ def fetch_window(talker: str, want: int) -> list[dict]:
     return collected
 
 
+ALL_MENTION_IDS = {"announceall", "notification@all", "notify@all", "@all"}
+
+
+def _annotate_mentions(content: str, message: dict, names: dict[str, str]) -> str:
+    """Keep @ hints visible when the raw text dropped them (P1 text form).
+
+    Windows WeChat text usually carries "@昵称" inline already; in that case
+    this is a no-op. Real @-Feishu-user mentions need the identity mapping
+    and are deferred to the SaaS stage per the product spec.
+    """
+    ats = [str(u) for u in (message.get("atUsernames") or []) if u]
+    if not ats:
+        return content
+    display = ["全体成员" if u in ALL_MENTION_IDS else (names.get(u) or u) for u in ats]
+    if any(f"@{name}" in content for name in display):
+        return content
+    prefix = " ".join(f"@{name}" for name in display)
+    return f"{prefix} {content}" if content else prefix
+
+
 def map_row(talker: str, message: dict, names: dict[str, str]) -> dict:
     """One WDA message -> one w2f payload row (see ticket 02 mapping table)."""
     wda_type = int(message.get("type") or 0)
@@ -94,7 +114,7 @@ def map_row(talker: str, message: dict, names: dict[str, str]) -> dict:
     }
 
     if base == 1:
-        kind, text = "text", content
+        kind, text = "text", _annotate_mentions(content, message, names)
     elif base == 3:
         kind, text = "image", content          # XML with cdnurl -> w2f media_url
     elif base == 34:
