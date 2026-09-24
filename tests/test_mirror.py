@@ -81,6 +81,14 @@ class MirrorFormattingTest(unittest.TestCase):
     def test_xml_url_and_unknown_sender_fallback(self):
         row = {"text": '<msg><img cdnurl = "https://example.test/a.png&amp;x=1" /></msg>'}
         self.assertEqual(mirror.media_url(row), "https://example.test/a.png&x=1")
+
+    def test_media_url_prefers_big_image_fields_for_images(self):
+        xml = '<msg><img cdnurl="https://example.test/thumb.png" cdnmidimgurl="https://example.test/mid.png" cdnbigimgurl="https://example.test/big.png" /></msg>'
+        self.assertEqual(mirror.media_url({"text": xml}, kind="image"), "https://example.test/big.png")
+        mid_only = xml.replace('cdnbigimgurl="https://example.test/big.png" ', '')
+        self.assertEqual(mirror.media_url({"text": mid_only}, kind="image"), "https://example.test/mid.png")
+        # 非 图片 kind 或未指定 kind 时保持原字段顺序（语音/文件等不受影响）。
+        self.assertEqual(mirror.media_url({"text": xml}), "https://example.test/thumb.png")
         self.assertEqual(mirror.clean_body({"kind_name": "sticker", "text": "ignored"}), "[表情]")
         with tempfile.TemporaryDirectory() as directory:
             store = MirrorStore(Path(directory) / "mirror.sqlite3")

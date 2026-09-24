@@ -304,10 +304,17 @@ def sticker_url(row: dict[str, Any]) -> str | None:
     return html.unescape(match.group(1)) if match else None
 
 
-def media_url(row: dict[str, Any]) -> str | None:
-    """Extract a downloadable URL from common WeChat XML media fields."""
+def media_url(row: dict[str, Any], kind: str | None = None) -> str | None:
+    """Extract a downloadable URL from common WeChat XML media fields.
+
+    图片消息的缩略图在 cdnurl，大图在 cdnbigimgurl / cdnmidimgurl（#2）；
+    仅图片 kind 时优先取大图字段。
+    """
     raw = str(row.get("text") or row.get("content") or "")
-    for field in ("cdnurl", "url", "videourl", "voiceurl", "fileurl", "externurl"):
+    fields = ("cdnurl", "url", "videourl", "voiceurl", "fileurl", "externurl")
+    if kind == "image":
+        fields = ("cdnbigimgurl", "cdnmidimgurl") + fields
+    for field in fields:
         match = re.search(rf'{re.escape(field)}\s*=\s*["\']([^"\']+)', raw, re.I)
         if match:
             return html.unescape(match.group(1))
@@ -445,7 +452,7 @@ def stage_media(row: dict[str, Any], kind: str) -> tuple[str | None, bool]:
             return str(path), thumbnail_only
         except OSError as exc:
             print(f"本地媒体暂存失败 local_id={local_id}: {type(exc).__name__}", file=sys.stderr, flush=True)
-    url = media_url(row)
+    url = media_url(row, kind=kind)
     if not url or not url.startswith(("http://", "https://")):
         return None, thumbnail_only
     try:
