@@ -379,6 +379,15 @@ class Manager:
             chat_id=str((payload.get('data') or {}).get('chat_id') or payload.get('chat_id') or '')
             if not chat_id:raise ValueError('飞书未返回 chat_id；请先到飞书确认群是否已建成，再刷新列表选择')
             result={'chat_id':chat_id,'name':name,'profile':profile}
+            # 入群链接是建群后的加分项：拿不到（权限未开通等）绝不阻塞建群。
+            try:
+                link_payload=run_cli(['lark-cli','--profile',profile,'api','POST',f'/open-apis/im/v1/chats/{chat_id}/link','--as','bot','--format','json'])
+                result['chat_link']=(link_payload.get('data') or {}).get('link') or link_payload.get('link')
+                if not result['chat_link']:result['link_note']='飞书未返回入群链接：可联系管理员添加成员入群。'
+            except Exception as exc:
+                from .wechat_feishu_mirror import safe_error
+                result['chat_link']=None
+                result['link_note']='获取入群链接失败（多为应用未开通 im 群链接权限）：可联系管理员添加成员入群。'+safe_error(exc)
         elif resource=='media-failures' and op=='retry':
             with s.connect() as db:
                 row=db.execute('SELECT * FROM media_jobs WHERE id=?',(int(data['id']),)).fetchone()

@@ -24,13 +24,29 @@ class WizardCreateTarget(unittest.TestCase):
         calls = []
         def fake_run(args, **kwargs):
             calls.append(args)
-            return {"data": {"chat_id": "oc_new"}}
+            return {"data": {"chat_id": "oc_new", "link": "https://example.test/join"}}
         with patch.object(manage, "run_cli", side_effect=fake_run):
             result = self.manager.post("wizard", {"op": "create-target", "profile": "p", "name": "新群",
                                                   "add_owner": True, "owner_open_id": "ou_me"})
-        self.assertEqual(result, {"chat_id": "oc_new", "name": "新群", "profile": "p"})
+        self.assertEqual(result["chat_id"], "oc_new")
+        self.assertEqual(result["chat_link"], "https://example.test/join")
         self.assertIn("+chat-create", calls[0])
         self.assertIn("ou_me", calls[0])
+        link_call = next(c for c in calls if "/im/v1/chats/" in " ".join(c))
+        self.assertIn("POST", link_call)
+        self.assertIn("/open-apis/im/v1/chats/oc_new/link", " ".join(link_call))
+        self.assertIn("bot", link_call)
+
+    def test_link_failure_degrades_without_blocking_create(self):
+        def fake_run(args, **kwargs):
+            if "+chat-create" in args:
+                return {"data": {"chat_id": "oc_new"}}
+            raise RuntimeError("PermissionError: 应用未开通对应权限")
+        with patch.object(manage, "run_cli", side_effect=fake_run):
+            result = self.manager.post("wizard", {"op": "create-target", "profile": "p", "name": "新群"})
+        self.assertEqual(result["chat_id"], "oc_new")
+        self.assertIsNone(result["chat_link"])
+        self.assertIn("权限", result["link_note"])
 
     def test_create_without_owner_omits_member_flag(self):
         with patch.object(manage, "run_cli", return_value={"data": {"chat_id": "oc_x"}}) as run:
