@@ -77,9 +77,10 @@ def task_register(config_path, db_path) -> dict:
     script = ("$action=New-ScheduledTaskAction -Execute '" + _quote(cmd["execute"])
               + "' -Argument '" + _quote(cmd["argument"])
               + "' -WorkingDirectory '" + _quote(cmd["working_directory"]) + "';"
-              # Domain-qualified: a bare logon name is not a valid -User value
-              # on domain-joined machines.
-              "$trigger=New-ScheduledTaskTrigger -AtLogOn -User ('{0}\\{1}' -f $env:USERDOMAIN,$env:USERNAME);"
+              # whoami resolves the real logon principal on local, domain and
+              # Azure AD joined machines alike; $env:USERDOMAIN is the device
+              # name on Azure AD joins and would fail SID lookup.
+              "$trigger=New-ScheduledTaskTrigger -AtLogOn -User (whoami);"
               "Register-ScheduledTask -TaskName '" + _quote(TASK_NAME) + "' -Action $action -Trigger $trigger"
               " -Description 'w2f mirror: restore console, watchdog and running bindings at logon' -Force|Out-Null;"
               "ConvertTo-Json @{registered=$true}")
@@ -151,7 +152,9 @@ def console_alive(session: dict) -> bool:
     try:
         with opener.open(f"http://127.0.0.1:{int(session['port'])}/", timeout=2) as response:
             return response.status == 200
-    except (OSError, ValueError):
+    except Exception:
+        # Includes http.client.HTTPException (e.g. BadStatusLine from a
+        # non-HTTP service that ended up on the recorded port).
         return False
 
 
@@ -228,7 +231,12 @@ def run_boot(store, config_path, db_path, start=None, spawn=None, console_check=
     watchdog_cmd = [sys.executable, "-m", "agents.manage", "watchdog",
                     "--config", str(config_path.resolve()), "--db", str(Path(db_path).resolve())]
     session = console_session(store)
-    alive = bool(session) and (console_check or console_alive)(session)
+    try:
+        alive = bool(session) and (console_check or console_alive)(session)
+    except Exception:
+        # A probe must never kill the boot pass: an unexpected exception here
+        # would leave both console and watchdog offline (worse than a respawn).
+        alive = False
     if not alive:
         # A second serve spawned in a race loses the console lock on startup
         # and exits; the lock is the final authority, the probe is a shortcut.

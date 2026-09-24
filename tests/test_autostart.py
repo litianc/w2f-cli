@@ -136,6 +136,16 @@ class BootTest(unittest.TestCase):
         self.assertEqual(len(spawned), 2)
         self.assertIn("database is locked", summary["error"])
 
+    def test_boot_survives_console_probe_crash(self):
+        spawned = []
+        def exploding_probe(state):
+            raise RuntimeError("BadStatusLine")
+        summary = autostart.run_boot(self.store, self.config_path, self.db_path,
+                                     start=lambda bid: None, spawn=lambda args, log: spawned.append(args),
+                                     console_check=exploding_probe)
+        self.assertEqual(len(spawned), 2)
+        self.assertEqual(summary["console"], "spawned")
+
 
 class TaskCommandTest(unittest.TestCase):
     def test_boot_command_uses_windowless_python_and_autostart(self):
@@ -163,7 +173,7 @@ class TaskCommandTest(unittest.TestCase):
         self.assertIn("Register-ScheduledTask", script)
         self.assertIn("AtLogOn", script)
         self.assertIn("WorkingDirectory", script)
-        self.assertIn("USERDOMAIN", script)
+        self.assertIn("whoami", script)
 
     def test_task_unregister_is_idempotent(self):
         calls = []
