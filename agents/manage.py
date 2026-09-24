@@ -253,7 +253,9 @@ class Manager:
                 self._autostart_cache=(time.time(),value)
                 return value
             finally:self._autostart_refresh.release()
-        return cached or {'task':autostart.TASK_NAME,'registered':False,'supported':autostart.supported()}
+        # Contended path: another thread is refreshing; serve the stale value
+        # (the dict, not the (timestamp, value) cache tuple).
+        return cached[1] if cached else {'task':autostart.TASK_NAME,'registered':False,'supported':autostart.supported()}
     def get(self,resource,query=None):
         query=query or {};s=self.store
         if resource=='profiles':return s.list_profiles()
@@ -401,7 +403,9 @@ class Manager:
             if op=='register':result={'task':autostart.TASK_NAME,**autostart.task_register(self.config_path,s.path)}
             elif op=='unregister':result={'task':autostart.TASK_NAME,**autostart.task_unregister()}
             else:raise ValueError('不支持的开机自启操作')
-            self._autostart_cache=(time.time(),result)
+            # Same lock as the poll path: an in-flight status snapshot must
+            # not overwrite the fresh register/unregister truth.
+            with self._autostart_refresh:self._autostart_cache=(time.time(),result)
         else:raise ValueError('不支持的管理操作')
         # Audit never captures Secret or arbitrary full request bodies.
         safe={k:v for k,v in data.items() if k in {'op','id','name','profile_name','person_id','message_id','part','new_name','remote_id'}}
@@ -494,9 +498,13 @@ def main():
     db=args.db or Path(config['sqlite_file']);store=MirrorStore(db);store.initialize(config);manager=Manager(store,args.config)
     if args.command=='serve':
         # Console singleton: a racing boot pass or manual serve must not end
-        # with two consoles on different ports; the loser exits here.
+        # with two consoles on different ports; the loser exits here — but
+        # still surfaces the running console's link (README documents that
+        # `serve` is how you get the URL).
         handle=autostart.singleton_lock(store.path.parent/'locks'/'console.lock')
-        if handle is None:print(json.dumps({'console':'already-running'}),flush=True);return 0
+        if handle is None:
+            session=autostart.console_session(store) or {}
+            print(json.dumps({'console':'already-running','url':session.get('url'),'port':session.get('port')},ensure_ascii=False));return 0
         try:serve(store,args.config,args.host,args.port)
         finally:handle.close()
         return 0

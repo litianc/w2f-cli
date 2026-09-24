@@ -90,11 +90,17 @@ def task_register(config_path, db_path) -> dict:
 def task_unregister() -> dict:
     if not supported():
         raise ValueError("开机自启目前仅支持 Windows 计划任务")
-    # Absent task stays a success; a real failure (denied, policy lock) must
-    # surface instead of being reported as unregistered.
-    script = ("$t=Get-ScheduledTask -TaskName '" + _quote(TASK_NAME) + "' -ErrorAction SilentlyContinue;"
-              "if($t){Unregister-ScheduledTask -TaskName '" + _quote(TASK_NAME) + "' -Confirm:$false -ErrorAction Stop};"
+    # Absent task stays a success; anything else must surface instead of
+    # being reported as unregistered: a stopped scheduler service or an
+    # unreadable task must not masquerade as a successful removal.
+    script = ("$svc=Get-Service Schedule;if($svc.Status -ne 'Running'){throw ('Task Scheduler 服务未运行: {0}' -f $svc.Status)};"
               "$t=Get-ScheduledTask -TaskName '" + _quote(TASK_NAME) + "' -ErrorAction SilentlyContinue;"
+              "if($t){Unregister-ScheduledTask -TaskName '" + _quote(TASK_NAME) + "' -Confirm:$false -ErrorAction Stop};"
+              "try{$t=Get-ScheduledTask -TaskName '" + _quote(TASK_NAME) + "' -ErrorAction Stop}catch{"
+              # Not-found is localized (找不到任何…MSFT_ScheduledTask 对象 / No
+              # … objects found); the CIM class name appears in both.
+              "if($_.Exception.Message -notmatch 'MSFT_ScheduledTask'){throw};"
+              "$t=$null};"
               "ConvertTo-Json @{registered=$($null -ne $t)}")
     # Report the post-unregister reality, not the intended outcome.
     return _task_state(_powershell(script))
@@ -103,7 +109,9 @@ def task_unregister() -> dict:
 def task_status() -> dict:
     if not supported():
         return {"registered": False, "supported": False}
-    script = ("$t=Get-ScheduledTask -TaskName '" + _quote(TASK_NAME) + "' -ErrorAction SilentlyContinue;"
+    # Service down would read as "not registered"; surface it instead.
+    script = ("$svc=Get-Service Schedule;if($svc.Status -ne 'Running'){throw ('Task Scheduler 服务未运行: {0}' -f $svc.Status)};"
+              "$t=Get-ScheduledTask -TaskName '" + _quote(TASK_NAME) + "' -ErrorAction SilentlyContinue;"
               "if($t){ConvertTo-Json @{registered=$true;state=$t.State.ToString()}}"
               "else{ConvertTo-Json @{registered=$false}}")
     try:

@@ -2,6 +2,7 @@
 import json
 import subprocess
 import sys
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -184,6 +185,29 @@ class TaskCommandTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 autostart.task_unregister()
 
+    def test_unregister_and_status_scripts_surface_service_failure(self):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv[-1])
+            return subprocess.CompletedProcess(argv, 0, stdout='{"registered": false}', stderr="")
+
+        with patch.object(autostart, "subprocess") as fake:
+            fake.run.side_effect = fake_run
+            fake.CompletedProcess = subprocess.CompletedProcess
+            autostart.task_unregister()
+            autostart.task_status()
+        for script in calls:
+            self.assertIn("Get-Service Schedule", script)
+        self.assertIn("MSFT_ScheduledTask", calls[0])
+
+    def test_console_session_reads_running_console(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "manager-session.json").write_text(json.dumps({"url": "http://127.0.0.1:59792/#token=t", "port": 59792}), encoding="utf-8")
+            store = type("S", (), {"path": root / "state.db"})()
+            self.assertEqual(autostart.console_session(store)["url"], "http://127.0.0.1:59792/#token=t")
+
     def test_task_unregister_reports_leftover_task(self):
         with patch.object(autostart, "subprocess") as fake:
             fake.run.return_value = subprocess.CompletedProcess([], 0, stdout='{"registered": true}', stderr="")
@@ -240,6 +264,23 @@ class ManagerIntegrationTest(unittest.TestCase):
             second = manager.autostart_status()
         self.assertEqual(query.call_count, 1)
         self.assertEqual(first, second)
+
+    def test_status_cache_contended_returns_value_not_tuple(self):
+        manager = manage.Manager(self.store, self.root / "config.json")
+        value = {"registered": True, "supported": True}
+        manager._autostart_cache = (time.time() - 999, value)
+        self.assertTrue(manager._autostart_refresh.acquire(blocking=False))
+        try:
+            self.assertEqual(manager.autostart_status(), value)
+        finally:
+            manager._autostart_refresh.release()
+
+    def test_post_populates_cache_for_following_reads(self):
+        manager = manage.Manager(self.store, self.root / "config.json")
+        with patch.object(autostart, "task_register", return_value={"registered": True, "supported": True}):
+            manager.post("autostart", {"op": "register"})
+        with patch.object(autostart, "task_status", side_effect=AssertionError("should serve cache")):
+            self.assertTrue(manager.autostart_status()["registered"])
 
     def test_binding_restorable_is_shared_rule(self):
         binding = self.store.list_bindings()[0]
