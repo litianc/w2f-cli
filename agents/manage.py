@@ -268,7 +268,8 @@ class Manager:
         if resource=='autostart':return self.autostart_status()
         if resource=='metrics':
             from .metrics import build_report
-            days=float(query.get('days') or 7)
+            raw=query.get('days')
+            days=float(raw) if raw is not None and raw!='' else 7.0
             if not days>0:raise ValueError('days 必须为正数')
             bid=int(query['binding_id']) if query.get('binding_id') else None
             return build_report(s.metric_rows(time.time()-days*86400,binding_id=bid),window_days=days)
@@ -409,7 +410,10 @@ class Manager:
         else:raise ValueError('不支持的管理操作')
         # Audit never captures Secret or arbitrary full request bodies.
         safe={k:v for k,v in data.items() if k in {'op','id','name','profile_name','person_id','message_id','part','new_name','remote_id'}}
-        s.audit(resource+'.'+str(op),after=safe,actor=actor)
+        # Bindings ops carry the binding id on the audit row itself — the
+        # metrics guard reads it as manual-intervention evidence.
+        binding_id=int(data['id']) if resource=='bindings' and str(data.get('id','')).isdigit() else None
+        s.audit(resource+'.'+str(op),after=safe,actor=actor,binding_id=binding_id)
         return result
 
 
@@ -527,7 +531,7 @@ def main():
             result=autostart.run_boot(store,args.config,store.path)
         print(json.dumps(result,ensure_ascii=False,indent=2));return 0
     if args.command=='status':result=manager.get('status')
-    if args.command=='metrics':result=manager.get('metrics',{'days':args.days,'binding_id':args.binding_id})
+    elif args.command=='metrics':result=manager.get('metrics',{'days':args.days,'binding_id':args.binding_id})
     else:
         op=args.op or args.action
         if args.health:op='health'

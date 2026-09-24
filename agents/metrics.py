@@ -65,12 +65,15 @@ def _binding_block(data, cursor):
 def build_report(rows, window_days, now=None):
     """原始行 → 指标报表；空库也保持完整形状。"""
     binding_ids = sorted(set(rows.get("bindings", {})) | set(rows.get("cursor", {})))
-    bindings, all_data = [], {"latency": [], "media_states": {}, "stuck_states": {}, "actions": []}
+    bindings, all_data = [], {"latency": [], "excluded": 0, "media_states": {}, "stuck_states": {}, "actions": [], "max_local_id": None}
     for bid in binding_ids:
         data = rows.get("bindings", {}).get(bid, {})
         bindings.append({"binding_id": bid, **_binding_block(data, rows.get("cursor", {}).get(bid))})
         for kind, lag in data.get("latency", []):
             all_data["latency"].append((kind, lag))
+        all_data["excluded"] += int(data.get("excluded", 0))
+        if data.get("max_local_id") is not None:
+            all_data["max_local_id"] = max(all_data["max_local_id"] or 0, int(data["max_local_id"]))
         for name, count in data.get("media_states", {}).items():
             all_data["media_states"][name] = all_data["media_states"].get(name, 0) + int(count)
         for name, count in data.get("stuck_states", {}).items():

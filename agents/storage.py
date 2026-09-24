@@ -629,13 +629,22 @@ class MirrorStore:
         return [r for r in rows if not person_id or json.loads(r.get('details_json') or '{}').get('person_id')==person_id or str(person_id)==str((json.loads(r.get('details_json') or '{}').get('after') or {}).get('person_id'))]
 
     def metric_rows(self, since, binding_id=None):
-        """阶段2 验收指标的原始输入；窗口按各表的 created_at 过滤。"""
+        """阶段2 验收指标的原始输入；窗口按各表的 created_at 过滤。
+
+        时延取消息最后一次成功发送部分的 attempted_at——upsert 重放会刷新
+        messages.updated_at，用它会在补扫后虚高；deliveries 回执不受重放影响。
+        """
         scope = " AND m.binding_id=?" if binding_id else ""
         params = (since, binding_id) if binding_id else (since,)
+        latency_sql = (
+            "SELECT m.binding_id,m.kind,{source},MAX(d.attempted_at) FROM messages m"
+            " JOIN deliveries d ON d.message_id=m.id AND d.state='sent'"
+            " WHERE m.created_at>=? AND m.state IN ('sent','placeholder') AND m.local_id IS NOT NULL" + scope + " GROUP BY m.id")
         with self.connect() as db:
-            latency = db.execute(
-                "SELECT m.binding_id,m.kind,m.payload_json,m.updated_at FROM messages m"
-                " WHERE m.created_at>=? AND m.state IN ('sent','placeholder') AND m.local_id IS NOT NULL" + scope, params).fetchall()
+            try:
+                latency = db.execute(latency_sql.format(source="json_extract(m.payload_json,'$.create_time')"), params).fetchall()
+            except Exception:
+                latency = db.execute(latency_sql.format(source="m.payload_json"), params).fetchall()
             media = db.execute(
                 "SELECT m.binding_id,j.state,COUNT(*) FROM media_jobs j JOIN messages m ON m.id=j.message_id"
                 " WHERE j.created_at>=?" + scope + " GROUP BY m.binding_id,j.state", params).fetchall()
@@ -653,12 +662,13 @@ class MirrorStore:
         bindings: dict[int, dict] = {}
         def slot(bid):
             return bindings.setdefault(int(bid), {"latency": [], "excluded": 0, "media_states": {}, "stuck_states": {}, "actions": [], "max_local_id": None})
-        for bid, kind, payload, updated_at in latency:
-            try: source = float(json.loads(payload or "{}").get("create_time") or 0)
-            except ValueError: source = 0.0
+        for bid, kind, source, delivered_at in latency:
+            if isinstance(source, str):
+                try: source = float(json.loads(source or "null").get("create_time") or 0) if source.strip().startswith("{") else 0.0
+                except (ValueError, AttributeError): source = 0.0
             target = slot(bid)
-            lag = float(updated_at) - source
-            if source > 0 and lag >= 0: target["latency"].append((str(kind), lag))
+            lag = float(delivered_at or 0) - float(source or 0)
+            if source and source > 0 and lag >= 0: target["latency"].append((str(kind), lag))
             else: target["excluded"] += 1
         for bid, state, count in media: slot(bid)["media_states"][state] = int(count)
         for bid, state, count in stuck: slot(bid)["stuck_states"][state] = int(count)

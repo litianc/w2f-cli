@@ -29,7 +29,11 @@ def seed_message(store, key, *, binding_id=1, kind="text", state="sent", create_
     store.upsert_message(key, row, kind, binding_id=binding_id, source_account="demo")
     if state != "received":
         store.mark_message(key, state, binding_id=binding_id)
+    message = store.message(key, binding_id)
     with store.connect() as db:
+        # 时延源是最后一次成功发送部分的 attempted_at（重放不虚高）。
+        db.execute("INSERT OR REPLACE INTO deliveries(message_id,part,state,payload_json,idempotency_key,feishu_message_id,attempted_at) VALUES(?,?,?,?,?,?,?)",
+                   (message["id"], "text-0", "sent", "[]", "k-" + key, "om_" + key, updated_at))
         # 窗口过滤读 created_at（入库时间）；测试里让它跟随 updated_at 以便构造旧数据。
         db.execute("UPDATE messages SET created_at=?, updated_at=?, local_id=? WHERE wechat_message_key=? AND binding_id=?",
                    (updated_at, updated_at, local_id, key, binding_id))
@@ -91,6 +95,13 @@ class BuildReportTest(unittest.TestCase):
         self.assertEqual(totals["latency"]["text"]["n"], 2)
         self.assertEqual(totals["media_delivery"]["success_rate"], 0.5)
 
+    def test_totals_carry_excluded_and_max_local_id(self):
+        rows = {"bindings": {1: {"latency": [], "excluded": 4, "max_local_id": 18},
+                             2: {"latency": [("text", 1.0)], "excluded": 2, "max_local_id": 9}}}
+        totals = build_report(rows, window_days=7)["totals"]
+        self.assertEqual(totals["latency"]["excluded"], 6)
+        self.assertEqual(totals["max_ingested_local_id"], 18)
+
 
 class StorageMetricsTest(unittest.TestCase):
     def setUp(self):
@@ -126,6 +137,31 @@ class StorageMetricsTest(unittest.TestCase):
         rows = self.store.metric_rows(since=4000, binding_id=1)
         self.assertEqual(rows["bindings"][1]["latency"], [("text", 3.0)])
 
+    def test_replayed_ingest_does_not_inflate_latency(self):
+        seed_message(self.store, "k1", state="sent", create_time=1000, updated_at=1003.0)
+        # 补扫重放同一行：ON CONFLICT 会刷新 updated_at，但回执 attempted_at 不变。
+        replay = {"talker": "room", "local_id": 1, "kind_name": "text", "sender_wxid": "wx",
+                  "sender": "某人", "text": "hi", "create_time": 1000}
+        self.store.upsert_message("k1", replay, "text")
+        rows = self.store.metric_rows(since=0)
+        self.assertEqual(rows["bindings"][1]["latency"], [("text", 3.0)])
+
+    def test_malformed_payload_is_excluded_not_fatal(self):
+        with self.store.connect() as db:
+            db.execute("INSERT INTO messages(binding_id,source_account,wechat_message_key,local_id,kind,payload_json,state,created_at,updated_at)"
+                       " VALUES(1,'demo','k9',99,'text','null','sent',5000,5003)")
+            db.execute("INSERT INTO deliveries(message_id,part,state,payload_json,idempotency_key,attempted_at)"
+                       " SELECT id,'text-0','sent','[]','k9',5003 FROM messages WHERE wechat_message_key='k9'")
+        rows = self.store.metric_rows(since=0)
+        self.assertEqual(rows["bindings"][1]["excluded"], 1)
+        self.assertEqual(rows["bindings"][1]["latency"], [])
+
+    def test_bindings_audit_rows_carry_binding_id(self):
+        manager = manage.Manager(self.store, self.root / "config.json")
+        manager.post("bindings", {"op": "rename", "id": 1, "wechat_alias": "甲", "feishu_alias": "乙"})
+        row = next(a for a in self.store.actions() if a["action"] == "bindings.rename")
+        self.assertEqual(row["binding_id"], 1)
+
 
 class ManagerIntegrationTest(unittest.TestCase):
     def setUp(self):
@@ -143,8 +179,9 @@ class ManagerIntegrationTest(unittest.TestCase):
 
     def test_get_metrics_rejects_bad_days(self):
         manager = manage.Manager(self.store, self.root / "config.json")
-        with self.assertRaises(ValueError):
-            manager.get("metrics", {"days": "zero"})
+        for bad in ("zero", 0, 0.0, -1):
+            with self.assertRaises(ValueError):
+                manager.get("metrics", {"days": bad})
 
 
 if __name__ == "__main__":
