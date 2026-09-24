@@ -628,6 +628,45 @@ class MirrorStore:
         with self.connect() as db: rows=[dict(r) for r in db.execute("SELECT * FROM management_actions ORDER BY id DESC LIMIT 200")]
         return [r for r in rows if not person_id or json.loads(r.get('details_json') or '{}').get('person_id')==person_id or str(person_id)==str((json.loads(r.get('details_json') or '{}').get('after') or {}).get('person_id'))]
 
+    def metric_rows(self, since, binding_id=None):
+        """阶段2 验收指标的原始输入；窗口按各表的 created_at 过滤。"""
+        scope = " AND m.binding_id=?" if binding_id else ""
+        params = (since, binding_id) if binding_id else (since,)
+        with self.connect() as db:
+            latency = db.execute(
+                "SELECT m.binding_id,m.kind,m.payload_json,m.updated_at FROM messages m"
+                " WHERE m.created_at>=? AND m.state IN ('sent','placeholder') AND m.local_id IS NOT NULL" + scope, params).fetchall()
+            media = db.execute(
+                "SELECT m.binding_id,j.state,COUNT(*) FROM media_jobs j JOIN messages m ON m.id=j.message_id"
+                " WHERE j.created_at>=?" + scope + " GROUP BY m.binding_id,j.state", params).fetchall()
+            stuck = db.execute(
+                "SELECT m.binding_id,m.state,COUNT(*) FROM messages m"
+                " WHERE m.created_at>=? AND m.state IN ('received','processing','failed')" + scope + " GROUP BY m.binding_id,m.state", params).fetchall()
+            actions = db.execute(
+                "SELECT action,actor,binding_id,COUNT(*) FROM management_actions"
+                " WHERE created_at>=? AND action IN ('watchdog.restart','watchdog.give_up','bindings.start')" + (" AND binding_id=?" if binding_id else "") + " GROUP BY action,actor,binding_id",
+                (since, binding_id) if binding_id else (since,)).fetchall()
+            cursor = dict(db.execute(
+                "SELECT binding_id,cursor FROM runtime_state" + (" WHERE binding_id=?" if binding_id else ""), (binding_id,) if binding_id else ()).fetchall())
+            max_local = dict(db.execute(
+                "SELECT binding_id,MAX(local_id) FROM messages WHERE local_id IS NOT NULL" + (" AND binding_id=?" if binding_id else "") + " GROUP BY binding_id", (binding_id,) if binding_id else ()).fetchall())
+        bindings: dict[int, dict] = {}
+        def slot(bid):
+            return bindings.setdefault(int(bid), {"latency": [], "excluded": 0, "media_states": {}, "stuck_states": {}, "actions": [], "max_local_id": None})
+        for bid, kind, payload, updated_at in latency:
+            try: source = float(json.loads(payload or "{}").get("create_time") or 0)
+            except ValueError: source = 0.0
+            target = slot(bid)
+            lag = float(updated_at) - source
+            if source > 0 and lag >= 0: target["latency"].append((str(kind), lag))
+            else: target["excluded"] += 1
+        for bid, state, count in media: slot(bid)["media_states"][state] = int(count)
+        for bid, state, count in stuck: slot(bid)["stuck_states"][state] = int(count)
+        for action, actor, bid, count in actions:
+            if bid is not None: slot(bid)["actions"].extend([(action, actor)] * int(count))
+        for bid, value in max_local.items(): slot(bid)["max_local_id"] = int(value)
+        return {"bindings": bindings, "cursor": cursor}
+
     def uncertain_deliveries(self):
         with self.connect() as db:
             return [dict(r) for r in db.execute("SELECT d.message_id,d.part,d.state,d.attempted_at,d.error,m.binding_id,m.local_id,m.sender_name FROM deliveries d JOIN messages m ON m.id=d.message_id WHERE d.state IN ('uncertain','sending') ORDER BY m.id")]

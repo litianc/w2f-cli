@@ -264,6 +264,12 @@ class Manager:
         if resource=='uncertain':return s.uncertain_deliveries()
         if resource=='setup':return setup_status(self.config_path,s.path)
         if resource=='autostart':return self.autostart_status()
+        if resource=='metrics':
+            from .metrics import build_report
+            days=float(query.get('days') or 7)
+            if not days>0:raise ValueError('days 必须为正数')
+            bid=int(query['binding_id']) if query.get('binding_id') else None
+            return build_report(s.metric_rows(time.time()-days*86400,binding_id=bid),window_days=days)
         if resource=='search/wechat':return search_wechat(query.get('q',''))
         if resource=='search/feishu':return search_feishu(query.get('profile',''),query.get('q',''))
         if resource=='wizard/wechat':return search_wechat('',200)
@@ -474,6 +480,7 @@ def main():
     sub.add_parser('status');sv=sub.add_parser('serve');sv.add_argument('--port',type=int,default=0);sv.add_argument('--host',default='127.0.0.1')
     wd=sub.add_parser('watchdog');wd.add_argument('--interval',type=float,default=15.0);wd.add_argument('--once',action='store_true')
     au=sub.add_parser('autostart');au.add_argument('--register',action='store_true');au.add_argument('--unregister',action='store_true')
+    mt=sub.add_parser('metrics');mt.add_argument('--days',type=float,default=7.0);mt.add_argument('--binding-id',type=int)
     for child in sub.choices.values():
         child.add_argument('--config',default=argparse.SUPPRESS,type=Path);child.add_argument('--db',default=argparse.SUPPRESS,type=Path)
     args=p.parse_args();config=read_config(args.config)
@@ -512,6 +519,7 @@ def main():
             result=autostart.run_boot(store,args.config,store.path)
         print(json.dumps(result,ensure_ascii=False,indent=2));return 0
     if args.command=='status':result=manager.get('status')
+    if args.command=='metrics':result=manager.get('metrics',{'days':args.days,'binding_id':args.binding_id})
     else:
         op=args.op or args.action
         if args.health:op='health'

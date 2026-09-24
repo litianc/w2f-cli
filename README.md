@@ -147,6 +147,7 @@ python3 -m agents.manage status
 | 启动 / 异常退出后重启 | `python3 -m agents.manage bindings start --id 1` |
 | 守护运行（自动拉起异常退出的 Worker） | `python3 -m agents.manage watchdog` |
 | 注册 / 注销开机自启（Windows） | `python3 -m agents.manage autostart --register` / `--unregister` |
+| 验收指标（时延分位数 / 媒体成功率 / 连续性） | `python3 -m agents.manage metrics --days 7` |
 | 暂停 | `python3 -m agents.manage bindings pause --id 1` |
 | 恢复暂停中的 Worker | `python3 -m agents.manage bindings resume --id 1` |
 | 停止 | `python3 -m agents.manage bindings stop --id 1` |
