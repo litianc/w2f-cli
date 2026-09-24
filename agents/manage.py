@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from .storage import MirrorStore
 from .paths import DATA_DIR, DEFAULT_CONFIG, ROOT, runtime_paths
+from . import autostart
 
 DEFAULT_DB=DATA_DIR/'wechat_feishu_mirror.sqlite3'
 READER=Path(os.environ.get('WECHAT_READER',str(Path(os.environ.get('CODEX_HOME',Path.home()/'.codex'))/'skills/wechat-cli/scripts/reader.sh')))
@@ -177,10 +178,11 @@ def setup_init(config_path,db_path,payload=None):
     return setup_status(config_path,db_path)
 
 
-def binding_action(store,config_path,binding_id,action):
+def binding_action(store,config_path,binding_id,action,start_reason=None):
     if action=='archive':
         binding_action(store,config_path,binding_id,'stop');store.archive_binding(binding_id);return store.get_binding(binding_id)
     args=[sys.executable,'-m','agents.wechat_feishu_mirror',action,'--config',str(config_path),'--db',str(store.path),'--binding-id',str(binding_id)]
+    if action=='start' and start_reason:args+=['--start-reason',start_reason]
     return run_cli(args)
 
 
@@ -233,7 +235,15 @@ class Watchdog:
 
 
 class Manager:
-    def __init__(self,store,config_path):self.store=store;self.config_path=Path(config_path);self.started=time.time()
+    def __init__(self,store,config_path):self.store=store;self.config_path=Path(config_path);self.started=time.time();self._autostart_cache=None
+    def autostart_status(self,ttl=60.0):
+        # task_status spawns PowerShell; the overview polls every 10s, so the
+        # query result is cached briefly. register/unregister refresh it.
+        cached=self._autostart_cache
+        if cached and time.time()-cached[0]<ttl:return cached[1]
+        value={'task':autostart.TASK_NAME,**autostart.task_status()}
+        self._autostart_cache=(time.time(),value)
+        return value
     def get(self,resource,query=None):
         query=query or {};s=self.store
         if resource=='profiles':return s.list_profiles()
@@ -243,6 +253,7 @@ class Manager:
         if resource=='media-failures':return [{k:v for k,v in r.items() if k not in {'source_ref','staging_path'}} for r in s.list_media_failures()]
         if resource=='uncertain':return s.uncertain_deliveries()
         if resource=='setup':return setup_status(self.config_path,s.path)
+        if resource=='autostart':return self.autostart_status()
         if resource=='search/wechat':return search_wechat(query.get('q',''))
         if resource=='search/feishu':return search_feishu(query.get('profile',''),query.get('q',''))
         if resource=='wizard/wechat':return search_wechat('',200)
@@ -370,6 +381,11 @@ class Manager:
             args=json.loads(row['payload_json'])
             if '--text' in args and found.get('content')!=args[args.index('--text')+1]:raise ValueError('回执正文不一致，请核对原消息和表情转换')
             s.set_delivery(int(data['message_id']),data['part'],'sent',data['remote_id']);result={'confirmed':True}
+        elif resource=='autostart':
+            if op=='register':result={'task':autostart.TASK_NAME,**autostart.task_register(self.config_path,s.path)}
+            elif op=='unregister':result={'task':autostart.TASK_NAME,**autostart.task_unregister()}
+            else:raise ValueError('不支持的开机自启操作')
+            self._autostart_cache=(time.time(),result)
         else:raise ValueError('不支持的管理操作')
         # Audit never captures Secret or arbitrary full request bodies.
         safe={k:v for k,v in data.items() if k in {'op','id','name','profile_name','person_id','message_id','part','new_name','remote_id'}}
@@ -447,6 +463,7 @@ def main():
         child=sub.add_parser(name);child.add_argument('action',nargs='?',default='list');child.add_argument('--op');child.add_argument('--id',type=int);child.add_argument('--data');child.add_argument('--name');child.add_argument('--profile-name');child.add_argument('--app-id');child.add_argument('--new-name');child.add_argument('--health',action='store_true');child.add_argument('--app-secret-stdin',action='store_true')
     sub.add_parser('status');sv=sub.add_parser('serve');sv.add_argument('--port',type=int,default=0);sv.add_argument('--host',default='127.0.0.1')
     wd=sub.add_parser('watchdog');wd.add_argument('--interval',type=float,default=15.0);wd.add_argument('--once',action='store_true')
+    au=sub.add_parser('autostart');au.add_argument('--register',action='store_true');au.add_argument('--unregister',action='store_true')
     for child in sub.choices.values():
         child.add_argument('--config',default=argparse.SUPPRESS,type=Path);child.add_argument('--db',default=argparse.SUPPRESS,type=Path)
     args=p.parse_args();config=read_config(args.config)
@@ -462,8 +479,21 @@ def main():
     if args.command=='watchdog':
         dog=Watchdog(store,args.config)
         if args.once:print(json.dumps({'restarted':dog.once()},ensure_ascii=False))
-        else:dog.loop(args.interval)
+        else:
+            # Singleton lock: the boot task spawns a watchdog, and a manual
+            # second copy must not double-restart the same bindings.
+            handle=autostart.singleton_lock(store.path.parent/'locks'/'watchdog.lock')
+            if handle is None:print(json.dumps({'watchdog':'already-running'}),flush=True);return 0
+            try:dog.loop(args.interval)
+            finally:handle.close()
         return 0
+    if args.command=='autostart':
+        if args.register or args.unregister:
+            result=autostart.task_register(args.config,store.path) if args.register else autostart.task_unregister()
+            store.audit('autostart.register' if args.register else 'autostart.unregister',after={'task':autostart.TASK_NAME})
+        else:
+            result=autostart.run_boot(store,args.config,store.path)
+        print(json.dumps(result,ensure_ascii=False,indent=2));return 0
     if args.command=='status':result=manager.get('status')
     else:
         op=args.op or args.action

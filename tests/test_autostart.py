@@ -1,0 +1,238 @@
+"""开机自启：恢复 running 绑定 + 管理台/watchdog 拉起 + 计划任务注册。"""
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from agents import autostart, manage
+from agents.storage import MirrorStore
+
+
+def make_config(root, talker="room"):
+    return {"binding_id": 1, "source_account": "demo", "wechat_talker": talker,
+            "wechat_chat_name": "源", "feishu_chat_id": "chat", "feishu_chat_name": "目标",
+            "lark_profile": "p", "lark_app_id": "app", "data_dir": str(root),
+            "sqlite_file": str(root / "state.db")}
+
+
+class RestoreTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.store = MirrorStore(self.root / "state.db")
+        self.store.initialize(make_config(self.root))
+        self.store.set_control(1, "running")
+        self.second = self.store.create_binding({**make_config(self.root, "room2"), "wechat_talker": "room2", "feishu_chat_id": "chat2"})["id"]
+        self.store.set_control(self.second, "stopped")
+
+    def test_restores_only_running_enabled_bindings(self):
+        paused = self.store.create_binding({**make_config(self.root, "room3"), "wechat_talker": "room3", "feishu_chat_id": "chat3"})["id"]
+        self.store.set_control(paused, "paused")
+        calls = []
+        restored, failed = autostart.restore_running_bindings(self.store, self.root / "config.json", start=calls.append)
+        self.assertEqual(restored, [1])
+        self.assertEqual(failed, {})
+        self.assertEqual(calls, [1])
+        self.assertIn("boot.restore", [a["action"] for a in self.store.actions()])
+
+    def test_skips_archived_and_disabled_bindings(self):
+        self.store.archive_binding(self.second)
+        calls = []
+        restored, failed = autostart.restore_running_bindings(self.store, self.root / "config.json", start=calls.append)
+        self.assertEqual(calls, [1])
+
+    def test_skips_worker_already_alive(self):
+        self.store.acquire_lease(1, pid=4321)
+        self.store.heartbeat(self.store.get_lease(1)["token"], 1)
+        calls = []
+        restored, failed = autostart.restore_running_bindings(self.store, self.root / "config.json", start=calls.append)
+        self.assertEqual(calls, [])
+
+    def test_failure_is_recorded_and_does_not_stop_others(self):
+        third = self.store.create_binding({**make_config(self.root, "room4"), "wechat_talker": "room4", "feishu_chat_id": "chat4"})["id"]
+        self.store.set_control(third, "running")
+
+        def flaky(bid):
+            if bid == 1:
+                raise RuntimeError("Worker 启动失败，请查看绑定日志")
+        restored, failed = autostart.restore_running_bindings(self.store, self.root / "config.json", start=flaky)
+        self.assertEqual(restored, [third])
+        self.assertIn(1, failed)
+        actions = [(a["action"], a["result"]) for a in self.store.actions()]
+        self.assertIn(("boot.restore", "failed"), actions)
+        self.assertIn(("boot.restore", "accepted"), actions)
+
+    def test_default_start_invokes_mirror_cli_with_boot_reason(self):
+        with patch.object(manage, "run_cli", return_value={}) as run:
+            autostart.restore_running_bindings(self.store, self.root / "config.json")
+        argv = run.call_args.args[0]
+        self.assertIn("agents.wechat_feishu_mirror", argv)
+        self.assertIn("start", argv)
+        self.assertEqual(argv[argv.index("--start-reason") + 1], "boot restore")
+
+
+class BootTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.store = MirrorStore(self.root / "state.db")
+        self.store.initialize(make_config(self.root))
+        self.store.set_control(1, "running")
+        self.config_path = self.root / "config.json"
+        self.db_path = self.store.path
+
+    def test_boot_restores_bindings_and_spawns_console_watchdog(self):
+        started, spawned = [], []
+        summary = autostart.run_boot(self.store, self.config_path, self.db_path,
+                                     start=started.append, spawn=lambda args, log: spawned.append(args))
+        self.assertEqual(started, [1])
+        joined = [" ".join(map(str, args)) for args in spawned]
+        self.assertEqual(len(spawned), 2)
+        self.assertTrue(any("serve" in a for a in joined))
+        self.assertTrue(any("watchdog" in a for a in joined))
+        self.assertEqual(summary["restored"], [1])
+        self.assertEqual(summary["console"], "spawned")
+
+    def test_boot_skips_console_when_session_alive(self):
+        session = self.store.path.parent / "manager-session.json"
+        session.write_text(json.dumps({"port": 54321, "pid": 1, "token": "t", "url": "u"}), encoding="utf-8")
+        spawned = []
+        summary = autostart.run_boot(self.store, self.config_path, self.db_path,
+                                     start=lambda bid: None, spawn=lambda args, log: spawned.append(args),
+                                     console_check=lambda state: True)
+        joined = [" ".join(map(str, args)) for args in spawned]
+        self.assertFalse(any("serve" in a for a in joined))
+        self.assertTrue(any("watchdog" in a for a in joined))
+        self.assertEqual(summary["console"], "already-running")
+
+    def test_boot_spawns_even_when_restore_fails(self):
+        spawned = []
+        summary = autostart.run_boot(self.store, self.config_path, self.db_path,
+                                     start=lambda bid: (_ for _ in ()).throw(RuntimeError("读取器不可用")),
+                                     spawn=lambda args, log: spawned.append(args))
+        self.assertEqual(len(spawned), 2)
+        self.assertEqual(len(summary["failed"]), 1)
+
+    def test_boot_writes_autostart_log(self):
+        autostart.run_boot(self.store, self.config_path, self.db_path,
+                           start=lambda bid: None, spawn=lambda args, log: None)
+        log = self.root / "logs" / "autostart.log"
+        self.assertTrue(log.exists())
+        self.assertIn("restored", log.read_text(encoding="utf-8"))
+
+
+class TaskCommandTest(unittest.TestCase):
+    def test_boot_command_uses_windowless_python_and_autostart(self):
+        cmd = autostart.boot_command(Path("C:/cfg.json"), Path("C:/data/state.db"))
+        self.assertTrue(cmd["execute"].endswith("pythonw.exe") or cmd["execute"].endswith("python.exe"))
+        self.assertIn("autostart", cmd["argument"])
+        self.assertIn("--config", cmd["argument"])
+        self.assertIn("--db", cmd["argument"])
+        self.assertEqual(cmd["working_directory"], str(autostart.ROOT))
+
+    def test_task_register_builds_logon_task(self):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout='{"registered": true}', stderr="")
+
+        with patch.object(autostart, "subprocess") as fake:
+            fake.run.side_effect = fake_run
+            fake.CompletedProcess = subprocess.CompletedProcess
+            result = autostart.task_register(Path("C:/cfg.json"), Path("C:/data/state.db"))
+        self.assertTrue(result["registered"])
+        script = calls[0][-1]
+        self.assertIn(autostart.TASK_NAME, script)
+        self.assertIn("Register-ScheduledTask", script)
+        self.assertIn("AtLogOn", script)
+        self.assertIn("WorkingDirectory", script)
+
+    def test_task_unregister_is_idempotent(self):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout='{"registered": false}', stderr="")
+
+        with patch.object(autostart, "subprocess") as fake:
+            fake.run.side_effect = fake_run
+            fake.CompletedProcess = subprocess.CompletedProcess
+            result = autostart.task_unregister()
+        self.assertIn("Unregister-ScheduledTask", calls[0][-1])
+        self.assertFalse(result["registered"])
+
+    def test_task_status_parses_query(self):
+        with patch.object(autostart, "subprocess") as fake:
+            fake.run.return_value = subprocess.CompletedProcess([], 0, stdout='{"registered": true, "state": "Ready"}', stderr="")
+            result = autostart.task_status()
+        self.assertTrue(result["registered"])
+        self.assertEqual(result["state"], "Ready")
+
+    def test_non_windows_register_is_rejected(self):
+        with patch.object(autostart.os, "name", "posix"):
+            with self.assertRaises(ValueError):
+                autostart.task_register(Path("c.json"), Path("s.db"))
+            self.assertFalse(autostart.task_status()["supported"])
+
+
+class ManagerIntegrationTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.store = MirrorStore(self.root / "state.db")
+        self.store.initialize(make_config(self.root))
+
+    def test_get_autostart_reports_status(self):
+        manager = manage.Manager(self.store, self.root / "config.json")
+        with patch.object(autostart, "task_status", return_value={"registered": True, "state": "Ready", "supported": True}):
+            status = manager.get("autostart")
+        self.assertEqual(status["task"], autostart.TASK_NAME)
+        self.assertTrue(status["registered"])
+
+    def test_post_register_and_unregister(self):
+        manager = manage.Manager(self.store, self.root / "config.json")
+        with patch.object(autostart, "task_register", return_value={"registered": True}) as reg:
+            manager.post("autostart", {"op": "register"})
+        reg.assert_called_once()
+        with patch.object(autostart, "task_unregister", return_value={"registered": False}) as unreg:
+            manager.post("autostart", {"op": "unregister"})
+        unreg.assert_called_once()
+        self.assertIn("autostart.register", [a["action"] for a in self.store.actions()])
+
+    def test_post_autostart_rejects_unknown_op(self):
+        manager = manage.Manager(self.store, self.root / "config.json")
+        with self.assertRaises(ValueError):
+            manager.post("autostart", {"op": "restart"})
+
+
+class WatchdogSingletonTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_singleton_lock_is_exclusive(self):
+        first = autostart.singleton_lock(self.root / "locks" / "watchdog.lock")
+        self.assertIsNotNone(first)
+        try:
+            self.assertIsNone(autostart.singleton_lock(self.root / "locks" / "watchdog.lock"))
+        finally:
+            first.close()
+
+    def test_singleton_lock_released_on_close(self):
+        first = autostart.singleton_lock(self.root / "locks" / "watchdog.lock")
+        first.close()
+        self.assertIsNotNone(autostart.singleton_lock(self.root / "locks" / "watchdog.lock"))
+
+
+if __name__ == "__main__":
+    unittest.main()

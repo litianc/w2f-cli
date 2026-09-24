@@ -51,7 +51,7 @@ flowchart LR
 
 首次启动一条新绑定时，从当前最新消息开始。后续启动、恢复或重连使用保存的进度，先完整读取离线区间，再按源时间与消息序号依次发送。姓名和群配置由数据库统一提供。
 
-Codex 负责服务控制和维护，Worker 负责持续读取与发送。按产品 Spec 的最小守护集：`python3 -m agents.manage watchdog` 自动拉起异常退出的 Worker（连续重启失败会停机并留痕，等待人工排查）；开机自启与更重的进程管家不在范围内。
+Codex 负责服务控制和维护，Worker 负责持续读取与发送。按产品 Spec 的最小守护集：`python3 -m agents.manage watchdog` 自动拉起异常退出的 Worker（连续重启失败会停机并留痕，等待人工排查）；Windows 上可注册登录计划任务，开机后自动恢复管理台、watchdog 与运行中的绑定（见下文「开机自启」），不引入系统服务或其他更重的进程管家。
 
 ## 快速开始
 
@@ -146,11 +146,22 @@ python3 -m agents.manage status
 | 查看待确认事项 | `python3 -m agents.manage confirmations list` |
 | 启动 / 异常退出后重启 | `python3 -m agents.manage bindings start --id 1` |
 | 守护运行（自动拉起异常退出的 Worker） | `python3 -m agents.manage watchdog` |
+| 注册 / 注销开机自启（Windows） | `python3 -m agents.manage autostart --register` / `--unregister` |
 | 暂停 | `python3 -m agents.manage bindings pause --id 1` |
 | 恢复暂停中的 Worker | `python3 -m agents.manage bindings resume --id 1` |
 | 停止 | `python3 -m agents.manage bindings stop --id 1` |
 
 暂停和停止都保留进度。`resume` 只恢复仍在运行的暂停 Worker；停止或进程异常退出后使用 `start`。
+
+### 开机自启（Windows）
+
+在管理台「运行概览」一键启用，或使用 CLI 注册：
+
+```bash
+python3 -m agents.manage autostart --register
+```
+
+注册的是当前用户的登录计划任务：登录后自动运行一次开机恢复——拉起管理台和 watchdog，并把重启前处于运行状态的绑定全部拉起。已停止、暂停或归档的绑定不会被拉起；重复运行是安全的（管理台按活动会话跳过，watchdog 有单例锁，绑定启动本身幂等）。`--unregister` 注销后重启不再自启。注册动作会保存当前解释器与配置路径，移动仓库或换 Python 后需重新注册。
 
 ## 配置与数据
 

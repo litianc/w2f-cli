@@ -929,6 +929,7 @@ def main():
     parser.add_argument('--config',type=Path,default=DEFAULT_CONFIG)
     parser.add_argument('--db',type=Path)
     parser.add_argument('--binding-id',type=int,default=1)
+    parser.add_argument('--start-reason',default='manual start',help='Control reason recorded when start flips the binding to running')
     parser.add_argument('--once',action='store_true',help='Read one source page without sending or advancing cursor')
     args=parser.parse_args();config=runtime_paths(load_json(args.config,{}))
     # A configured reader path must hold for every process in the chain
@@ -971,7 +972,7 @@ def main():
                 except OSError:
                     print(json.dumps(store.status(bid),ensure_ascii=False));return 0
                 _unlock(check)
-            store.set_control(bid,'running',reason='manual start')
+            store.set_control(bid,'running',reason=args.start_reason)
             log=Path(config['log_dir'])/f'binding-{bid}.log';log.parent.mkdir(parents=True,exist_ok=True)
             with log.open('a', encoding='utf-8', errors='replace') as out:
                 child=subprocess.Popen([sys.executable,'-m','agents.wechat_feishu_mirror','run','--config',str(args.config.resolve()),'--db',str(store.path.resolve()),'--binding-id',str(bid)],cwd=ROOT,stdout=out,stderr=subprocess.STDOUT,start_new_session=True)
