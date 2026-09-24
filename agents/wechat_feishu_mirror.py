@@ -166,6 +166,33 @@ def notify_confirmation(config: dict[str, Any], store: MirrorStore, source_accou
         store.finish_confirmation_notification(int(item["id"]))
 
 
+def system_event_body(raw: str) -> str | None:
+    """渲染邀请/群事件类系统消息模板，避免 $占位$ 原样透出（#3）。
+
+    微信库里模板形如 ``"$username$"邀请"$names$"加入了群聊``，真实成员以
+    「ID 显示名」对跟在模板后（$username$ 取第一个显示名，$names$ 取其余）。
+    返回渲染后的文本；不含占位符的普通系统消息返回 None（走原渲染）。
+    """
+    text = str(raw or "").strip()
+    matches = list(re.finditer(r"\$(\w+)\$", text))
+    if not matches:
+        return None
+    # 模板（含占位符后的中文后缀）与成员值以空白分界；无空白则整串是模板。
+    rest = text[matches[-1].end():]
+    boundary = re.search(r"\s", rest)
+    template = text if boundary is None else text[:matches[-1].end() + boundary.start()]
+    tail = [] if boundary is None else rest[boundary.start():].split()
+    # 「ID 显示名」成对（偶数个）取显示名；奇数个视为纯显示名列表。
+    names = (tail[1::2] if len(tail) % 2 == 0 else tail) if tail else []
+    def substitute(match):
+        if match.group(1) == "username":
+            return names[0] if names else "成员"
+        if match.group(1) == "names":
+            return "、".join(names[1:]) if len(names) > 1 else "成员"
+        return "成员"
+    return re.sub(r"\$(\w+)\$", substitute, template)
+
+
 def clean_body(row: dict[str, Any]) -> str:
     kind = str(row.get("kind_name") or "text")
     raw = str(row.get("text") or row.get("content") or "")
@@ -665,8 +692,12 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
         profile_list(store)
     check_control(config,store)
     # Freeze attribution on the first send attempt so a partially delivered
-    # message does not change names when it resumes.
-    if str(message.get('idempotency_key') or '').startswith('wx-'):
+    # message does not change names when it resumes. 群事件类系统消息没有
+    # 个人发送者：不进入实名解析，来源统一标「群事件」（#3）。
+    event_text = system_event_body(str(row.get('text') or row.get('content') or ''))
+    if event_text:
+        name, person = '群事件', None
+    elif str(message.get('idempotency_key') or '').startswith('wx-'):
         name, person = message['sender_name'], message.get('sender_person_id')
     else:
         name,person = resolve_name(store,config,str(row.get('sender_wxid') or ''),str(row.get('sender') or ''),key)
@@ -722,7 +753,7 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
             plan_key=f'render:{message["id"]}'
             plan=store.setting(plan_key)
             if not plan:
-                body = forward_body(row,config,store) if is_forward_row(row) else clean_body(row)
+                body = event_text or (forward_body(row,config,store) if is_forward_row(row) else clean_body(row))
                 quote=quote_info(row)
                 parent=store.find_message_by_server_id(bid,quote['server_id']) if quote and quote.get('server_id') else None
                 if quote and parent and parent.get('feishu_message_id'):
