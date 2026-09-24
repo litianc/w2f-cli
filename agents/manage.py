@@ -186,6 +186,13 @@ def binding_action(store,config_path,binding_id,action,start_reason=None):
     return run_cli(args)
 
 
+def binding_restorable(store,binding):
+    """已启用、控制状态 running 且 Worker 死亡——watchdog 与开机恢复共用的判定。"""
+    if not binding.get('enabled'):return False
+    state=store.status(int(binding['id']))
+    return state['control'].get('status')=='running' and not state['worker']['alive']
+
+
 class Watchdog:
     """Restart dead workers of running bindings (Spec 最小守护集）。
 
@@ -204,11 +211,7 @@ class Watchdog:
         now=time.time() if now is None else now;restarted=[]
         for binding in self.store.list_bindings(False):
             bid=binding['id']
-            if not binding.get('enabled'):continue
-            st=self.store.status(bid)
-            if st['control'].get('status')!='running':
-                self.fails.pop(bid,None);self.last.pop(bid,None);continue
-            if st['worker']['alive']:
+            if not binding_restorable(self.store,binding):
                 self.fails.pop(bid,None);self.last.pop(bid,None);continue
             if now-self.last.get(bid,0.0)<self.min_gap:continue
             self.last[bid]=now
@@ -235,15 +238,22 @@ class Watchdog:
 
 
 class Manager:
-    def __init__(self,store,config_path):self.store=store;self.config_path=Path(config_path);self.started=time.time();self._autostart_cache=None
+    def __init__(self,store,config_path):self.store=store;self.config_path=Path(config_path);self.started=time.time();self._autostart_cache=None;self._autostart_refresh=threading.Lock()
     def autostart_status(self,ttl=60.0):
         # task_status spawns PowerShell; the overview polls every 10s, so the
-        # query result is cached briefly. register/unregister refresh it.
+        # query is cached and refreshed by one thread at a time — overlapping
+        # polls get the stale value instead of each paying a PowerShell start.
         cached=self._autostart_cache
         if cached and time.time()-cached[0]<ttl:return cached[1]
-        value={'task':autostart.TASK_NAME,**autostart.task_status()}
-        self._autostart_cache=(time.time(),value)
-        return value
+        if self._autostart_refresh.acquire(blocking=False):
+            try:
+                cached=self._autostart_cache
+                if cached and time.time()-cached[0]<ttl:return cached[1]
+                value={'task':autostart.TASK_NAME,**autostart.task_status()}
+                self._autostart_cache=(time.time(),value)
+                return value
+            finally:self._autostart_refresh.release()
+        return cached or {'task':autostart.TASK_NAME,'registered':False,'supported':autostart.supported()}
     def get(self,resource,query=None):
         query=query or {};s=self.store
         if resource=='profiles':return s.list_profiles()
@@ -475,7 +485,14 @@ def main():
         os.environ['WECHAT_READER'] = reader_override
         READER = Path(reader_override)
     db=args.db or Path(config['sqlite_file']);store=MirrorStore(db);store.initialize(config);manager=Manager(store,args.config)
-    if args.command=='serve':serve(store,args.config,args.host,args.port);return 0
+    if args.command=='serve':
+        # Console singleton: a racing boot pass or manual serve must not end
+        # with two consoles on different ports; the loser exits here.
+        handle=autostart.singleton_lock(store.path.parent/'locks'/'console.lock')
+        if handle is None:print(json.dumps({'console':'already-running'}),flush=True);return 0
+        try:serve(store,args.config,args.host,args.port)
+        finally:handle.close()
+        return 0
     if args.command=='watchdog':
         dog=Watchdog(store,args.config)
         if args.once:print(json.dumps({'restarted':dog.once()},ensure_ascii=False))

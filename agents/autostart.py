@@ -57,6 +57,17 @@ def _powershell(script: str) -> str:
     return proc.stdout
 
 
+def _task_state(out: str) -> dict:
+    try:
+        value = json.loads(out) if out.strip() else {}
+    except ValueError:
+        value = {}
+    value.setdefault("registered", False)
+    value["supported"] = True
+    value.setdefault("task", TASK_NAME)
+    return value
+
+
 def task_register(config_path, db_path) -> dict:
     if not supported():
         raise ValueError("开机自启目前仅支持 Windows 计划任务")
@@ -66,7 +77,9 @@ def task_register(config_path, db_path) -> dict:
     script = ("$action=New-ScheduledTaskAction -Execute '" + _quote(cmd["execute"])
               + "' -Argument '" + _quote(cmd["argument"])
               + "' -WorkingDirectory '" + _quote(cmd["working_directory"]) + "';"
-              "$trigger=New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME;"
+              # Domain-qualified: a bare logon name is not a valid -User value
+              # on domain-joined machines.
+              "$trigger=New-ScheduledTaskTrigger -AtLogOn -User ('{0}\\{1}' -f $env:USERDOMAIN,$env:USERNAME);"
               "Register-ScheduledTask -TaskName '" + _quote(TASK_NAME) + "' -Action $action -Trigger $trigger"
               " -Description 'w2f mirror: restore console, watchdog and running bindings at logon' -Force|Out-Null;"
               "ConvertTo-Json @{registered=$true}")
@@ -77,11 +90,14 @@ def task_register(config_path, db_path) -> dict:
 def task_unregister() -> dict:
     if not supported():
         raise ValueError("开机自启目前仅支持 Windows 计划任务")
-    script = ("Unregister-ScheduledTask -TaskName '" + _quote(TASK_NAME) + "' -Confirm:$false -ErrorAction SilentlyContinue;"
+    # Absent task stays a success; a real failure (denied, policy lock) must
+    # surface instead of being reported as unregistered.
+    script = ("$t=Get-ScheduledTask -TaskName '" + _quote(TASK_NAME) + "' -ErrorAction SilentlyContinue;"
+              "if($t){Unregister-ScheduledTask -TaskName '" + _quote(TASK_NAME) + "' -Confirm:$false -ErrorAction Stop};"
               "$t=Get-ScheduledTask -TaskName '" + _quote(TASK_NAME) + "' -ErrorAction SilentlyContinue;"
               "ConvertTo-Json @{registered=$($null -ne $t)}")
-    _powershell(script)
-    return {"registered": False, "task": TASK_NAME}
+    # Report the post-unregister reality, not the intended outcome.
+    return _task_state(_powershell(script))
 
 
 def task_status() -> dict:
@@ -94,14 +110,7 @@ def task_status() -> dict:
         out = _powershell(script)
     except Exception as exc:
         return {"registered": False, "supported": True, "error": str(exc)[:200]}
-    try:
-        value = json.loads(out) if out.strip() else {}
-    except ValueError:
-        value = {}
-    value.setdefault("registered", False)
-    value["supported"] = True
-    value.setdefault("task", TASK_NAME)
-    return value
+    return _task_state(out)
 
 
 def singleton_lock(path):
@@ -128,8 +137,11 @@ def console_session(store) -> dict | None:
 
 
 def console_alive(session: dict) -> bool:
+    # A direct opener: http_proxy must never route a loopback probe, or a
+    # live console would look dead and every logon would spawn a second one.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{int(session['port'])}/", timeout=2) as response:
+        with opener.open(f"http://127.0.0.1:{int(session['port'])}/", timeout=2) as response:
             return response.status == 200
     except (OSError, ValueError):
         return False
@@ -157,15 +169,12 @@ def restore_running_bindings(store, config_path, start=None):
     if start is None:
         from .manage import binding_action
         start = lambda bid: binding_action(store, config_path, bid, "start", start_reason="boot restore")
+    from .manage import binding_restorable
     restored, failed = [], {}
     for binding in store.list_bindings(False):
         bid = int(binding["id"])
-        if not binding.get("enabled"):
-            continue
-        state = store.status(bid)
-        if state["control"].get("status") != "running":
-            continue
-        if state["worker"]["alive"]:
+        # Same rule as the watchdog: enabled, control running, worker dead.
+        if not binding_restorable(store, binding):
             continue
         try:
             start(bid)
@@ -193,9 +202,17 @@ def _log_dir(config_path, store) -> Path:
 
 
 def run_boot(store, config_path, db_path, start=None, spawn=None, console_check=None) -> dict:
-    """One idempotent boot pass: restore bindings, then console and watchdog."""
+    """One idempotent boot pass: restore bindings, then console and watchdog.
+
+    A restore crash must never keep the console and watchdog offline; only
+    per-binding start failures are expected, everything else is recorded.
+    """
     config_path = Path(config_path)
-    restored, failed = restore_running_bindings(store, config_path, start=start)
+    restored, failed, boot_error = [], {}, None
+    try:
+        restored, failed = restore_running_bindings(store, config_path, start=start)
+    except Exception as exc:
+        boot_error = str(exc)[:200]
     log_dir = _log_dir(config_path, store)
     spawn = spawn or spawn_detached
     console_cmd = [sys.executable, "-m", "agents.manage", "serve",
@@ -205,14 +222,19 @@ def run_boot(store, config_path, db_path, start=None, spawn=None, console_check=
     session = console_session(store)
     alive = bool(session) and (console_check or console_alive)(session)
     if not alive:
+        # A second serve spawned in a race loses the console lock on startup
+        # and exits; the lock is the final authority, the probe is a shortcut.
         spawn(console_cmd, log_dir / "manager.log")
     # The watchdog's singleton lock makes an overlapping second copy exit.
     spawn(watchdog_cmd, log_dir / "watchdog.log")
     summary = {"boot": "completed", "restored": restored, "failed": failed,
                "console": "already-running" if alive else "spawned", "watchdog": "spawned",
                "at": time.time()}
+    if boot_error:
+        summary["error"] = boot_error
     line = json.dumps(summary, ensure_ascii=False) + "\n"
-    print(line, flush=True)
+    # No stdout print: under the task's pythonw it is a no-op, and the CLI
+    # caller serializes the same summary itself.
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
         with (log_dir / "autostart.log").open("a", encoding="utf-8", errors="replace") as out:

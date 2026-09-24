@@ -127,6 +127,14 @@ class BootTest(unittest.TestCase):
         self.assertTrue(log.exists())
         self.assertIn("restored", log.read_text(encoding="utf-8"))
 
+    def test_boot_survives_restore_crash_and_still_spawns(self):
+        spawned = []
+        with patch.object(autostart, "restore_running_bindings", side_effect=RuntimeError("database is locked")):
+            summary = autostart.run_boot(self.store, self.config_path, self.db_path,
+                                         spawn=lambda args, log: spawned.append(args))
+        self.assertEqual(len(spawned), 2)
+        self.assertIn("database is locked", summary["error"])
+
 
 class TaskCommandTest(unittest.TestCase):
     def test_boot_command_uses_windowless_python_and_autostart(self):
@@ -154,6 +162,7 @@ class TaskCommandTest(unittest.TestCase):
         self.assertIn("Register-ScheduledTask", script)
         self.assertIn("AtLogOn", script)
         self.assertIn("WorkingDirectory", script)
+        self.assertIn("USERDOMAIN", script)
 
     def test_task_unregister_is_idempotent(self):
         calls = []
@@ -168,6 +177,17 @@ class TaskCommandTest(unittest.TestCase):
             result = autostart.task_unregister()
         self.assertIn("Unregister-ScheduledTask", calls[0][-1])
         self.assertFalse(result["registered"])
+
+    def test_task_unregister_failure_is_not_swallowed(self):
+        with patch.object(autostart, "subprocess") as fake:
+            fake.run.return_value = subprocess.CompletedProcess([], 1, stdout="", stderr="Access is denied")
+            with self.assertRaises(RuntimeError):
+                autostart.task_unregister()
+
+    def test_task_unregister_reports_leftover_task(self):
+        with patch.object(autostart, "subprocess") as fake:
+            fake.run.return_value = subprocess.CompletedProcess([], 0, stdout='{"registered": true}', stderr="")
+            self.assertTrue(autostart.task_unregister()["registered"])
 
     def test_task_status_parses_query(self):
         with patch.object(autostart, "subprocess") as fake:
@@ -212,6 +232,20 @@ class ManagerIntegrationTest(unittest.TestCase):
         manager = manage.Manager(self.store, self.root / "config.json")
         with self.assertRaises(ValueError):
             manager.post("autostart", {"op": "restart"})
+
+    def test_status_cache_pays_powershell_once_within_ttl(self):
+        manager = manage.Manager(self.store, self.root / "config.json")
+        with patch.object(autostart, "task_status", return_value={"registered": False, "supported": True}) as query:
+            first = manager.autostart_status()
+            second = manager.autostart_status()
+        self.assertEqual(query.call_count, 1)
+        self.assertEqual(first, second)
+
+    def test_binding_restorable_is_shared_rule(self):
+        binding = self.store.list_bindings()[0]
+        self.assertFalse(manage.binding_restorable(self.store, binding))
+        self.store.set_control(binding["id"], "running")
+        self.assertTrue(manage.binding_restorable(self.store, binding))
 
 
 class WatchdogSingletonTest(unittest.TestCase):
