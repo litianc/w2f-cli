@@ -10,3 +10,5 @@
 /* Wizard create-group form */
 .wzCheck{display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer}
 .wzCheck input{width:auto;margin:0}
+
+.shareLink{border:1px solid var(--line);border-radius:9px;padding:12px;margin:12px 0}.shareLink input{font-size:12px}

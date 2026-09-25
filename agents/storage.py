@@ -329,6 +329,16 @@ class MirrorStore:
             rows = db.execute(query + (" WHERE f.person_id=?" if person_id else "") + " ORDER BY f.updated_at DESC", (person_id,) if person_id else ()).fetchall()
         return [dict(x) for x in rows]
 
+    def mention_identity(self, source_account: str, sender_id: str, profile_name: str) -> dict[str, Any] | None:
+        # IDs are scoped to their Feishu application; no name-only matching.
+        with self.connect() as db:
+            row=db.execute("""SELECT p.confirmed_name, f.open_id FROM wechat_identities w
+                JOIN people p ON p.id=w.person_id JOIN feishu_identities f ON f.person_id=p.id
+                JOIN profiles pr ON pr.id=f.profile_id
+                WHERE w.source_account=? AND w.wechat_sender_id=? AND pr.profile_name=? AND pr.enabled=1
+                ORDER BY f.id LIMIT 1""", (source_account, sender_id, profile_name)).fetchone()
+            return dict(row) if row else None
+
     def create_person(self, name: str, notes: str = "") -> dict[str, Any]:
         if not name.strip():
             raise ValueError("姓名不能为空")
@@ -585,7 +595,7 @@ class MirrorStore:
 
     def upsert_message(self, key: str, row: dict[str, Any], kind: str, state: str = "received", *, binding_id: int = 1, source_account: str = "default", payload: dict[str, Any] | None = None, quoted_message_key: str | None = None) -> int:
         ts = now()
-        safe_payload = payload or {k: row.get(k) for k in ("talker", "local_id", "server_id", "sender_wxid", "sender", "kind_name", "text", "content", "time", "create_time", "forward_items") if k in row}
+        safe_payload = payload or {k: row.get(k) for k in ("talker", "local_id", "server_id", "sender_wxid", "sender", "kind_name", "text", "content", "time", "create_time", "forward_items", "voice_transcript") if k in row}
         with self.connect() as db:
             db.execute("INSERT INTO messages(binding_id,source_account,wechat_message_key,local_id,server_id,sender_wxid,sender_name,kind,payload_json,quoted_message_key,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(binding_id,wechat_message_key) DO UPDATE SET updated_at=excluded.updated_at", (binding_id, source_account, key, row.get("local_id"), str(row.get("server_id") or ""), row.get("sender_wxid"), row.get("sender"), kind, json.dumps(safe_payload, ensure_ascii=False, default=str), quoted_message_key, state, ts, ts))
             found = db.execute("SELECT id FROM messages WHERE binding_id=? AND wechat_message_key=?", (binding_id, key)).fetchone()

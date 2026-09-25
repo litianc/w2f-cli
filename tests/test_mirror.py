@@ -78,6 +78,27 @@ class MirrorStoreTest(unittest.TestCase):
 
 
 class MirrorFormattingTest(unittest.TestCase):
+    def test_group_invite_renders_names_and_current_profile_mentions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MirrorStore(Path(directory) / "mirror.sqlite3")
+            store.initialize({"wechat_chat_name": "源", "wechat_talker": "room@chatroom", "feishu_chat_name": "目标",
+                              "feishu_chat_id": "chat", "lark_profile": "p", "lark_app_id": "app"})
+            person = store.create_person("张三")
+            store.link_wechat_identity(person["id"], "default", "wx_a", "旧昵称")
+            profile = next(p for p in store.list_profiles() if p["profile_name"] == "p")
+            store.link_feishu_identity(person["id"], profile["id"], "ou_a")
+            row = {"talker": "room@chatroom", "local_id": 99, "sender_wxid": "room@chatroom", "sender": "room@chatroom",
+                   "kind_name": "system", "text": '"$username$"邀请"$names$"加入了群聊 wx_a 旧昵称 wx_b 小李'}
+            with patch.object(mirror, "run_lark", return_value={"data": {"message_id": "om_test"}}) as send:
+                mirror.send_row({"lark_profile": "p", "feishu_chat_id": "chat"}, row, {}, store)
+            body = send.call_args.args[1][send.call_args.args[1].index("--text") + 1]
+            self.assertIn('<at user_id="ou_a">张三</at>', body)
+            self.assertIn("小李", body)
+            self.assertNotIn("wx_b", body)
+            self.assertNotIn("$names$", body)
+            self.assertTrue(body.startswith("群事件："))
+            self.assertEqual(store.status()["pending_senders"], 0)
+
     def test_xml_url_and_unknown_sender_fallback(self):
         row = {"text": '<msg><img cdnurl = "https://example.test/a.png&amp;x=1" /></msg>'}
         self.assertEqual(mirror.media_url(row), "https://example.test/a.png&x=1")
@@ -137,6 +158,19 @@ class MirrorFormattingTest(unittest.TestCase):
                 paths = mirror.reader_media_paths({"talker": "talker", "local_id": 9, "server_id": "s9"})
         self.assertEqual(paths[0], Path("/tmp/example.jpg"))
         self.assertIn("--include-local-paths", run.call_args.args[0])
+        self.assertNotIn("true", run.call_args.args[0])
+
+    def test_reader_media_paths_falls_back_for_legacy_wda_flag(self):
+        missing_value = type("Completed", (), {"returncode": 2, "stdout": "", "stderr": "argument --include-local-paths: expected one argument"})()
+        completed = type("Completed", (), {"returncode": 0, "stdout": '{"resources":[{"local_path":"/tmp/example.jpg"}]}', "stderr": ""})()
+        with patch.object(mirror.subprocess, "run", side_effect=[missing_value, completed]) as run:
+            with patch.object(Path, "is_file", return_value=True):
+                paths = mirror.reader_media_paths({"talker": "talker", "local_id": 9})
+        self.assertEqual(paths, [Path("/tmp/example.jpg")])
+        first = run.call_args_list[0].args[0]
+        second = run.call_args_list[1].args[0]
+        self.assertEqual(first[first.index("--include-local-paths") + 1:], [])
+        self.assertEqual(second[second.index("--include-local-paths") + 1:], ["true"])
 
     def test_wechat_cache_fallback_matches_message_identifier(self):
         with tempfile.TemporaryDirectory() as directory:

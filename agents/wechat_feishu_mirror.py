@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import signal
 import shutil
 import subprocess
@@ -164,6 +165,37 @@ def notify_confirmation(config: dict[str, Any], store: MirrorStore, source_accou
         print(f"身份提醒发送失败 confirmation_id={item['id']}: {safe_error(exc)}", file=sys.stderr, flush=True)
     else:
         store.finish_confirmation_notification(int(item["id"]))
+
+
+def group_event_body(row: dict[str, Any], config: dict[str, Any], store: MirrorStore) -> str:
+    raw = str(row.get('text') or row.get('content') or '')
+    marker = re.search(r'\$username\$.*?邀请.*?\$names\$.*?加入了群聊', raw, re.S)
+    if not marker:
+        return '群成员变更（姓名暂不可用）' if ('$username$' in raw or '$names$' in raw) else (raw or '[群成员变更]')
+    tokens = raw[marker.end():].strip().split()
+    pairs = [(tokens[i], tokens[i + 1]) for i in range(0, len(tokens) - 1, 2)]
+    source = str(config.get('source_account') or 'default')
+    profile = str(config.get('lark_profile') or '')
+    def member(sender_id, nickname):
+        identity = store.resolve_sender(source, sender_id)
+        name = str((identity or {}).get('confirmed_name') or nickname or '成员')
+        # Raw WeChat IDs must never appear as a substitute for a display name.
+        if name == sender_id or name.endswith('@chatroom'):
+            name = '成员'
+        mention = store.mention_identity(source, sender_id, profile)
+        if mention and str(mention['open_id']).startswith('ou_'):
+            return f'<at user_id="{mention["open_id"]}">{html.escape(name)}</at>'
+        return name
+    inviter = member(*pairs[0]) if pairs else '成员'
+    invited = '、'.join(member(*pair) for pair in pairs[1:]) if len(pairs) > 1 else '成员'
+    return f'{inviter} 邀请 {invited} 加入了群聊'
+
+
+def is_group_event(row: dict[str, Any]) -> bool:
+    raw = str(row.get('text') or row.get('content') or '')
+    return ('$username$' in raw or '$names$' in raw or
+            (str(row.get('sender_wxid') or '').endswith('@chatroom') and
+             str(row.get('kind_name') or '').lower() in {'system', 'sys', 'group_event'}))
 
 
 def clean_body(row: dict[str, Any]) -> str:
@@ -325,12 +357,20 @@ def reader_media_result(row: dict[str, Any]) -> tuple[list[Path], bool]:
     local_id = str(row.get("local_id") or "")
     if not talker or not local_id:
         return [], False
-    cmd = [str(WECHAT_READER), "media", "--talker", talker, "--local-id", local_id, "--include-local-paths", "true"]
+    # Rion uses a boolean flag. Its positional chat argument silently accepts
+    # a trailing "true", which makes the lookup return an empty resource list.
+    cmd = [str(WECHAT_READER), "media", "--talker", talker, "--local-id", local_id, "--include-local-paths"]
     server_id = str(row.get("server_id") or "")
     if server_id:
         cmd.extend(["--server-id", server_id])
     try:
         proc = subprocess.run(cmd, cwd=ROOT, text=True, encoding="utf-8", capture_output=True, timeout=45)
+        if proc.returncode == 2 and "--include-local-paths" in proc.stderr and "expected one argument" in proc.stderr:
+            # Older WDA adapters require the explicit value. Keep deployed
+            # Windows readers working until they are updated.
+            legacy = list(cmd)
+            legacy.insert(legacy.index("--include-local-paths") + 1, "true")
+            proc = subprocess.run(legacy, cwd=ROOT, text=True, encoding="utf-8", capture_output=True, timeout=45)
         if proc.returncode:
             return [], False
         payload = json.loads(proc.stdout)
@@ -655,6 +695,8 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
     # message does not change names when it resumes.
     if str(message.get('idempotency_key') or '').startswith('wx-'):
         name, person = message['sender_name'], message.get('sender_person_id')
+    elif is_group_event(row):
+        name, person = '群事件', None
     else:
         name,person = resolve_name(store,config,str(row.get('sender_wxid') or ''),str(row.get('sender') or ''),key)
     store.mark_message(key,'processing',binding_id=bid,sender_name=name,sender_person_id=person,idempotency_key=delivery_key(config,key,'message'))
@@ -665,7 +707,10 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
         target=['+messages-reply','--message-id',message['feishu_message_id']]
     placeholder = False
     try:
-        if kind in {'sticker','emoji','image','video','file','voice','audio','media'}:
+        transcript = str(row.get('voice_transcript') or row.get('voiceTranscript') or '').strip()
+        if kind in {'voice','audio'} and transcript:
+            result=send('text-0',target+['--text',f'{name}：{transcript}'])
+        elif kind in {'sticker','emoji','image','video','file','voice','audio','media'}:
             # A saved receipt lets an upload survive a crash after the file was
             # deleted, without attempting to download an expired URL again.
             sent_media = store.delivery(message['id'],'media')
@@ -709,7 +754,7 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
             plan_key=f'render:{message["id"]}'
             plan=store.setting(plan_key)
             if not plan:
-                body = forward_body(row,config,store) if is_forward_row(row) else clean_body(row)
+                body = group_event_body(row,config,store) if is_group_event(row) else (forward_body(row,config,store) if is_forward_row(row) else clean_body(row))
                 quote=quote_info(row)
                 parent=store.find_message_by_server_id(bid,quote['server_id']) if quote and quote.get('server_id') else None
                 if quote and parent and parent.get('feishu_message_id'):
@@ -846,6 +891,40 @@ def expire_failed_media(config,store):
             db.execute('UPDATE media_jobs SET staging_path=NULL WHERE id=?',(job['id'],))
 
 
+def reader_wakeup_loop(config: dict[str, Any], wakeup: threading.Event, stopped: threading.Event) -> None:
+    """Use Rion's read-only watch as a hint; sync-page remains authoritative."""
+    store = MirrorStore(config['sqlite_file'])
+    while not stopped.is_set():
+        cursor = store.get_cursor(int(config['binding_id']))
+        cmd = [str(WECHAT_READER), 'watch', '--talker', config['wechat_talker'],
+               '--since-local-id', str(cursor), '--follow', '--jsonl',
+               '--poll-interval', '2', '--limit', '100', '--scan-limit', '1000']
+        proc = None
+        try:
+            proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            with selectors.DefaultSelector() as selector:
+                selector.register(proc.stdout, selectors.EVENT_READ)
+                while not stopped.is_set() and proc.poll() is None:
+                    for _key, _mask in selector.select(timeout=0.5):
+                        chunk = os.read(proc.stdout.fileno(), 65536)
+                        if not chunk: break
+                        # Rows are only wake-up signals. Never log or trust this
+                        # stream for ordering; recover_once scans the durable DB.
+                        wakeup.set()
+                # Drain a final chunk from a reader that exited after emitting.
+                if proc.poll() is not None and not stopped.is_set():
+                    if os.read(proc.stdout.fileno(), 65536):wakeup.set()
+        except (OSError, ValueError):
+            pass  # Keep the normal poll as the safety net.
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:proc.kill();proc.wait(timeout=2)
+            if proc is not None and proc.stdout:proc.stdout.close()
+        stopped.wait(5)
+
+
 def realtime_wakeup_loop(config: dict[str, Any], wakeup: threading.Event, stopped: threading.Event) -> None:
     """Wake the worker as soon as the reader reports source changes.
 
@@ -881,6 +960,8 @@ def stream(config, state=None):
     thread=threading.Thread(target=heartbeat,daemon=True);thread.start()
     if config.get('realtime_wakeup'):
         threading.Thread(target=realtime_wakeup_loop,args=(config,wakeup,stopped),daemon=True).start()
+    if str(config.get('reader_wakeup', '')).lower() in {'true', '1', 'yes'}:
+        threading.Thread(target=reader_wakeup_loop,args=(config,wakeup,stopped),daemon=True).start()
     try:
         wait_until=0
         while True:

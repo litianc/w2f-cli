@@ -119,6 +119,10 @@ def map_row(talker: str, message: dict, names: dict[str, str]) -> dict:
 
     row["kind_name"] = kind
     row["text"] = text
+    if kind == "voice":
+        transcript = str(message.get("voiceTranscript") or "").strip()
+        if transcript:
+            row["voice_transcript"] = transcript
     if kind == "forward_chat":
         row["forward_items"] = _forward_items(content)
     return row

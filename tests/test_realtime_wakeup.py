@@ -4,7 +4,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from agents.wechat_feishu_mirror import realtime_wakeup_loop
+from agents.wechat_feishu_mirror import realtime_wakeup_loop, reader_wakeup_loop
 
 
 class FakeSseHandler(BaseHTTPRequestHandler):
@@ -60,6 +60,29 @@ class RealtimeWakeupTest(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+class ReaderWakeupTest(unittest.TestCase):
+    def test_rion_watch_wakes_worker_on_new_row(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from agents import wechat_feishu_mirror as mirror
+        from agents.storage import MirrorStore
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            store=MirrorStore(root/'state.db')
+            store.initialize({'wechat_talker':'room','feishu_chat_id':'chat'})
+            reader=root/'reader.sh'
+            reader.write_text('#!/bin/sh\nprintf \'{"local_id":42}\\n\'\n', encoding='utf-8')
+            reader.chmod(0o755)
+            wakeup=threading.Event();stopped=threading.Event()
+            with patch.object(mirror,'WECHAT_READER',reader):
+                worker=threading.Thread(target=reader_wakeup_loop,args=({'sqlite_file':str(store.path),'binding_id':1,'wechat_talker':'room'},wakeup,stopped),daemon=True)
+                worker.start()
+                self.assertTrue(wakeup.wait(3))
+                stopped.set();worker.join(3)
+                self.assertFalse(worker.is_alive())
 
 
 if __name__ == '__main__':

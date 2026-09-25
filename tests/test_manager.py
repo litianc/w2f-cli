@@ -16,6 +16,21 @@ class ManagementAcceptance(unittest.TestCase):
     def test_config_credentials_and_untrusted_fields_never_saved(self):
         self.manager.post('setup',{'op':'save','wechat_talker':'room','app_secret':'secret','sqlite_file':'/outside','refreshToken':'secret'})
         value=self.store.setting('setup_draft');self.assertEqual(value,{'wechat_talker':'room'})
+    def test_setup_save_applies_runtime_wakeup_and_verified_admin(self):
+        self.bind()
+        person=self.store.create_person('管理员')
+        profile=next(p for p in self.store.list_profiles() if p['profile_name']=='p')
+        self.store.link_feishu_identity(person['id'],profile['id'],'ou_admin')
+        result=self.manager.post('setup',{'op':'save','reader_wakeup':'true','poll_interval':600,
+                                         'admin_profile':'p','admin_feishu_user_id':'ou_admin'})
+        stored=json.loads((self.root/'config.json').read_text())
+        self.assertEqual(stored['reader_wakeup'],'true')
+        self.assertEqual(stored['admin_feishu_user_id'],'ou_admin')
+        self.assertEqual(result['draft']['admin_profile'],'p')
+        with self.assertRaisesRegex(ValueError,'管理员身份尚未关联'):
+            self.manager.post('setup',{'op':'save','admin_feishu_user_id':'ou_other','admin_profile':'p'})
+        self.assertEqual(json.loads((self.root/'config.json').read_text())['admin_feishu_user_id'],'ou_admin')
+
     def test_profile_external_rename_preserves_app_external_replace_stops(self):
         self.bind();self.store.set_control(1,'running')
         with patch('agents.manage.run_cli',return_value=[{'name':'renamed','appId':'app'}]):profile_list(self.store)

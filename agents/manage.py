@@ -19,7 +19,7 @@ from .paths import DATA_DIR, DEFAULT_CONFIG, ROOT, runtime_paths
 
 DEFAULT_DB=DATA_DIR/'wechat_feishu_mirror.sqlite3'
 READER=Path(os.environ.get('WECHAT_READER',str(Path(os.environ.get('CODEX_HOME',Path.home()/'.codex'))/'skills/wechat-cli/scripts/reader.sh')))
-SETUP_FIELDS={'source_account','wechat_chat_name','wechat_talker','feishu_chat_name','feishu_chat_id','lark_profile','lark_app_id','admin_feishu_user_id','admin_profile','feishu_app_link','feishu_assistant_link','poll_interval'}
+SETUP_FIELDS={'source_account','wechat_chat_name','wechat_talker','feishu_chat_name','feishu_chat_id','lark_profile','lark_app_id','admin_feishu_user_id','admin_profile','feishu_app_link','feishu_assistant_link','poll_interval','reader_wakeup'}
 
 
 def read_config(path):
@@ -105,6 +105,18 @@ def profile_health(store,name):
     except Exception as exc:bot_status='error';errors.append(str(exc))
     store.update_profile_health(name,bot_status=bot_status,user_status=user_status,error='; '.join(errors) or None)
     return {'profile':name,'bot_status':bot_status,'user_status':user_status,'error':'; '.join(errors) or None}
+
+
+def chat_share_link(profile_name, chat_id):
+    payload = run_cli(['lark-cli', '--profile', profile_name, 'im', 'chats', 'link',
+                       '--chat-id', chat_id, '--data', json.dumps({'validity_period': 'week'}),
+                       '--as', 'bot', '--format', 'json'])
+    data = payload.get('data', payload)
+    link = str(data.get('share_link') or '')
+    if not link.startswith('https://'):
+        raise RuntimeError('飞书未返回有效的群分享链接')
+    return {'share_link': link, 'expire_time': data.get('expire_time'),
+            'is_permanent': bool(data.get('is_permanent'))}
 
 
 def search_wechat(query,limit=30):
@@ -244,6 +256,10 @@ class Manager:
                     binding=s.get_binding(int(data['id']));check=preflight_binding(binding,s)
                     if not check['ok']:raise ValueError('; '.join(check['errors']))
                 result=binding_action(s,self.config_path,int(data['id']),op)
+            elif op=='share-link':
+                binding=s.get_binding(int(data['id']))
+                if not binding or binding['archived']:raise ValueError('有效群映射不存在')
+                result=chat_share_link(binding['lark_profile'],binding['feishu_chat_id'])
             elif op=='rename':
                 bid=int(data['id']);before=s.get_binding(bid)
                 if not before:raise ValueError('绑定不存在')
@@ -275,7 +291,24 @@ class Manager:
             else:result=s.confirm_sender(int(data['id']),data['name'],actor)
         elif resource=='setup':
             if op=='save':
-                draft=s.setting('setup_draft',{});draft.update({k:v for k,v in data.items() if k in SETUP_FIELDS});s.save_setting('setup_draft',draft);result=self.get('setup')
+                draft=s.setting('setup_draft',{});draft.update({k:v for k,v in data.items() if k in SETUP_FIELDS})
+                # After setup, operational settings must reach the runtime
+                # config; otherwise the UI claims success but workers never see them.
+                if s.list_bindings():
+                    mutable={'admin_feishu_user_id','admin_profile','poll_interval','reader_wakeup'}
+                    updates={k:v for k,v in data.items() if k in mutable}
+                    if updates:
+                        runtime=read_config(self.config_path)
+                        runtime.update(updates)
+                        admin_id=str(runtime.get('admin_feishu_user_id') or '').strip()
+                        admin_profile=str(runtime.get('admin_profile') or '').strip()
+                        if admin_id and (('admin_feishu_user_id' in updates) or ('admin_profile' in updates)):
+                            profile=next((p for p in s.list_profiles() if p['profile_name']==admin_profile),None)
+                            if not profile or not any(f['profile_id']==profile['id'] and f['open_id']==admin_id
+                                                      for f in s.list_feishu_identities()):
+                                raise ValueError('管理员身份尚未关联到提醒应用；请先在「人员」页关联并核对')
+                        write_runtime_config(runtime,self.config_path)
+                s.save_setting('setup_draft',draft);result=self.get('setup')
             elif op=='check':result=preflight_binding(s.setting('setup_draft',{}),s)
             elif op=='init':
                 draft=s.setting('setup_draft',{}) or data.get('config') or {k:v for k,v in data.items() if k in SETUP_FIELDS}
@@ -287,20 +320,33 @@ class Manager:
                 if not data.get('confirm'):raise ValueError('请确认重置引导草稿；已启动绑定和凭证不会删除')
                 s.save_setting('setup_draft',{});result=self.get('setup')
             else:raise ValueError('不支持的初始化操作')
+        elif resource=='wizard' and op=='share-link':
+            profile=str(data.get('profile') or '').strip()
+            chat_id=str(data.get('chat_id') or '').strip()
+            if not profile or not chat_id:raise ValueError('请选择目标飞书群和发送应用')
+            if not any(p['profile_name']==profile and p['enabled'] for p in s.list_profiles()):
+                raise ValueError('发送应用未启用')
+            result=chat_share_link(profile,chat_id)
         elif resource=='wizard' and op=='create-target':
             profile=str(data.get('profile') or '');name=str(data.get('name') or '').strip()
             if not profile:raise ValueError('请先选择发送 Profile')
+            if not any(p['profile_name']==profile and p['enabled'] for p in s.list_profiles()):raise ValueError('发送应用未接入或已停用')
             if not name:raise ValueError('请填写新群名称')
             if len(name)>60:raise ValueError('群名称最长 60 字')
             args=['lark-cli','--profile',profile,'im','+chat-create','--name',name,'--as','bot','--format','json']
             if data.get('add_owner'):
                 owner=str(data.get('owner_open_id') or '').strip()
-                if not owner.startswith('ou_'):raise ValueError('勾选「拉我进群」时需填写本人 open_id（ou_ 开头）')
+                matched=next((p for p in s.list_profiles() if p['profile_name']==profile and p['enabled']),None)
+                if not matched or not any(identity['open_id']==owner and identity['profile_id']==matched['id']
+                                          for identity in s.list_feishu_identities()):
+                    raise ValueError('请先在「人员」页关联当前 Profile 下的本人飞书身份，再从下拉菜单选择')
                 args+=['--users',owner]
             payload=run_cli(args)
             chat_id=str((payload.get('data') or {}).get('chat_id') or payload.get('chat_id') or '')
             if not chat_id:raise ValueError('飞书未返回 chat_id；请先到飞书确认群是否已建成，再刷新列表选择')
             result={'chat_id':chat_id,'name':name,'profile':profile}
+            try:result.update(chat_share_link(profile,chat_id))
+            except Exception as exc:result['share_error']=str(exc)
         elif resource=='media-failures' and op=='retry':
             with s.connect() as db:
                 row=db.execute('SELECT * FROM media_jobs WHERE id=?',(int(data['id']),)).fetchone()
