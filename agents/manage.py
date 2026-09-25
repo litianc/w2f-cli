@@ -29,7 +29,7 @@ def read_config(path):
 def write_runtime_config(value,path):
     # All values accepted from the browser are allowlisted separately. Runtime
     # paths are supplied only by local config/CLI, never arbitrary HTTP bodies.
-    value={k:v for k,v in value.items() if k in SETUP_FIELDS|{'sqlite_file','data_dir','media_dir','log_dir','state_file'}}
+    value={k:v for k,v in value.items() if k in SETUP_FIELDS|{'sqlite_file','data_dir','media_dir','log_dir','state_file','wechat_reader','realtime_wakeup','realtime_stream_url','sender_map'}}
     path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
     tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(value,ensure_ascii=False,indent=2)+'\n',encoding='utf-8');tmp.chmod(0o600);tmp.replace(path)
 

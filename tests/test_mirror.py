@@ -99,6 +99,18 @@ class MirrorFormattingTest(unittest.TestCase):
             self.assertTrue(body.startswith("群事件："))
             self.assertEqual(store.status()["pending_senders"], 0)
 
+    def test_group_removal_renders_mapped_name_without_raw_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MirrorStore(Path(directory) / "mirror.sqlite3")
+            store.initialize({"wechat_talker": "room@chatroom", "feishu_chat_id": "chat", "lark_profile": "p"})
+            person = store.create_person("张三")
+            store.link_wechat_identity(person["id"], "default", "wx_a", "旧昵称")
+            row = {"kind_name": "system", "text": '"$username$"将"$names$"移出了群聊 wx_a 旧昵称 wx_b 小李'}
+            body = mirror.group_event_body(row, {"lark_profile": "p"}, store)
+            self.assertEqual(body, "张三 将 小李 移出了群聊")
+            self.assertNotIn("wx_a", body)
+            self.assertNotIn("wx_b", body)
+
     def test_xml_url_and_unknown_sender_fallback(self):
         row = {"text": '<msg><img cdnurl = "https://example.test/a.png&amp;x=1" /></msg>'}
         self.assertEqual(mirror.media_url(row), "https://example.test/a.png&x=1")

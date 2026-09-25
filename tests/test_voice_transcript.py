@@ -32,6 +32,25 @@ class VoiceTranscriptTest(unittest.TestCase):
             self.assertIn('voice_transcript',saved['payload_json'])
             with store.connect() as db:self.assertEqual(db.execute('SELECT count(*) FROM media_jobs').fetchone()[0],0)
 
+    def test_amr_fallback_transcodes_to_playable_opus(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source=Path(directory)/'voice.amr';source.write_bytes(b'fixture')
+            def transcode(args,**kwargs):
+                self.assertEqual(args[args.index('-c:a')+1],'libopus')
+                Path(args[-1]).write_bytes(b'ogg-opus-fixture')
+                return type('Result',(),{'returncode':0})()
+            with patch.object(mirror.shutil,'which',return_value='/usr/bin/ffmpeg'),patch.object(mirror.subprocess,'run',side_effect=transcode):
+                flags,converted=mirror.voice_upload_args(str(source))
+            self.assertEqual(flags,['--audio',str(source.with_suffix('.opus'))])
+            self.assertEqual(converted,str(source.with_suffix('.opus')))
+            mirror.cleanup_staged(converted)
+            self.assertFalse(Path(converted).exists())
+
+    def test_unsupported_voice_codec_remains_downloadable_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source=Path(directory)/'voice.silk';source.write_bytes(b'fixture')
+            self.assertEqual(mirror.voice_upload_args(str(source)),(['--file',str(source)],None))
+
     def test_empty_transcript_falls_back_to_audio(self):
         with tempfile.TemporaryDirectory() as directory:
             store=MirrorStore(Path(directory)/'state.db')

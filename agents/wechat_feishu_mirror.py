@@ -169,7 +169,9 @@ def notify_confirmation(config: dict[str, Any], store: MirrorStore, source_accou
 
 def group_event_body(row: dict[str, Any], config: dict[str, Any], store: MirrorStore) -> str:
     raw = str(row.get('text') or row.get('content') or '')
-    marker = re.search(r'\$username\$.*?邀请.*?\$names\$.*?加入了群聊', raw, re.S)
+    invite = re.search(r'\$username\$.*?邀请.*?\$names\$.*?加入了群聊', raw, re.S)
+    removal = re.search(r'\$username\$.*?将.*?\$names\$.*?移出了群聊', raw, re.S)
+    marker = invite or removal
     if not marker:
         return '群成员变更（姓名暂不可用）' if ('$username$' in raw or '$names$' in raw) else (raw or '[群成员变更]')
     tokens = raw[marker.end():].strip().split()
@@ -188,7 +190,7 @@ def group_event_body(row: dict[str, Any], config: dict[str, Any], store: MirrorS
         return name
     inviter = member(*pairs[0]) if pairs else '成员'
     invited = '、'.join(member(*pair) for pair in pairs[1:]) if len(pairs) > 1 else '成员'
-    return f'{inviter} 邀请 {invited} 加入了群聊'
+    return f'{inviter} 邀请 {invited} 加入了群聊' if invite else f'{inviter} 将 {invited} 移出了群聊'
 
 
 def is_group_event(row: dict[str, Any]) -> bool:
@@ -560,6 +562,27 @@ def stage_sticker(row: dict[str, Any]) -> str | None:
         return None
 
 
+def voice_upload_args(path: str) -> tuple[list[str], str | None]:
+    """Prefer a playable Feishu voice message; preserve unsupported audio as a file."""
+    source = Path(path)
+    if source.suffix.lower() in {'.opus', '.ogg'}:
+        return ['--audio', path], None
+    if source.suffix.lower() in {'.amr', '.aac', '.m4a', '.mp3', '.wav'}:
+        encoder = shutil.which('ffmpeg')
+        if encoder:
+            converted = source.with_suffix('.opus')
+            try:
+                result = subprocess.run([encoder, '-v', 'error', '-y', '-i', str(source),
+                                         '-vn', '-c:a', 'libopus', '-b:a', '24k', str(converted)],
+                                        capture_output=True, timeout=60)
+                if result.returncode == 0 and converted.is_file() and converted.stat().st_size:
+                    return ['--audio', str(converted)], str(converted)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            cleanup_staged(str(converted))
+    return ['--file', path], None
+
+
 def cleanup_staged(path: str | None) -> None:
     if not path:
         return
@@ -735,13 +758,17 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
                         send('name',target+['--text',f'{name}：{note}'])
                     flag='--image' if kind in {'image','sticker','emoji'} else '--file'
                     media_args = [flag,media_input]
+                    converted_voice=None
                     if kind=='video':
                         cover = video_cover(Path(media_input))
                         if cover:
                             media_args=['--video',media_input,'--video-cover',str(cover)]
-                    elif kind in {'audio','voice'} and Path(media_input).suffix in {'.opus','.ogg'}:
-                        media_args=['--audio',media_input]
-                    result=send('media',target+media_args)
+                    elif kind in {'audio','voice'}:
+                        media_args,converted_voice=voice_upload_args(media_input)
+                    try:
+                        result=send('media',target+media_args)
+                    finally:
+                        cleanup_staged(converted_voice)
                     store.add_media_job(message['id'],kind,None,media_input,'uploaded')
                     cleanup_staged(media_input)
                     if kind=='video' and cover: cleanup_staged(str(cover))
