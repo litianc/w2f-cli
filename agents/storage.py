@@ -375,6 +375,10 @@ class MirrorStore:
         with self.connect() as db:
             if not db.execute("SELECT 1 FROM people WHERE id=?", (person_id,)).fetchone():
                 raise ValueError("人员不存在")
+            existing=db.execute("SELECT person_id FROM feishu_identities WHERE profile_id=? AND open_id=?",
+                                (profile_id,open_id)).fetchone()
+            if existing and existing['person_id']!=person_id:
+                raise ValueError("此飞书 open_id 已关联其他人员；请先核实身份，不能直接覆盖")
             db.execute("INSERT INTO feishu_identities(person_id,profile_id,open_id,user_id,display_name,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(profile_id,open_id) DO UPDATE SET person_id=excluded.person_id,user_id=excluded.user_id,display_name=excluded.display_name,updated_at=excluded.updated_at", (person_id, profile_id, open_id, user_id, display_name, now(), now()))
             return dict(db.execute("SELECT f.*,p.confirmed_name,pr.profile_name FROM feishu_identities f JOIN people p ON p.id=f.person_id JOIN profiles pr ON pr.id=f.profile_id WHERE f.profile_id=? AND f.open_id=?", (profile_id, open_id)).fetchone())
 

@@ -1,1 +1,2 @@
 Pillow>=11,<12
+pypinyin>=0.53,<1
