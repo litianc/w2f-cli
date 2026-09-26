@@ -42,11 +42,15 @@ def run_cli(argv,*,stdin=None):
         p=subprocess.run(argv,cwd=ROOT,input=stdin,text=True,encoding='utf-8',capture_output=True,timeout=60,
                          env={**os.environ,'LARKSUITE_CLI_NO_UPDATE_NOTIFIER':'1','LARKSUITE_CLI_NO_SKILLS_NOTIFIER':'1'})
     except subprocess.TimeoutExpired: raise RuntimeError('CLI 请求超时，请稍后重试') from None
-    try: value=json.loads(p.stdout if p.returncode==0 else p.stderr)
+    try: value=json.loads(p.stdout)
     except ValueError: value={}
+    if p.returncode and not (isinstance(value,dict) and value.get('error')):
+        try: value=json.loads(p.stderr)
+        except ValueError: value={}
     if p.returncode or (isinstance(value,dict) and value.get('ok') is False):
-        error=value.get('error',{})
-        raise RuntimeError(safe_error(error.get('message') or 'CLI 请求失败'))
+        error=value.get('error',{}) if isinstance(value,dict) else {}
+        message=error.get('message') if isinstance(error,dict) else str(error)
+        raise RuntimeError(safe_error(message or 'CLI 请求失败'))
     return value
 
 
@@ -120,7 +124,13 @@ def chat_share_link(profile_name, chat_id):
 
 
 def search_wechat(query,limit=30):
-    return payload_items(run_cli([str(READER),'resolve-chat',query,'--type-filter','group','--limit',str(limit)]),'candidates')
+    query=str(query or '').strip()
+    if query:
+        return payload_items(run_cli([str(READER),'resolve-chat',query,'--type-filter','group','--limit',str(limit)]),'candidates')
+    # resolve-chat requires a nonempty query. The contacts command filters
+    # groups after its limit, so ask for the full index before limiting here.
+    groups=payload_items(run_cli([str(READER),'contacts','--groups-only','--limit','100000']),'contacts')
+    return sorted(groups,key=lambda item:str(item.get('display_name') or item.get('username') or '').casefold())[:limit]
 
 
 def search_feishu(profile,query):
@@ -209,7 +219,7 @@ class Manager:
         if resource=='setup':return setup_status(self.config_path,s.path)
         if resource=='search/wechat':return search_wechat(query.get('q',''))
         if resource=='search/feishu':return search_feishu(query.get('profile',''),query.get('q',''))
-        if resource=='wizard/wechat':return search_wechat('',200)
+        if resource=='wizard/wechat':return search_wechat(query.get('q',''),200)
         if resource=='wizard/feishu':return search_feishu(query.get('profile',''),'')
         if resource=='wizard/check-source':
             from .wechat_feishu_mirror import source_page

@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from agents.manage import Manager,profile_list,preflight_binding,setup_init,write_runtime_config
+from agents.manage import Manager,profile_list,preflight_binding,setup_init,write_runtime_config,run_cli
 from agents.storage import MirrorStore
 
 
@@ -13,6 +13,27 @@ class ManagementAcceptance(unittest.TestCase):
         self.store.upsert_profile('p','app');self.manager=Manager(self.store,self.root/'config.json')
     def tearDown(self):self.temp.cleanup()
     def bind(self):return self.store.create_binding({'wechat_chat_name':'源','wechat_talker':'room','feishu_chat_name':'目标','feishu_chat_id':'chat','lark_profile':'p'})
+    def test_wizard_group_list_uses_contacts_when_query_is_empty(self):
+        calls=[]
+        def reader(argv,**kwargs):
+            calls.append(argv[1:])
+            if argv[1]=='contacts':
+                return {'ok':True,'data':{'contacts':[{'username':'room@chatroom','display_name':'测试群'}]}}
+            if argv[1]=='resolve-chat' and not argv[2]:
+                raise RuntimeError('CLI 请求失败')
+            return {'ok':True,'data':{'candidates':[{'username':'room@chatroom','display_name':'测试群'}]}}
+        with patch('agents.manage.run_cli',side_effect=reader):
+            self.assertEqual(self.manager.get('wizard/wechat')[0]['display_name'],'测试群')
+            self.assertEqual(self.manager.get('wizard/wechat',{'q':'测试'})[0]['username'],'room@chatroom')
+        self.assertEqual(calls[0][0],'contacts')
+        self.assertEqual(calls[1][0:2],['resolve-chat','测试'])
+
+    def test_reader_json_error_from_stdout_is_not_hidden(self):
+        response=type('Process',(),{'returncode':1,'stdout':json.dumps({'ok':False,'error':{'code':'missing_required_argument','message':'resolve-chat 需要 query'}}),'stderr':'bash locale warning'})()
+        with patch('agents.manage.subprocess.run',return_value=response):
+            with self.assertRaisesRegex(RuntimeError,'resolve-chat 需要 query'):
+                run_cli(['reader','resolve-chat',''])
+
     def test_config_credentials_and_untrusted_fields_never_saved(self):
         self.manager.post('setup',{'op':'save','wechat_talker':'room','app_secret':'secret','sqlite_file':'/outside','refreshToken':'secret'})
         value=self.store.setting('setup_draft');self.assertEqual(value,{'wechat_talker':'room'})
