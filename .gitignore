@@ -18,6 +18,7 @@ staging/
 __pycache__/
 *.py[cod]
 .venv/
+.qa-results/
 venv/
 env/
 .DS_Store

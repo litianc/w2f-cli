@@ -1,5 +1,6 @@
 """SSE wakeup loop must skip the poll wait on data events, survive drops."""
 import threading
+import sys
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -63,6 +64,7 @@ class RealtimeWakeupTest(unittest.TestCase):
 
 
 class ReaderWakeupTest(unittest.TestCase):
+    @unittest.skipIf(sys.platform == 'win32', 'Rion watch uses POSIX pipes; Windows uses the separately tested WDA/SSE loop')
     def test_rion_watch_wakes_worker_on_new_row(self):
         import tempfile
         from pathlib import Path
@@ -80,8 +82,10 @@ class ReaderWakeupTest(unittest.TestCase):
             with patch.object(mirror,'WECHAT_READER',reader):
                 worker=threading.Thread(target=reader_wakeup_loop,args=({'sqlite_file':str(store.path),'binding_id':1,'wechat_talker':'room'},wakeup,stopped),daemon=True)
                 worker.start()
-                self.assertTrue(wakeup.wait(3))
-                stopped.set();worker.join(3)
+                try:
+                    self.assertTrue(wakeup.wait(3))
+                finally:
+                    stopped.set();worker.join(3)
                 self.assertFalse(worker.is_alive())
 
 
