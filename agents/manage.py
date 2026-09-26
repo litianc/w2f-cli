@@ -127,6 +127,62 @@ def discover_profile_user(store, profile_name):
             'user_status':str(user.get('tokenStatus') or user.get('status') or 'unknown')}
 
 
+def search_feishu_people(store, profile_name, name, query=''):
+    """Find visible contacts for one app; the caller must choose a candidate."""
+    profile=next((item for item in store.list_profiles()
+                  if item['profile_name']==profile_name and item['enabled']),None)
+    if not profile:raise ValueError('请选择已启用的发送 Profile')
+    name=str(name or '').strip()
+    query=str(query or '').strip()
+    if not name or len(name)>50 or ',' in name or '\n' in name:
+        raise ValueError('请先确认人员实名（最多 50 字，不能含逗号或换行）')
+    if query and (len(query)>50 or ',' in query or '\n' in query):
+        raise ValueError('搜索词最多 50 字，不能包含逗号或换行')
+    auth=run_cli(['lark-cli','--profile',profile_name,'auth','status','--json','--verify'])
+    if str(auth.get('appId') or '')!=str(profile['app_id']):
+        raise ValueError('Profile App ID 与登记应用不一致，请先在「飞书应用」刷新 Profile')
+    user=(auth.get('identities') or {}).get('user') or {}
+    if not user.get('available'):
+        raise ValueError('此应用的用户授权不可用；通讯录姓名搜索需要用户授权。请先检查该 Profile 的用户授权，或手动填写 open_id')
+    if query:
+        terms=[query]
+    else:
+        from pypinyin import lazy_pinyin, Style
+        terms=[name]
+        if len(name)>=3:
+            terms.extend([name[:2],name[-2:]])
+        syllables=lazy_pinyin(name)
+        if any('\u4e00'<=ch<='\u9fff' for ch in name):
+            terms.extend([''.join(syllables), ''.join(lazy_pinyin(name,style=Style.FIRST_LETTER))])
+        terms=list(dict.fromkeys(term for term in terms if term and len(term)<=50))
+    argv=['lark-cli','--profile',profile_name,'contact','+search-user','--as','user',
+          '--page-size','30','--format','json']
+    argv+=['--query',terms[0]] if len(terms)==1 else ['--queries',','.join(terms)]
+    result=run_cli(argv)
+    data=result.get('data',result)
+    raw=data.get('users',[]) if isinstance(data,dict) else []
+    candidates={}
+    for item in raw:
+        open_id=str(item.get('open_id') or '').strip()
+        if not open_id.startswith('ou_'):continue
+        display=str(item.get('localized_name') or item.get('name') or '').strip()
+        source=str(item.get('matched_query') or terms[0])
+        if open_id not in candidates:
+            candidates[open_id]={'open_id':open_id,'display_name':display,
+                                 'department':str(item.get('department') or ''),
+                                 'enterprise_email':str(item.get('enterprise_email') or ''),
+                                 'is_cross_tenant':bool(item.get('is_cross_tenant')),
+                                 'matched_queries':[]}
+        if source not in candidates[open_id]['matched_queries']:
+            candidates[open_id]['matched_queries'].append(source)
+    people=sorted(candidates.values(),key=lambda item:(item['display_name']!=name,
+                   terms[0] not in item['matched_queries'],item['display_name'].casefold(),item['open_id']))
+    queries=data.get('queries',[]) if isinstance(data,dict) else []
+    partial=bool(data.get('has_more') or any(q.get('has_more') or q.get('error') for q in queries)) if isinstance(data,dict) else False
+    return {'profile_name':profile_name,'app_id':profile['app_id'],'searched':terms,
+            'candidates':people[:100],'has_more':partial or len(people)>100}
+
+
 def chat_share_link(profile_name, chat_id):
     payload = run_cli(['lark-cli', '--profile', profile_name, 'im', 'chats', 'link',
                        '--chat-id', chat_id, '--data', json.dumps({'validity_period': 'week'}),
@@ -228,6 +284,8 @@ class Manager:
         query=query or {};s=self.store
         if resource=='profiles':return s.list_profiles()
         if resource=='profiles/self':return discover_profile_user(s,str(query.get('profile') or ''))
+        if resource=='people/search-feishu':return search_feishu_people(s,str(query.get('profile') or ''),
+                                                                       query.get('name',''),query.get('q',''))
         if resource=='bindings':return s.list_bindings()
         if resource=='people':return {'people':s.list_people(),'wechat':s.list_wechat_identities(),'feishu':s.list_feishu_identities(),'actions':s.actions()}
         if resource=='confirmations':return s.list_confirmations()
@@ -469,7 +527,7 @@ def main():
     p=argparse.ArgumentParser();p.add_argument('--config',type=Path,default=DEFAULT_CONFIG);p.add_argument('--db',type=Path)
     sub=p.add_subparsers(dest='command',required=True)
     for name in ('profiles','bindings','people','confirmations','media-failures','uncertain','setup'):
-        child=sub.add_parser(name);child.add_argument('action',nargs='?',default='list');child.add_argument('--op');child.add_argument('--id',type=int);child.add_argument('--data');child.add_argument('--name');child.add_argument('--profile-name');child.add_argument('--app-id');child.add_argument('--new-name');child.add_argument('--health',action='store_true');child.add_argument('--app-secret-stdin',action='store_true')
+        child=sub.add_parser(name);child.add_argument('action',nargs='?',default='list');child.add_argument('--op');child.add_argument('--id',type=int);child.add_argument('--data');child.add_argument('--name');child.add_argument('--profile-name');child.add_argument('--app-id');child.add_argument('--new-name');child.add_argument('--health',action='store_true');child.add_argument('--app-secret-stdin',action='store_true');child.add_argument('--query')
     sub.add_parser('status');sv=sub.add_parser('serve');sv.add_argument('--port',type=int,default=0);sv.add_argument('--host',default='127.0.0.1')
     for child in sub.choices.values():
         child.add_argument('--config',default=argparse.SUPPRESS,type=Path);child.add_argument('--db',default=argparse.SUPPRESS,type=Path)
@@ -492,6 +550,9 @@ def main():
             if getattr(args,field,None) is not None:data[field]=getattr(args,field)
         if args.app_secret_stdin:data['app_secret']=sys.stdin.readline().rstrip('\n')
         if op in {'list','status'}:result=manager.get(args.command)
+        elif args.command=='people' and op=='search-feishu':
+            result=manager.get('people/search-feishu',{'profile':data.get('profile_name',''),
+                                                       'name':data.get('name',''),'q':args.query or data.get('query','')})
         else:
             data['op']={'check':'preflight' if args.command=='bindings' else 'check','link-wechat':'link_wechat','link-feishu':'link_feishu'}.get(op,op)
             if args.command=='setup' and op=='init' and not args.data:result=setup_init(args.config,store.path)

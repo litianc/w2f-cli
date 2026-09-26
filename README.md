@@ -23,7 +23,7 @@ W2F CLI（WeChat to Feishu）是一个由 Codex 控制与维护的本地会话�
 | 本地管理台 | 查看运行概览，管理群映射、飞书应用、人员实名、失败项和首次接入 |
 | 多应用、多群 | 同一微信账号下支持最多 10 组一对一绑定；每组指定飞书 CLI Profile，以机器人身份发送 |
 | 群名称管理 | 按稳定 ID 绑定群；修改本地显示名、刷新群名，并在明确确认后修改飞书真实群名 |
-| 统一实名 | 多个微信 ID 可人工关联同一人；未知身份先用昵称同步，并生成待确认事项 |
+| 统一实名 | 多个微信 ID 可人工关联同一人；关联飞书身份时可按实名、相近姓名和拼音查通讯录，核对候选 ID 后选择；未知身份先用昵称同步，并生成待确认事项 |
 | 消息镜像 | 支持文字、emoji、链接、表情，以及读取器能获取的图片、视频和文件；正文保留发言人姓名 |
 | 引用与回复 | 原消息已同步时关联飞书回复；找不到对应消息时展示可读引用或占位 |
 | 离线续传 | 保存游标与发送回执；服务恢复后按源消息顺序补齐积压，再继续处理新消息 |
@@ -31,7 +31,7 @@ W2F CLI（WeChat to Feishu）是一个由 Codex 控制与维护的本地会话�
 | 失败可追踪 | 媒体获取或上传失败时保留占位和待办，支持人工排查后补发 |
 | Codex 管理 | 网页与 CLI 共用 SQLite 和管理逻辑；Codex 执行启动、停止、状态查询与排障 |
 
-实名更正对后续消息生效，历史消息保留发送时的姓名。未知身份的飞书私聊提醒需要先配置并核实管理员身份。
+实名更正对后续消息生效，历史消息保留发送时的姓名。未知身份的飞书私聊提醒需要先配置并核实管理员身份。通讯录姓名搜索需要所选 Profile 的用户授权与可见范围；搜索失败时可继续手工填写该应用下的 `open_id`。
 
 ## 工作方式
 
@@ -143,6 +143,7 @@ python3 -m agents.manage status
 | 查看飞书应用 | `python3 -m agents.manage profiles list` |
 | 查看群映射 | `python3 -m agents.manage bindings list` |
 | 查看人员档案 | `python3 -m agents.manage people list` |
+| 按实名查飞书候选人 | `python3 -m agents.manage people search-feishu --profile-name wechat-mirror --name 王小明` |
 | 查看待确认事项 | `python3 -m agents.manage confirmations list` |
 | 启动 / 异常退出后重启 | `python3 -m agents.manage bindings start --id 1` |
 | 暂停 | `python3 -m agents.manage bindings pause --id 1` |

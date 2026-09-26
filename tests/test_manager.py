@@ -1,9 +1,10 @@
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from agents.manage import Manager,profile_list,preflight_binding,setup_init,write_runtime_config,run_cli
+from agents.manage import Manager,profile_list,preflight_binding,setup_init,write_runtime_config,run_cli,main
 from agents.storage import MirrorStore
 
 
@@ -65,6 +66,60 @@ class ManagementAcceptance(unittest.TestCase):
                 self.manager.post('people',{'op':'link_feishu','person_id':person['id'],
                                             'profile_id':profile['id'],'open_id':value})
         self.assertEqual(self.store.list_feishu_identities(),[])
+
+    def test_contact_candidates_are_app_scoped_deduplicated_and_not_auto_linked(self):
+        auth={'appId':'app','identities':{'user':{'available':True}}}
+        contacts={'ok':True,'data':{'users':[
+            {'open_id':'ou_exact','localized_name':'王小明','department':'产品','matched_query':'王小明'},
+            {'open_id':'ou_exact','localized_name':'王小明','department':'产品','matched_query':'wangxiaoming'},
+            {'open_id':'ou_other','localized_name':'王小鸣','department':'研发','matched_query':'王小'},
+            {'open_id':'bad','localized_name':'无效','matched_query':'王小'}],
+            'queries':[{'query':'王小','has_more':True}]}}
+        with patch('agents.manage.run_cli',side_effect=[auth,contacts]) as cli:
+            result=self.manager.get('people/search-feishu',{'profile':'p','name':'王小明'})
+        argv=cli.call_args_list[1].args[0]
+        self.assertEqual(argv[:6],['lark-cli','--profile','p','contact','+search-user','--as'])
+        self.assertIn('--as',argv);self.assertIn('user',argv)
+        self.assertEqual(argv[argv.index('--queries')+1],'王小明,王小,小明,wangxiaoming,wxm')
+        self.assertEqual([c['open_id'] for c in result['candidates']],['ou_exact','ou_other'])
+        self.assertEqual(result['candidates'][0]['matched_queries'],['王小明','wangxiaoming'])
+        self.assertTrue(result['has_more'])
+        self.assertEqual(self.store.list_feishu_identities(),[])
+
+    def test_contact_search_manual_pinyin_and_authorization_errors(self):
+        auth={'appId':'app','identities':{'user':{'available':True}}}
+        with patch('agents.manage.run_cli',side_effect=[auth,{'data':{'users':[]}}]) as cli:
+            result=self.manager.get('people/search-feishu',{'profile':'p','name':'王小明','q':'li wenhao'})
+        self.assertEqual(result['searched'],['li wenhao'])
+        self.assertIn('--query',cli.call_args_list[1].args[0])
+        for value in ('a,b','x'*51):
+            with self.assertRaisesRegex(ValueError,'搜索词'):
+                self.manager.get('people/search-feishu',{'profile':'p','name':'王小明','q':value})
+        with patch('agents.manage.run_cli',return_value={'appId':'other','identities':{'user':{'available':True}}}):
+            with self.assertRaisesRegex(ValueError,'App ID'):
+                self.manager.get('people/search-feishu',{'profile':'p','name':'王小明'})
+        with patch('agents.manage.run_cli',return_value={'appId':'app','identities':{'user':{'available':False}}}) as cli:
+            with self.assertRaisesRegex(ValueError,'用户授权'):
+                self.manager.get('people/search-feishu',{'profile':'p','name':'王小明'})
+        self.assertEqual(cli.call_count,1)
+
+    def test_cli_people_search_uses_shared_read_only_manager(self):
+        argv=['agents.manage','--config',str(self.root/'config.json'),'--db',str(self.store.path),
+              'people','search-feishu','--profile-name','p','--name','王小明','--query','wangxiaoming']
+        with patch('sys.argv',argv),patch('sys.stdout',new_callable=io.StringIO) as output,\
+             patch('agents.manage.search_feishu_people',return_value={'candidates':[]}) as search:
+            self.assertEqual(main(),0)
+        self.assertEqual(json.loads(output.getvalue()),{'candidates':[]})
+        search.assert_called_once_with(unittest.mock.ANY,'p','王小明','wangxiaoming')
+
+    def test_feishu_id_cannot_silently_move_between_people(self):
+        first=self.store.create_person('同名')
+        second=self.store.create_person('同名')
+        profile=self.store.list_profiles()[0]
+        self.store.link_feishu_identity(first['id'],profile['id'],'ou_same')
+        with self.assertRaisesRegex(ValueError,'已关联其他人员'):
+            self.store.link_feishu_identity(second['id'],profile['id'],'ou_same')
+        self.assertEqual(self.store.list_feishu_identities()[0]['person_id'],first['id'])
 
     def test_profile_self_discovery_is_app_scoped_and_read_only(self):
         response={'appId':'app','verified':True,'identities':{'user':{'openId':'ou_self','userName':'本人','available':False,'tokenStatus':'expired'}}}
