@@ -57,6 +57,36 @@ class ManagementAcceptance(unittest.TestCase):
             self.manager.post('setup',{'op':'save','admin_feishu_user_id':'ou_other','admin_profile':'p'})
         self.assertEqual(json.loads((self.root/'config.json').read_text())['admin_feishu_user_id'],'ou_admin')
 
+    def test_feishu_identity_cannot_be_linked_with_empty_id(self):
+        person=self.store.create_person('测试人员')
+        profile=next(p for p in self.store.list_profiles() if p['profile_name']=='p')
+        for value in ('','not-an-open-id'):
+            with self.assertRaisesRegex(ValueError,'open_id'):
+                self.manager.post('people',{'op':'link_feishu','person_id':person['id'],
+                                            'profile_id':profile['id'],'open_id':value})
+        self.assertEqual(self.store.list_feishu_identities(),[])
+
+    def test_profile_self_discovery_is_app_scoped_and_read_only(self):
+        response={'appId':'app','verified':True,'identities':{'user':{'openId':'ou_self','userName':'本人','available':False,'tokenStatus':'expired'}}}
+        with patch('agents.manage.run_cli',return_value=response) as cli:
+            result=self.manager.get('profiles/self',{'profile':'p'})
+        self.assertEqual(result['open_id'],'ou_self')
+        self.assertEqual(result['display_name'],'本人')
+        self.assertFalse(result['available'])
+        self.assertEqual(result['user_status'],'expired')
+        self.assertEqual(len(self.store.list_feishu_identities()),0)
+        self.assertEqual(cli.call_args.args[0],['lark-cli','--profile','p','auth','status','--json','--verify'])
+        self.assertEqual(set(result),{'profile_name','open_id','display_name','available','user_status'})
+
+    def test_profile_self_discovery_rejects_replaced_app_and_missing_identity(self):
+        with patch('agents.manage.run_cli',return_value={'appId':'different','identities':{'user':{'openId':'ou_other'}}}):
+            with self.assertRaisesRegex(ValueError,'App ID'):
+                self.manager.get('profiles/self',{'profile':'p'})
+        with patch('agents.manage.run_cli',return_value={'appId':'app','identities':{'user':{'status':'missing'}}}):
+            result=self.manager.get('profiles/self',{'profile':'p'})
+        self.assertIsNone(result['open_id'])
+        self.assertEqual(result['user_status'],'missing')
+
     def test_profile_external_rename_preserves_app_external_replace_stops(self):
         self.bind();self.store.set_control(1,'running')
         with patch('agents.manage.run_cli',return_value=[{'name':'renamed','appId':'app'}]):profile_list(self.store)

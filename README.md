@@ -164,7 +164,7 @@ python3 -m agents.manage status
 
 通过 `W2F_CONFIG_DIR`、`W2F_DATA_DIR` 可切换到隔离的配置和数据目录；旧版 `CHZ_CONFIG_DIR`、`CHZ_DATA_DIR` 仍作为兼容 fallback。`W2F_MEDIA_DIR` 可指定媒体暂存目录，`WECHAT_READER` 用于覆盖微信 CLI 入口。
 
-管理员私聊提醒需要在其所属 `admin_profile` 下核实 `admin_feishu_user_id`，不能复制另一应用的 `open_id`。已有绑定可在管理台“接入引导”保存管理员身份与运行参数；新管理员必须先在“人员与实名”页关联到提醒应用。实时唤醒和轮询间隔变更在 Worker 重启后生效。
+管理员私聊提醒需要在其所属 `admin_profile` 下核实 `admin_feishu_user_id`，不能复制另一应用的 `open_id`。在“人员与实名”页选择本人和发送 Profile 后，可点“读取此应用保存的用户 ID”从该 Profile 的 CLI 授权记录填入 ID；若授权已过期，页面会注明是上次保存的身份，仍须核对姓名后保存。读取不到时，页面提供 CLI 查询和联系应用管理员的指引。已有绑定可在管理台“接入引导”保存管理员身份与运行参数；新管理员必须先在“人员与实名”页关联到提醒应用。实时唤醒和轮询间隔变更在 Worker 重启后生效。
 
 ## 当前边界
 

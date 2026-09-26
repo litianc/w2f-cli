@@ -111,6 +111,22 @@ def profile_health(store,name):
     return {'profile':name,'bot_status':bot_status,'user_status':user_status,'error':'; '.join(errors) or None}
 
 
+def discover_profile_user(store, profile_name):
+    """Read the CLI's saved user identity for exactly one registered app."""
+    profile=next((item for item in store.list_profiles() if item['profile_name']==profile_name and item['enabled']),None)
+    if not profile:raise ValueError('请选择已启用的发送 Profile')
+    status=run_cli(['lark-cli','--profile',profile_name,'auth','status','--json','--verify'])
+    if str(status.get('appId') or '')!=str(profile['app_id']):
+        raise ValueError('Profile App ID 与登记应用不一致，请先在「飞书应用」刷新 Profile')
+    user=(status.get('identities') or {}).get('user') or {}
+    open_id=str(user.get('openId') or '').strip()
+    if open_id and not open_id.startswith('ou_'):raise ValueError('CLI 返回的用户 open_id 格式不正确')
+    return {'profile_name':profile_name,'open_id':open_id or None,
+            'display_name':str(user.get('userName') or ''),
+            'available':bool(user.get('available')),
+            'user_status':str(user.get('tokenStatus') or user.get('status') or 'unknown')}
+
+
 def chat_share_link(profile_name, chat_id):
     payload = run_cli(['lark-cli', '--profile', profile_name, 'im', 'chats', 'link',
                        '--chat-id', chat_id, '--data', json.dumps({'validity_period': 'week'}),
@@ -211,6 +227,7 @@ class Manager:
     def get(self,resource,query=None):
         query=query or {};s=self.store
         if resource=='profiles':return s.list_profiles()
+        if resource=='profiles/self':return discover_profile_user(s,str(query.get('profile') or ''))
         if resource=='bindings':return s.list_bindings()
         if resource=='people':return {'people':s.list_people(),'wechat':s.list_wechat_identities(),'feishu':s.list_feishu_identities(),'actions':s.actions()}
         if resource=='confirmations':return s.list_confirmations()

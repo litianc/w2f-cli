@@ -369,6 +369,9 @@ class MirrorStore:
             return dict(db.execute("SELECT w.*,p.confirmed_name FROM wechat_identities w JOIN people p ON p.id=w.person_id WHERE w.source_account=? AND w.wechat_sender_id=?", (source_account, sender_id)).fetchone())
 
     def link_feishu_identity(self, person_id: int, profile_id: int, open_id: str, user_id: str = "", display_name: str = "") -> dict[str, Any]:
+        open_id = str(open_id or "").strip()
+        if not open_id.startswith("ou_") or len(open_id) <= 3 or any(ch.isspace() for ch in open_id):
+            raise ValueError("飞书 open_id 格式不正确；请从所选应用读取 ou_ 开头的 ID")
         with self.connect() as db:
             if not db.execute("SELECT 1 FROM people WHERE id=?", (person_id,)).fetchone():
                 raise ValueError("人员不存在")
