@@ -14,6 +14,10 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# An explicit supported-platform contract, never a blanket waiver for skips.
+PLATFORM_EXCLUSIONS = {
+    'test_realtime_wakeup.ReaderWakeupTest.test_rion_watch_wakes_worker_on_new_row': {'win32'},
+}
 
 
 def restrict_network():
@@ -85,7 +89,10 @@ class EvidenceResult(unittest.TestResult):
 
     def addSkip(self, test, reason):
         super().addSkip(test, reason)
-        self.record(test, 'blocked', reason='Test skipped; platform or optional dependency needs review.')
+        if sys.platform in PLATFORM_EXCLUSIONS.get(test.id(), set()):
+            self.record(test, 'not_applicable', reason='POSIX Rion watch does not apply to Windows; WDA/SSE has separate coverage.')
+        else:
+            self.record(test, 'blocked', reason='Test skipped; platform or optional dependency needs review.')
 
     def addExpectedFailure(self, test, err):
         super().addExpectedFailure(test, err)

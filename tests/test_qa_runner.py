@@ -16,6 +16,17 @@ def check(status='failed', actual='assertion failed'):
 
 
 class ClassificationTests(unittest.TestCase):
+    def test_only_explicit_platform_exclusion_is_not_applicable(self):
+        class Case:
+            def __init__(self, name): self.name = name
+            def id(self): return self.name
+        result = EvidenceResult()
+        with patch('qa.worker.sys.platform', 'win32'):
+            result.addSkip(Case('test_realtime_wakeup.ReaderWakeupTest.test_rion_watch_wakes_worker_on_new_row'), 'POSIX only')
+            result.addSkip(Case('test_unknown.missing_dependency'), 'missing dependency')
+        self.assertEqual([row['status'] for row in result.checks], ['not_applicable', 'blocked'])
+        self.assertEqual(classify([result.checks[0]]), 'not_applicable')
+
     def test_only_identical_repeated_failure_is_confirmed(self):
         row = check()
         self.assertEqual(classify([row, dict(row)]), 'confirmed_failure')

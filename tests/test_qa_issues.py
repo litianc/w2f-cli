@@ -133,9 +133,9 @@ class IssuePublisherTests(unittest.TestCase):
         self.assertEqual(len(gh.calls), 2)
 
     def test_passed_flaky_and_blocked_never_access_github(self):
-        checks = [failure(status=status) for status in ("passed", "flaky", "blocked", "failed")]
+        checks = [failure(status=status) for status in ("passed", "flaky", "blocked", "failed", "not_applicable")]
         result, gh = self.publish_with(report(*checks))
-        self.assertEqual([item["status"] for item in result], ["skipped"] * 4)
+        self.assertEqual([item["status"] for item in result], ["skipped"] * 5)
         self.assertEqual(gh.calls, [])
 
     def test_invalid_confirmation_cannot_publish_even_with_confirmed_status(self):

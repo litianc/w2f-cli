@@ -26,6 +26,8 @@ def signature(check):
 
 def classify(attempts):
     states = [row['status'] for row in attempts]
+    if states == ['not_applicable']:
+        return 'not_applicable'
     if states == ['passed'] or (states and all(s == 'passed' for s in states)):
         return 'passed'
     if 'blocked' in states:
@@ -88,7 +90,7 @@ def run_group(group, timeout=240, check=None):
             if not isinstance(rows, list) or not rows:
                 raise ValueError('empty result')
             for row in rows:
-                if not isinstance(row, dict) or row.get('status') not in {'passed', 'failed', 'blocked'}:
+                if not isinstance(row, dict) or row.get('status') not in {'passed', 'failed', 'blocked', 'not_applicable'}:
                     raise ValueError('invalid check')
                 if not re.fullmatch(r'[A-Za-z0-9_.-]+', row.get('id', '')):
                     raise ValueError('invalid id')
@@ -184,12 +186,12 @@ def write_reports(report, directory):
     (directory / 'report.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
     suite = ET.Element('testsuite', name='w2f-functional', tests=str(len(clean['checks'])),
                        failures=str(counts['confirmed_failure']),
-                       skipped=str(counts['blocked'] + counts['flaky']))
+                       skipped=str(counts['blocked'] + counts['flaky'] + counts['not_applicable']))
     for row in clean['checks']:
         case = ET.SubElement(suite, 'testcase', name=row['id'], classname=row.get('group', 'qa'))
         if row['status'] == 'confirmed_failure':
             ET.SubElement(case, 'failure', message=row.get('actual', '')).text = '\n'.join(row.get('evidence', []))
-        elif row['status'] in {'blocked', 'flaky'}:
+        elif row['status'] in {'blocked', 'flaky', 'not_applicable'}:
             ET.SubElement(case, 'skipped', message=row['status']).text = row.get('actual', '')
     ET.ElementTree(suite).write(directory / 'junit.xml', encoding='utf-8', xml_declaration=True)
 
