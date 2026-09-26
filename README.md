@@ -178,6 +178,16 @@ python3 -m agents.manage status
 
 ## 开发与验证
 
+完整的隔离功能测试（回归测试、业务探针、真实浏览器操作）及自动 issue 提交：
+
+```bash
+python3 -m pip install -r requirements-qa.txt
+python3 -m playwright install chromium
+python3 -m qa.run --publish
+```
+
+省略 `--publish` 只生成报告。失败需在全新环境中重复出现且证据一致才可自动提单；已知问题去重关联，环境阻塞和偶发失败不自动发布。配置、报告与 CI 说明见[自动功能测试系统](docs/自动功能测试系统.md)。
+
 ```bash
 python3 -m unittest discover -s tests -v
 node --check agents/web/app.js
