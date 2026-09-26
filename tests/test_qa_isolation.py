@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 
-from qa.isolation import ProcessTree, child_env
+from qa.isolation import ProcessTree, _first_argument, child_env
 
 
 class IsolationTests(unittest.TestCase):
@@ -50,15 +50,34 @@ print(json.dumps([rejected,child.returncode,child.stdout.strip()]))
 ''')
         self.assertEqual(result, [[True, True, True], 0, '1'])
 
-    @unittest.skipIf(os.name == 'nt', 'POSIX executable fixture; Windows fixture scripts use .cmd wrappers')
     def test_fixture_cli_inside_qa_root_is_allowed(self):
-        executable = self.root / 'fake-cli'
-        executable.write_text('#!/bin/sh\nprintf fixture-ok', encoding='utf-8')
-        executable.chmod(0o755)
+        executable = self.root / ('fake-cli.cmd' if os.name == 'nt' else 'fake-cli')
+        if os.name == 'nt':
+            executable.write_bytes(b'@echo off\r\necho fixture-ok\r\n')
+        else:
+            executable.write_text('#!/bin/sh\nprintf fixture-ok', encoding='utf-8')
+            executable.chmod(0o755)
+        self.env['QA_FIXTURE_EXECUTABLE'] = str(executable)
         result = self.run_child('import json,os,subprocess; from pathlib import Path; '
-                                'p=subprocess.run([str(Path(os.environ["W2F_QA_ROOT"])/"fake-cli")],capture_output=True,text=True); '
-                                'print(json.dumps([p.returncode,p.stdout]))')
+                                'p=subprocess.run([os.environ["QA_FIXTURE_EXECUTABLE"]],capture_output=True,text=True); '
+                                'print(json.dumps([p.returncode,p.stdout.strip()]))')
         self.assertEqual(result, [0, 'fixture-ok'])
+
+    def test_windows_executable_parse_ignores_python_code_quotes(self):
+        # Exercise Windows audit-event strings on every CI platform. The code
+        # argument deliberately contains quotes that are not shell-balanced.
+        code = "import json\nvalue = \"can't parse this as shell\"\nprint(value)"
+        for executable in (r'C:\Python\python.exe', r'C:\Program Files\Python\python.exe',
+                           r'C:\QA fixtures\fake-cli.cmd'):
+            command = subprocess.list2cmdline([executable, '-c', code])
+            self.assertEqual(_first_argument(command, windows=True), executable)
+        self.assertEqual(_first_argument('python.exe -c "unterminated trailing code', windows=True), 'python.exe')
+
+    def test_windows_executable_parse_rejects_ambiguous_path(self):
+        for command in ('', '"unterminated path', '"" -c test', '"C:\\python.exe"suffix -c test',
+                        'C:\\bad"path.exe -c test'):
+            with self.assertRaises(PermissionError):
+                _first_argument(command, windows=True)
 
     def test_cleanup_finds_detached_python_after_original_parent_exits(self):
         import psutil

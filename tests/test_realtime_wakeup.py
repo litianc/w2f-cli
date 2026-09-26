@@ -64,6 +64,8 @@ class RealtimeWakeupTest(unittest.TestCase):
 
 class ReaderWakeupTest(unittest.TestCase):
     def test_rion_watch_wakes_worker_on_new_row(self):
+        import os
+        import sys
         import tempfile
         from pathlib import Path
         from unittest.mock import patch
@@ -73,15 +75,23 @@ class ReaderWakeupTest(unittest.TestCase):
             root=Path(directory)
             store=MirrorStore(root/'state.db')
             store.initialize({'wechat_talker':'room','feishu_chat_id':'chat'})
-            reader=root/'reader.sh'
-            reader.write_text('#!/bin/sh\nprintf \'{"local_id":42}\\n\'\n', encoding='utf-8')
-            reader.chmod(0o755)
+            body='import json\nprint(json.dumps({"local_id":42}))\n'
+            if os.name == 'nt':
+                (root/'reader.py').write_text(body,encoding='utf-8')
+                reader=root/'reader.cmd'
+                reader.write_text(f'@"{sys.executable}" "%~dp0reader.py" %*\r\n',encoding='utf-8')
+            else:
+                reader=root/'reader'
+                reader.write_text('#!/usr/bin/env python3\n'+body,encoding='utf-8')
+                reader.chmod(0o755)
             wakeup=threading.Event();stopped=threading.Event()
             with patch.object(mirror,'WECHAT_READER',reader):
                 worker=threading.Thread(target=reader_wakeup_loop,args=({'sqlite_file':str(store.path),'binding_id':1,'wechat_talker':'room'},wakeup,stopped),daemon=True)
                 worker.start()
-                self.assertTrue(wakeup.wait(3))
-                stopped.set();worker.join(3)
+                try:
+                    self.assertTrue(wakeup.wait(3))
+                finally:
+                    stopped.set();worker.join(3)
                 self.assertFalse(worker.is_alive())
 
 

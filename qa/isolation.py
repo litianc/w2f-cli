@@ -108,13 +108,43 @@ def _allowed_executables():
     return paths
 
 
+def _first_argument(command: str, *, windows: bool) -> str:
+    """Read only argv[0], leaving quoted script/code arguments uninterpreted.
+
+    Windows subprocess audit events contain the CreateProcess command line,
+    even when Popen received a list. shlex is not a Windows command-line parser:
+    parsing the entire string can reject valid Python -c code after argv[0].
+    Windows executable filenames cannot contain a quote, so accept one fully
+    quoted path or one unquoted word and fail closed on ambiguous forms.
+    """
+    command = command.lstrip()
+    if not command:
+        raise PermissionError('QA cannot identify the child executable')
+    if windows:
+        if command.startswith('"'):
+            end = command.find('"', 1)
+            if end <= 1 or (end + 1 < len(command) and not command[end + 1].isspace()):
+                raise PermissionError('QA cannot identify the child executable')
+            return command[1:end]
+        first = command.split(None, 1)[0]
+        if '"' in first:
+            raise PermissionError('QA cannot identify the child executable')
+        return first
+    lexer = shlex.shlex(command, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ''
+    try:
+        return next(lexer)
+    except (StopIteration, ValueError):
+        raise PermissionError('QA cannot identify the child executable') from None
+
+
 def _command_path(executable, args, cwd, env):
     if not executable:
         if isinstance(args, (list, tuple)) and args:
             executable = args[0]
         elif isinstance(args, (str, bytes)):
-            words = shlex.split(os.fsdecode(args), posix=os.name != 'nt')
-            executable = words[0].strip('"') if words else ''
+            executable = _first_argument(os.fsdecode(args), windows=os.name == 'nt')
     value = os.fsdecode(executable) if executable else ''
     if not value:
         raise PermissionError('QA cannot identify the child executable')
