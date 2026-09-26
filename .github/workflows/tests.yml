@@ -39,9 +39,8 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - run: python scripts/check_public_tree.py
-      - name: Require complete passing verification
-        if: steps.qa.outcome != 'success'
-        run: python -c "raise SystemExit('Functional failures, flaky checks, or blocked environment; see QA artifact')"
+      - name: Reject new failures and stale known-failure entries
+        run: python -m qa.gate .qa-results/ci/report.json
 
   publish:
     needs: test

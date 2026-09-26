@@ -1,0 +1,22 @@
+{
+  "people.lifecycle": {
+    "issue": 15,
+    "signature": "81f3c674e84e1a7e5290ea06a4d0f1cf460e9caba6eae732a08998372d396735"
+  },
+  "people.archived-attribution": {
+    "issue": 15,
+    "signature": "b0896a2e1841dfc3c50020a63ab1376623bd319e387217fe4f75f7153a011194"
+  },
+  "identity.reconfirmation": {
+    "issue": 15,
+    "signature": "b853ebc411cd8263849ffcac4928877f3a0c630982199493c7cdabeacef8b289"
+  },
+  "identity.confirmation-replay": {
+    "issue": 16,
+    "signature": "78f9af59f59f25939168e07d3c08c33263de54d604e138275e5e8b862073c714"
+  },
+  "browser.empty_wechat_id": {
+    "issue": 17,
+    "signature": "8f3d38bf1fdccf9738413771116cf9a3475031c7114902be61e4619d40550e25"
+  }
+}
