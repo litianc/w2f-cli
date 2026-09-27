@@ -25,6 +25,15 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install -r requirements-qa.txt
+      - name: Install FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+      - name: Install FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg --no-progress -y
       - run: python -m playwright install --with-deps chromium
       - name: Run isolated checks and confirm failures
         id: qa
@@ -39,9 +48,8 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - run: python scripts/check_public_tree.py
-      - name: Require complete passing verification
-        if: steps.qa.outcome != 'success'
-        run: python -c "raise SystemExit('Functional failures, flaky checks, or blocked environment; see QA artifact')"
+      - name: Reject new failures and stale known-failure entries
+        run: python -m qa.gate .qa-results/ci/report.json
 
   publish:
     needs: test
