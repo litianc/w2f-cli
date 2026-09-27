@@ -16,7 +16,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 20 || 15 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,7 +44,9 @@ jobs:
       - name: Run isolated checks and confirm failures
         id: qa
         continue-on-error: true
-        run: python -m qa.run --output .qa-results/ci
+        # Windows filesystem/process startup is slower; retain a bounded timeout
+        # and the same strict gate (no accepted blocked/flaky results).
+        run: python -m qa.run --timeout ${{ runner.os == 'Windows' && 480 || 240 }} --output .qa-results/ci
       - name: Upload structured evidence
         if: always()
         uses: actions/upload-artifact@v4

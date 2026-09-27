@@ -7,6 +7,8 @@ import hashlib
 import io
 import json
 import os
+import re
+import time
 import socket
 import sys
 import traceback
@@ -42,9 +44,32 @@ def restrict_network():
 
 
 class EvidenceResult(unittest.TestResult):
-    def __init__(self):
+    def __init__(self, progress_path=None):
         super().__init__()
         self.checks = []
+        self.progress_path = progress_path
+        self.test_started = None
+
+    def write_progress(self, current=None):
+        if self.progress_path is None:
+            return
+        identifier = current.id() if current is not None else None
+        if identifier and not re.fullmatch(r'[A-Za-z0-9_.-]+', identifier):
+            identifier = 'unidentified_test'
+        value = {'completed': self.testsRun - (1 if current is not None else 0), 'current_test': identifier}
+        temporary = self.progress_path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(value), encoding='utf-8')
+        temporary.replace(self.progress_path)
+
+    def startTest(self, test):
+        super().startTest(test)
+        self.test_started = time.perf_counter()
+        self.write_progress(test)
+
+    def stopTest(self, test):
+        super().stopTest(test)
+        self.write_progress()
+
 
     def record(self, test, status, err=None, reason=''):
         frames = []
@@ -64,6 +89,7 @@ class EvidenceResult(unittest.TestResult):
             'status': status, 'expected': 'The regression test passes.',
             'actual': actual, 'evidence': frames[-4:],
             'related_issues': [], 'category': 'bug',
+            'test_duration_seconds': round(time.perf_counter() - self.test_started, 3) if self.test_started is not None else None,
         }
         if err:
             # Preserve distinctions between assertion values without disclosing
@@ -109,14 +135,14 @@ class EvidenceResult(unittest.TestResult):
             self.record(test, 'failed' if issubclass(err[0], AssertionError) else 'blocked', err)
 
 
-def unit_checks(check=None):
+def unit_checks(check=None, progress_path=None):
     loader = unittest.TestLoader()
     if check:
         sys.path.insert(0, str(ROOT / 'tests'))
         suite = loader.loadTestsFromName(check.removeprefix('unit.'))
     else:
         suite = loader.discover(str(ROOT / 'tests'))
-    result = EvidenceResult()
+    result = EvidenceResult(progress_path)
     suite.run(result)
     # A test with multiple subtest failures is one finding, never multiple issues.
     rows = {}
@@ -146,7 +172,7 @@ def main():
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         try:
             if args.group == 'unit':
-                rows = unit_checks(args.check)
+                rows = unit_checks(args.check, args.output.with_suffix('.progress.json'))
             elif args.group == 'probes':
                 from qa.probes import run_checks
                 rows = run_checks()

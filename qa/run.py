@@ -58,6 +58,21 @@ def blocked(group, actual, check=None):
             'actual': actual, 'evidence': [], 'category': 'bug', 'related_issues': []}
 
 
+def timeout_detail(path):
+    """Only export counters and validated test IDs, never test values or output."""
+    try:
+        progress = json.loads(path.read_text(encoding='utf-8'))
+        completed = progress.get('completed')
+        current = progress.get('current_test')
+        if type(completed) is not int or not 0 <= completed <= 1000000:
+            return ''
+        if current is not None and (not isinstance(current, str) or not re.fullmatch(r'[A-Za-z0-9_.-]+', current)):
+            return ''
+        return f' Completed {completed} tests; active: {current or "between tests"}.'
+    except (OSError, ValueError, AttributeError):
+        return ''
+
+
 def run_group(group, timeout=240, check=None):
     try:
         import psutil  # noqa: F401 - fail before starting a child if cleanup is unavailable
@@ -82,7 +97,7 @@ def run_group(group, timeout=240, check=None):
             except subprocess.TimeoutExpired:
                 tree.cleanup()
                 process.wait(timeout=10)
-                return [blocked(group, f'Environment exceeded {timeout}s timeout.', check)]
+                return [blocked(group, f'Environment exceeded {timeout}s timeout.' + timeout_detail(output.with_suffix('.progress.json')), check)]
         if process.returncode or not output.is_file():
             return [blocked(group, f'Test process exited without results ({process.returncode}).', check)]
         try:

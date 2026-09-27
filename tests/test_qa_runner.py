@@ -16,6 +16,25 @@ def check(status='failed', actual='assertion failed'):
 
 
 class ClassificationTests(unittest.TestCase):
+    def test_progress_preserves_only_safe_test_identifier_and_count(self):
+        from qa.run import timeout_detail
+        class Case:
+            def id(self): return 'test_fixture.Case.test_slow'
+        with tempfile.TemporaryDirectory() as directory:
+            progress = Path(directory) / 'progress.json'
+            result = EvidenceResult(progress_path=progress)
+            test = Case()
+            result.startTest(test)
+            detail = timeout_detail(progress)
+            self.assertIn('test_fixture.Case.test_slow', detail)
+            self.assertIn('Completed 0', detail)
+            result.stopTest(test)
+            self.assertIn('Completed 1', timeout_detail(progress))
+            progress.write_text(json.dumps({'completed': 1, 'current_test': 'private value=secret'}))
+            self.assertNotIn('secret', timeout_detail(progress))
+            progress.write_text('incomplete')
+            self.assertEqual(timeout_detail(progress), '')
+
     def test_only_explicit_platform_exclusion_is_not_applicable(self):
         class Case:
             def __init__(self, name): self.name = name
