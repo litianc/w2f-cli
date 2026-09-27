@@ -95,4 +95,104 @@ class GroupNamesTest(unittest.TestCase):
             self.assertFalse(paused.wait(.1));release.set();worker.join(3);stopper.join(3)
         self.assertTrue(paused.is_set());self.source='C';self.tick();self.assertEqual(self.writes,['B'])
 
+    def test_display_alias_without_authoritative_name_never_renames_target(self):
+        self.tick()
+        original = self.cli
+        def display_only(args, **kwargs):
+            if 'resolve-chat' in args:
+                return {'data': {'candidates': [{'username': 'room', 'display_name': 'Private alias'}]}}
+            return original(args, **kwargs)
+        from agents.group_names import sync_group_name
+        with patch('agents.group_names.run_cli', side_effect=display_only):
+            sync_group_name({'binding_id': 1}, self.s)
+        self.assertEqual(self.target, 'Custom target')
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.s.get_binding(1)['name_sync']['status'], 'failed')
+
+    def test_non_string_source_name_never_overwrites_target(self):
+        self.tick()
+        for value in (None, [], {}, 123, False):
+            with self.subTest(value=value):
+                self.source = value
+                self.tick()
+                self.assertEqual(self.writes, [])
+                self.assertEqual(self.target, 'Custom target')
+                self.assertEqual(self.s.get_binding(1)['name_sync']['status'], 'failed')
+
+    def test_same_names_across_accounts_profiles_and_restart_stay_isolated(self):
+        from agents.group_names import sync_group_name
+        self.s.upsert_profile('second', 'app-second')
+        other = self.s.create_binding({'source_account': 'second-account', 'wechat_chat_name': 'A',
+            'wechat_talker': 'second-room', 'feishu_chat_name': 'Custom target',
+            'feishu_chat_id': 'second-chat', 'lark_profile': 'second'})
+        bid = other['id']
+        self.s.save_setting(f'name_sync_enabled:{bid}', True)
+        self.s.set_control(bid, 'running')
+        self.s.set_cursor(17, 1)
+        self.s.set_cursor(29, bid)
+        names = {'room': 'A', 'second-room': 'A'}
+        targets = {'chat': 'Original one', 'second-chat': 'Original two'}
+        writes = []
+        def transport(args, **kwargs):
+            if 'resolve-chat' in args:
+                talker = args[args.index('resolve-chat') + 1]
+                return {'data': {'candidates': [{'username': talker, 'nick_name': names[talker]}]}}
+            target = args[args.index('--chat-id') + 1]
+            profile = args[args.index('--profile') + 1]
+            self.assertEqual(profile, 'test' if target == 'chat' else 'second')
+            self.assertEqual(args[args.index('--as') + 1], 'bot')
+            if '+chat-update' in args:
+                targets[target] = args[args.index('--name') + 1]
+                writes.append((profile, target, targets[target]))
+            return {'data': {'name': targets[target]}}
+        def both():
+            for identity in (1, bid):
+                sync_group_name({'binding_id': identity}, self.s)
+        with patch('agents.group_names.run_cli', side_effect=transport):
+            both()
+            names['room'] = 'B'
+            both()
+            self.s.set_control(1, 'paused')
+            names.update({'room': 'C', 'second-room': 'D'})
+            both()
+            self.s = MirrorStore(self.s.path)  # Persisted state survives a new owner.
+            self.s.set_control(1, 'running')
+            both()
+            both()
+        self.assertEqual(writes, [('test', 'chat', 'B'), ('second', 'second-chat', 'D'), ('test', 'chat', 'C')])
+        self.assertEqual((self.s.get_cursor(1), self.s.get_cursor(bid)), (17, 29))
+        self.assertEqual(self.s.get_binding(1)['wechat_talker'], 'room')
+        self.assertEqual(self.s.get_binding(bid)['source_account'], 'second-account')
+
+    def test_production_maintenance_cycle_follows_name_without_messages(self):
+        from agents.group_names import group_name_loop
+        owner = self
+        class TwoCycles:
+            cycles = 0
+            def is_set(self): return self.cycles >= 2
+            def wait(self, seconds):
+                self.cycles += 1
+                owner.source = 'B'
+        with patch('agents.manage.run_cli', return_value={'data': {'profiles': [{'name': 'test', 'appId': 'app'}]}}), patch('agents.group_names.run_cli', side_effect=self.cli):
+            group_name_loop({'binding_id': 1}, self.s, TwoCycles())
+        self.assertEqual(self.target, 'B')
+        self.assertEqual(self.writes, ['B'])
+        self.assertEqual(self.s.get_cursor(1), 0)
+
+    def test_stop_disabled_profile_and_replacement_do_not_write(self):
+        self.tick()
+        self.source = 'B'
+        self.s.set_control(1, 'stopped')
+        self.tick()
+        self.assertEqual(self.writes, [])
+        self.s.set_control(1, 'running')
+        self.s.set_profile_enabled('test', False)
+        self.tick()
+        self.assertEqual(self.writes, [])
+        self.s.set_profile_enabled('test', True)
+        self.s.set_control(1, 'running')
+        self.s.upsert_profile('test', 'replacement-app')
+        self.tick()
+        self.assertEqual(self.writes, [])
+
 if __name__=='__main__':unittest.main()

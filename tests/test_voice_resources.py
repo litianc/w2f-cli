@@ -77,7 +77,7 @@ class VoiceResourcesTest(unittest.TestCase):
     def test_generated_silk_converts_to_playable_opus(self):
         try:import pilk
         except ImportError:self.skipTest('optional pilk unavailable')
-        if not mirror.shutil.which('ffmpeg'):self.skipTest('optional ffmpeg unavailable')
+        if not mirror.ffmpeg_executable():self.skipTest('optional ffmpeg unavailable')
         import math,struct
         pcm=self.root/'synthetic.pcm'
         pcm.write_bytes(b''.join(struct.pack('<h',int(5000*math.sin(i*2*math.pi*440/24000))) for i in range(12000)))
@@ -86,7 +86,7 @@ class VoiceResourcesTest(unittest.TestCase):
         # Keep the production CLI/network guard intact and use synthetic input.
         import shutil
         codec=self.root/('ffmpeg.exe' if sys.platform=='win32' else 'ffmpeg')
-        shutil.copy2(mirror.shutil.which('ffmpeg'),codec)
+        shutil.copy2(mirror.ffmpeg_executable(),codec)
         with patch.object(mirror.shutil,'which',return_value=str(codec)):
             args,cleanup=mirror.voice_upload_args(str(silk))
         self.assertEqual(args[0],'--audio')

@@ -28,7 +28,8 @@ def sync_group_name(config, store):
         if len(matches)!=1:raise ValueError('未能按稳定 ID 唯一读取源群真实名称')
         # Rion display_name can be a private remark, so never prefer it to nick_name.
         source=matches[0]
-        name=str(source.get('nick_name') if 'nick_name' in source else source.get('name') or source.get('display_name') or '').strip()
+        raw_name=source.get('nick_name') if 'nick_name' in source else source.get('name')
+        name=raw_name.strip() if isinstance(raw_name,str) else ''
         if not name or name==binding['wechat_talker'] or len(name)>60 or any(ord(c)<32 for c in name):
             raise ValueError('源群真实名称缺失或不符合飞书群名限制，未修改目标')
         if 'observed' not in state:

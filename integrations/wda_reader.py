@@ -120,6 +120,15 @@ def map_row(talker: str, message: dict, names: dict[str, str]) -> dict:
 
     row["kind_name"] = kind
     row["text"] = text
+    if base == 49 and sub == 5:
+        try:
+            from .article_shares import reader_article, article_share, article_body
+        except ImportError:
+            from article_shares import reader_article, article_share, article_body
+        article = reader_article(message)
+        xml_article = article_share({'content': content}) or {}
+        row['article'] = {key: value or xml_article.get(key, '') for key, value in article.items()}
+        row['text'] = article_body(row['article'])
     if kind == "voice":
         transcript = str(message.get("voiceTranscript") or "").strip()
         if transcript:

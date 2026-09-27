@@ -47,6 +47,21 @@ class VoiceTranscriptTest(unittest.TestCase):
             mirror.cleanup_staged(converted)
             self.assertFalse(Path(converted).exists())
 
+    def test_macos_service_without_homebrew_path_still_transcodes_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'voice.amr'
+            source.write_bytes(b'synthetic')
+            def installed(command, path=None):
+                return '/opt/homebrew/bin/ffmpeg' if path and '/opt/homebrew/bin' in path else None
+            def transcode(args, **kwargs):
+                self.assertEqual(args[0], '/opt/homebrew/bin/ffmpeg')
+                Path(args[-1]).write_bytes(b'ogg-opus-fixture')
+                return type('Result', (), {'returncode': 0})()
+            with patch.object(mirror.sys, 'platform', 'darwin'), patch.object(mirror.shutil, 'which', side_effect=installed), patch.object(mirror.subprocess, 'run', side_effect=transcode):
+                flags, converted = mirror.voice_upload_args(str(source))
+            self.assertEqual(flags[0], '--audio')
+            mirror.cleanup_staged(converted)
+
     def test_unsupported_voice_codec_remains_downloadable_file(self):
         with tempfile.TemporaryDirectory() as directory:
             source=Path(directory)/'voice.silk';source.write_bytes(b'fixture')

@@ -251,6 +251,10 @@ def clean_body(row: dict[str, Any]) -> str:
     if kind in {"image", "video", "file", "voice", "audio", "media"}:
         labels = {"image": "图片", "video": "视频", "file": "文件", "voice": "语音", "audio": "语音", "media": "媒体"}
         return f"[{labels.get(kind, '媒体')}]"
+    from integrations.article_shares import article_share, article_body
+    article = article_share(row)
+    if article is not None:
+        return article_body(article)
     if raw.startswith("<"):
         # Keep useful fields from app messages while never forwarding raw XML.
         title = re.search(r"<title>(.*?)</title>", raw, re.S)
@@ -437,7 +441,7 @@ def media_url(row: dict[str, Any]) -> str | None:
     return None
 
 
-def reader_media_result(row: dict[str, Any]) -> tuple[list[Path], bool]:
+def reader_media_result(row: dict[str, Any], *, preview_only: bool = False) -> tuple[list[Path], bool]:
     """Ask the read-only reader for local resources belonging to one message.
 
     Returns (paths, thumbnail_only); the optional contract field
@@ -467,20 +471,21 @@ def reader_media_result(row: dict[str, Any]) -> tuple[list[Path], bool]:
         payload = json.loads(proc.stdout)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return [], False
-    found = []
-    thumbnail_only = False
+    originals, previews = [], []
     for resource in payload.get('data', payload).get('resources', []):
-        thumbnail_only = thumbnail_only or bool(resource.get('thumbnail_only'))
-        for value in resource.get('local_paths', []):
+        candidates = previews if resource.get('thumbnail_only') else originals
+        paths = list(resource.get('local_paths') or [])
+        if resource.get('local_path'):
+            paths.append(resource['local_path'])
+        for value in paths:
             path = Path(value).expanduser()
             if path.is_file():
-                found.append(path)
-        # Older reader versions used one local_path.
-        if resource.get('local_path'):
-            path = Path(resource['local_path']).expanduser()
-            if path.is_file():
-                found.append(path)
-    return list(dict.fromkeys(found)), thumbnail_only
+                candidates.append(path)
+    # Explicit quality is stronger evidence than compressed file size. Do not
+    # label an original degraded merely because a preview also exists.
+    if preview_only:
+        return list(dict.fromkeys(previews)), bool(previews)
+    return list(dict.fromkeys(originals or previews)), bool(previews and not originals)
 
 
 def reader_media_paths(row: dict[str, Any]) -> list[Path]:
@@ -578,43 +583,56 @@ def stage_voice_resource(row, media_dir, namespace):
 
 
 def stage_media(row: dict[str, Any], kind: str) -> tuple[str | None, bool]:
-    """Stage a reader-provided local file, then fall back to a normal URL.
+    """Prefer explicit originals; stage a preview if all originals are unusable.
 
-    Returns (path, thumbnail_only). When several local candidates exist the
-    largest file wins: the desktop WeChat cache often keeps a thumbnail next
-    to the original, and size reliably prefers the original.
+    Size only orders candidates of the same quality. Preview resources are
+    queried again on staging failure so normal delivery needs one reader call.
+    Upload/permission failures do not silently downgrade the selected image.
     """
     local_candidates, thumbnail_only = reader_media_result(row)
     if not local_candidates:
         local_candidates = wechat_cache_paths(row)
-    try:
-        local_candidates = sorted(local_candidates, key=lambda item: item.stat().st_size, reverse=True)
-    except OSError:
-        pass
-    source_path = local_candidates[0] if local_candidates else None
     media_dir = Path(os.environ.get("W2F_MEDIA_DIR", os.environ.get("CHZ_MEDIA_DIR", str(row.get("media_dir") or MEDIA_DIR)))).expanduser()
     namespace = str(row.get("binding_id",1)) + "-" + hashlib.sha1(str(row.get("talker") or "default").encode()).hexdigest()[:10]
     local_id = int(row.get("local_id") or 0)
-    if not source_path and kind in {'voice','audio'}:
+    if not local_candidates and kind in {'voice','audio'}:
         voice = stage_voice_resource(row,media_dir,namespace)
         if voice:
             return voice,False
-    if source_path:
+    last_error = None
+    try_previews = bool(local_candidates) and not thumbnail_only and kind == 'image'
+    while local_candidates:
         try:
-            media_dir.mkdir(parents=True, exist_ok=True)
-            suffix = source_path.suffix.lower() or {"image": ".jpg", "video": ".mp4", "voice": ".ogg", "file": ".bin"}.get(kind, ".bin")
-            path = media_dir / f"{namespace}-{local_id}{suffix}"
-            if kind == "image" and suffix == ".dat":
-                if not decode_wechat_dat(source_path, path, allow_macos_derivation=row.get('macos_image_key_derivation') is True):
-                    raise CliError('decode_failed: 无法解码本机图片资源')
-                path = next((media_dir / f"{namespace}-{local_id}{ext}" for ext in (".png",".jpg",".gif",".webp") if (media_dir / f"{namespace}-{local_id}{ext}").is_file()), path)
-            else:
-                shutil.copy2(source_path, path)
-            return str(path), thumbnail_only
-        except OSError as exc:
-            print(f"本地媒体暂存失败 local_id={local_id}: {type(exc).__name__}", file=sys.stderr, flush=True)
+            local_candidates = sorted(local_candidates, key=lambda item: item.stat().st_size, reverse=True)
+        except OSError:
+            pass
+        for source_path in local_candidates:
+            try:
+                if source_path.stat().st_size == 0:
+                    raise CliError('decode_failed: 本机媒体资源为空')
+                media_dir.mkdir(parents=True, exist_ok=True)
+                suffix = source_path.suffix.lower() or {"image": ".jpg", "video": ".mp4", "voice": ".ogg", "file": ".bin"}.get(kind, ".bin")
+                path = media_dir / f"{namespace}-{local_id}{suffix}"
+                if kind == "image" and suffix == ".dat":
+                    if not decode_wechat_dat(source_path, path, allow_macos_derivation=row.get('macos_image_key_derivation') is True):
+                        raise CliError('decode_failed: 无法解码本机图片资源')
+                    path = next((media_dir / f"{namespace}-{local_id}{ext}" for ext in (".png",".jpg",".gif",".webp") if (media_dir / f"{namespace}-{local_id}{ext}").is_file()), path)
+                else:
+                    shutil.copy2(source_path, path)
+                return str(path), thumbnail_only
+            except CliError as exc:
+                last_error = exc
+            except OSError as exc:
+                last_error = CliError('resource_missing: 本地媒体暂存失败 ' + type(exc).__name__)
+        if try_previews:
+            local_candidates, thumbnail_only = reader_media_result(row, preview_only=True)
+            try_previews = False
+        else:
+            break
     url = media_url(row)
     if not url or not url.startswith(("http://", "https://")):
+        if last_error:
+            raise last_error
         return None, thumbnail_only
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "wechat-feishu-mirror/1.0"})
@@ -715,6 +733,14 @@ def stage_sticker(row: dict[str, Any]) -> str | None:
     raise CliError('sticker_resource_missing: 当前消息及本群历史中未找到可用表情资源')
 
 
+def ffmpeg_executable() -> str | None:
+    """Respect PATH, then macOS package locations for GUI-launched services."""
+    encoder = shutil.which('ffmpeg')
+    if not encoder and sys.platform == 'darwin':
+        encoder = shutil.which('ffmpeg', path='/opt/homebrew/bin:/usr/local/bin')
+    return encoder
+
+
 def voice_upload_args(path: str) -> tuple[list[str], str | None]:
     """Prefer a playable Feishu voice message; preserve unsupported audio as a file."""
     source = Path(path)
@@ -725,7 +751,7 @@ def voice_upload_args(path: str) -> tuple[list[str], str | None]:
     if source.suffix.lower() in {'.opus', '.ogg'}:
         return ['--audio', path], None
     if source.suffix.lower() in {'.silk','.slk'}:
-        encoder = shutil.which('ffmpeg')
+        encoder = ffmpeg_executable()
         if encoder:
             pcm = private_output('.pcm');converted = private_output('.opus')
             try:
@@ -742,7 +768,7 @@ def voice_upload_args(path: str) -> tuple[list[str], str | None]:
                 cleanup_staged(str(pcm))
             cleanup_staged(str(converted))
     if source.suffix.lower() in {'.amr', '.aac', '.m4a', '.mp3', '.wav'}:
-        encoder = shutil.which('ffmpeg')
+        encoder = ffmpeg_executable()
         if encoder:
             converted = private_output('.opus')
             try:
@@ -874,6 +900,25 @@ def forward_body(row, config, store):
     return '\n'.join(render(items)) if items else '[转发聊天记录内容暂不可用]'
 
 
+def send_article_cover(store, message, plan, text_result, send):
+    article = plan.get('article') or {}
+    cover = article.get('cover_url')
+    if not cover or not article.get('url'):
+        return False
+    try:
+        # Use the existing CLI upload and persisted delivery receipts. Keeping
+        # the cover attached to its article also makes manual repair unambiguous.
+        send('article-cover', ['+messages-reply', '--message-id', text_result['data']['message_id'], '--image', cover])
+        store.add_media_job(message['id'], 'article_cover', None, None, 'uploaded')
+        return False
+    except (CliError, DeliveryUncertain) as exc:
+        # The article text already has a receipt. Optional cover uncertainty
+        # stays visible for reconciliation without blocking subsequent messages.
+        uncertain = isinstance(exc, DeliveryUncertain) or exc.uncertain
+        store.add_media_job(message['id'], 'article_cover', None, None, 'manual' if uncertain else 'placeholder', safe_error(exc))
+        return True
+
+
 def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any], store: MirrorStore) -> None:
     key = message_key(row); bid = int(config.get('binding_id',1))
     kind = str(row.get('kind_name') or 'text')
@@ -971,10 +1016,14 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
                 total=len(raw_parts)
                 parts=[f'{name}转发聊天记录（第 {i}/{total} 段）\n{part}' for i,part in enumerate(raw_parts,1)] if is_forward_row(row) else [f'{name}：{part}' for part in raw_parts]
                 plan={'target':target,'parts':parts,'placeholder':is_forward_row(row) and body=='[转发聊天记录内容暂不可用]'}
+                from integrations.article_shares import article_share
+                if not is_forward_row(row) and not is_group_event(row) and not quote:
+                    plan['article'] = article_share(row)
                 store.save_setting(plan_key,plan)
             for index,part in enumerate(plan['parts']):
                 result=send(f'text-{index}',plan['target']+['--text',part])
-            placeholder=plan['placeholder']
+            cover_missing=send_article_cover(store,message,plan,result,send)
+            placeholder=plan['placeholder'] or cover_missing
         store.mark_message(key,'placeholder' if placeholder else 'sent',binding_id=bid,feishu_message_id=message['feishu_message_id'] if config.get('_retry_media') else str(result['data']['message_id']))
     except Exception as exc:
         store.mark_message(key,'failed',binding_id=bid,error=safe_error(exc))
@@ -983,11 +1032,12 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
 
 
 def video_cover(path):
-    if not shutil.which('ffmpeg'):
+    encoder = ffmpeg_executable()
+    if not encoder:
         return None
     cover = path.with_suffix('.cover.jpg')
     try:
-        result=subprocess.run(['ffmpeg','-v','error','-y','-i',str(path),'-frames:v','1','-vf','scale=640:-2',str(cover)],capture_output=True,timeout=30)
+        result=subprocess.run([encoder,'-v','error','-y','-i',str(path),'-frames:v','1','-vf','scale=640:-2',str(cover)],capture_output=True,timeout=30)
         return cover if result.returncode==0 and cover.exists() else None
     except (OSError,subprocess.TimeoutExpired): return None
 
