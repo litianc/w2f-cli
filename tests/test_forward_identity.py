@@ -1,4 +1,5 @@
 import tempfile
+from contextlib import closing
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -64,7 +65,7 @@ class ForwardIdentityTest(unittest.TestCase):
         backups=list((self.store.path.parent/'backups').glob('*.bak'))
         self.assertEqual(len(backups),1)
         import sqlite3
-        with sqlite3.connect(backups[0]) as old:
+        with closing(sqlite3.connect(backups[0])) as old:
             self.assertEqual(old.execute("SELECT status FROM wechat_identities WHERE wechat_sender_id=?",(fake,)).fetchone()[0],'pending')
         rejected=self.store.list_confirmations('rejected')
         self.assertEqual(len(rejected),1)

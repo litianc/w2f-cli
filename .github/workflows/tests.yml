@@ -33,7 +33,13 @@ jobs:
         run: brew install ffmpeg
       - name: Install FFmpeg (Windows)
         if: runner.os == 'Windows'
-        run: choco install ffmpeg --no-progress -y
+        run: |
+          choco install ffmpeg --no-progress -y
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # QA copies the codec into its fixture; a Chocolatey shim cannot be relocated.
+          $codec = Get-ChildItem "$env:ChocolateyInstall\lib\ffmpeg" -Filter ffmpeg.exe -Recurse | Select-Object -First 1
+          if (-not $codec) { throw "FFmpeg executable was not installed" }
+          $codec.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - run: python -m playwright install --with-deps chromium
       - name: Run isolated checks and confirm failures
         id: qa
