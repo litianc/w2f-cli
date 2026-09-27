@@ -156,7 +156,11 @@ class ManagementAcceptance(unittest.TestCase):
         self.store.record_sender('default','wx2','昵称',binding_id=1)
         for item in self.store.list_confirmations():self.store.confirm_sender(item['id'],'张三')
         self.assertEqual(len(self.store.list_people()),2)
-        first=self.store.list_people()[0]['id'];self.store.link_wechat_identity(first,'default','wx2')
+        wx2=self.store.resolve_sender('default','wx2')
+        first=next(p['id'] for p in self.store.list_people() if p['id']!=wx2['person_id'])
+        with self.assertRaisesRegex(ValueError,'已关联其他人员'):
+            self.store.link_wechat_identity(first,'default','wx2')
+        self.store.reassign_wechat_identity(wx2['id'],wx2['person_id'],first,'核对后发现是同一人')
         self.assertEqual(self.store.resolve_sender('default','wx2')['person_id'],first)
     def test_archive_allows_new_target_binding_without_overwriting_history(self):
         old=self.bind();self.store.set_cursor(500);self.store.archive_binding(old['id'])

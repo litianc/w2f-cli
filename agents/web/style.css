@@ -13,4 +13,4 @@
 
 .shareLink{border:1px solid var(--line);border-radius:9px;padding:12px;margin:12px 0}.shareLink input{font-size:12px}
 
-.contactCandidate{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px;border:1px solid var(--line);border-radius:8px;margin:8px 0}.contactCandidate small{display:block;overflow-wrap:anywhere;margin-top:4px}.contactCandidate button{flex-shrink:0}#contactResults{max-height:280px;overflow:auto}
+.contactCandidate{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px;border:1px solid var(--line);border-radius:8px;margin:8px 0}.contactCandidate small{display:block;overflow-wrap:anywhere;margin-top:4px}.contactCandidate button{flex-shrink:0}#contactResults,#wechatResults,#wechatPending{max-height:280px;overflow:auto}

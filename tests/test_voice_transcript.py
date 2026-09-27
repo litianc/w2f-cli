@@ -41,8 +41,9 @@ class VoiceTranscriptTest(unittest.TestCase):
                 return type('Result',(),{'returncode':0})()
             with patch.object(mirror.shutil,'which',return_value='/usr/bin/ffmpeg'),patch.object(mirror.subprocess,'run',side_effect=transcode):
                 flags,converted=mirror.voice_upload_args(str(source))
-            self.assertEqual(flags,['--audio',str(source.with_suffix('.opus'))])
-            self.assertEqual(converted,str(source.with_suffix('.opus')))
+            self.assertEqual(flags,['--audio',converted])
+            self.assertEqual(Path(converted).suffix,'.opus')
+            self.assertEqual(Path(converted).read_bytes(),b'ogg-opus-fixture')
             mirror.cleanup_staged(converted)
             self.assertFalse(Path(converted).exists())
 

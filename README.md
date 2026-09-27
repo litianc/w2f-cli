@@ -22,7 +22,8 @@ W2F CLI（WeChat to Feishu）是一个由 Codex 控制与维护的本地会话�
 | --- | --- |
 | 本地管理台 | 查看运行概览，管理群映射、飞书应用、人员实名、失败项和首次接入 |
 | 多应用、多群 | 同一微信账号下支持最多 10 组一对一绑定；每组指定飞书 CLI Profile，以机器人身份发送 |
-| 群名称管理 | 按稳定 ID 绑定群；修改本地显示名、刷新群名，并在明确确认后修改飞书真实群名 |
+| 群名称管理 | 按稳定 ID 绑定群；修改本地显示名、刷新群名，并在明确确认后修改飞书真实群名；可逐群开启群名自动跟随（默认关闭） |
+| 群成员同步 | 逐群确认开启，默认关闭；可信微信事件结合已确认双端身份，执行飞书成员变更；不确定情况保留待办 |
 | 统一实名 | 多个微信 ID 可人工关联同一人；关联飞书身份时可按实名、相近姓名和拼音查通讯录，核对候选 ID 后选择；未知身份先用昵称同步，并生成待确认事项 |
 | 消息镜像 | 支持文字、emoji、链接、表情，以及读取器能获取的图片、视频和文件；正文保留发言人姓名 |
 | 引用与回复 | 原消息已同步时关联飞书回复；找不到对应消息时展示可读引用或占位 |
@@ -31,7 +32,7 @@ W2F CLI（WeChat to Feishu）是一个由 Codex 控制与维护的本地会话�
 | 失败可追踪 | 媒体获取或上传失败时保留占位和待办，支持人工排查后补发 |
 | Codex 管理 | 网页与 CLI 共用 SQLite 和管理逻辑；Codex 执行启动、停止、状态查询与排障 |
 
-实名更正对后续消息生效，历史消息保留发送时的姓名。未知身份的飞书私聊提醒需要先配置并核实管理员身份。通讯录姓名搜索需要所选 Profile 的用户授权与可见范围；搜索失败时可继续手工填写该应用下的 `open_id`。
+人员可解除单项身份关联、归档和恢复；有关联或使用历史的人员不能直接删除。实名更正对后续消息生效，历史消息保留发送时的姓名。未知身份的飞书私聊提醒需要先配置并核实管理员身份。通讯录姓名搜索需要所选 Profile 的用户授权与可见范围；搜索失败时可继续手工填写该应用下的 `open_id`。
 
 ## 工作方式
 
@@ -83,6 +84,12 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 python3 -m pip install -r requirements.txt
 ```
 
+需要本机 SILK 语音转码时，另安装 FFmpeg 和可选依赖：
+
+```bash
+python3 -m pip install -r requirements-voice.txt
+```
+
 ### 2. 接入微信读取器
 
 **macOS**：按微信读取 CLI 的首次接入流程授权，并确认 `reader.sh access-plan` 可读。然后为已安装读取器增加完整分页扩展，将下列路径替换为实际的引擎文件：
@@ -91,7 +98,7 @@ python3 -m pip install -r requirements.txt
 python3 scripts/install_reader_sync.py /实际路径/rion_wechat_reader.py
 ```
 
-脚本保留引擎备份，只添加 `sync-page`，不修改微信数据库。重新安装读取器后需要重新应用扩展；可通过 `WECHAT_READER` 指定兼容的 CLI 入口。
+脚本保留版本备份，原子安装 `sync-page`、`watch-changes` 与 `voice-resource` 扩展，失败回滚；不修改微信数据库。重新安装读取器后需要重新应用扩展；可通过 `WECHAT_READER` 指定兼容的 CLI 入口。
 
 **Windows**：安装并登录桌面版微信（4.x），保持 [WeChatDataAnalysis](https://github.com/LifeArchiveProject/WeChatDataAnalysis) 运行（本地 API 默认 `http://localhost:10392`，首次使用需在其界面内完成密钥提取与数据库解密）。然后生成适配层垫片并在运行配置中登记：
 
@@ -143,6 +150,8 @@ python3 -m agents.manage status
 | 查看飞书应用 | `python3 -m agents.manage profiles list` |
 | 查看群映射 | `python3 -m agents.manage bindings list` |
 | 查看人员档案 | `python3 -m agents.manage people list` |
+| 从已绑定微信群查成员候选 | `python3 -m agents.manage people search-wechat --binding-id 1 --query 小明` |
+| 从本机联系人查候选 | `python3 -m agents.manage people search-wechat --source-account default --query 王小明` |
 | 按实名查飞书候选人 | `python3 -m agents.manage people search-feishu --profile-name wechat-mirror --name 王小明` |
 | 查看待确认事项 | `python3 -m agents.manage confirmations list` |
 | 启动 / 异常退出后重启 | `python3 -m agents.manage bindings start --id 1` |
@@ -151,6 +160,8 @@ python3 -m agents.manage status
 | 停止 | `python3 -m agents.manage bindings stop --id 1` |
 
 暂停和停止都保留进度。`resume` 只恢复仍在运行的暂停 Worker；停止或进程异常退出后使用 `start`。
+
+在管理台「人员与实名」中，优先从待确认发言人选用稳定微信 ID；需要提前关联时可按微信群成员或本机联系人搜索。昵称、备注与拼音仅用于查候选，选择后仍须人工核对真人。普通关联不会覆盖其他人员的 ID；核实后可在人员详情中用「更正归属」并填写原因。更正只影响后续镜像，历史消息姓名保留原样。缺少稳定 ID 的消息不能按昵称关联。
 
 ## 配置与数据
 
@@ -171,7 +182,7 @@ python3 -m agents.manage status
 
 - **时效性**：默认定时兜底为 10 分钟；macOS 端可在引导页开启 Rion `reader_wakeup` 只读事件唤醒，Windows 端可开启 `realtime_wakeup`。秒级端到端时延仍须按真实群消息实测。
 - **媒体可用性**：新格式加密图片、转发记录内独立媒体和超过 100 MB 的文件仍需后续适配；源端缺失的资源会保留占位。图片优先同步原图（Windows 端经 WDA 拉取 CDN 原图；原图过期时回落缩略图，并在飞书消息上标注「原图未同步」）。
-- **语音回退**：已有 Opus 文件按语音发送；AMR/AAC/M4A/MP3/WAV 在安装 FFmpeg 后转为 Opus。无法转码的原始文件作为附件发送，客户端内播放能力需按格式验收。
+- **语音回退**：macOS 读取器可从已授权的语音库按群与消息身份提取 SILK；安装可选 pilk 和 FFmpeg 后转为 Opus。已有 Opus 文件按语音发送；AMR/AAC/M4A/MP3/WAV 在安装 FFmpeg 后转为 Opus。无法转码的原始文件作为附件发送，客户端内播放能力需按格式验收。
 - **视频号**：卡片与链接已做解析处理，跨应用跳转仍待完善，不能保证在飞书中直接播放或打开。
 - **恢复条件**：续传依赖微信历史仍可读取；已删除的历史或缺失的原文件无法凭空重建。
 - **不确定回执**：发送结果不确定且超过平台去重窗口时暂停等待核对，避免盲目重复发送。

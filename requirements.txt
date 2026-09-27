@@ -1,2 +1,3 @@
 Pillow>=11,<12
 pypinyin>=0.53,<1
+cryptography>=44,<47

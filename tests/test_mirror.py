@@ -78,6 +78,71 @@ class MirrorStoreTest(unittest.TestCase):
 
 
 class MirrorFormattingTest(unittest.TestCase):
+    def test_xml_self_invite_resolves_member_and_omits_revoke(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MirrorStore(Path(directory) / "mirror.sqlite3")
+            store.initialize({"wechat_talker": "room@chatroom", "feishu_chat_id": "chat", "lark_profile": "p", "lark_app_id": "app"})
+            person = store.create_person("测试实名")
+            store.link_wechat_identity(person["id"], "default", "wx_test", "旧昵称")
+            profile = next(p for p in store.list_profiles() if p["profile_name"] == "p")
+            store.link_feishu_identity(person["id"], profile["id"], "ou_test")
+            raw = '''room@chatroom:
+<sysmsg type="sysmsgtemplate"><sysmsgtemplate><content_template type="tmpl_type_profilewithrevoke">
+<plain/><template><![CDATA[你邀请"$names$"加入了群聊  $revoke$]]></template><link_list>
+<link name="names" type="link_profile"><memberlist><member><username>wx_test</username><nickname>旧昵称</nickname></member></memberlist><separator>、</separator></link>
+<link name="revoke" type="link_revoke" hidden="1"><title>撤销</title><usernamelist><username>wx_test</username></usernamelist></link>
+</link_list></content_template></sysmsgtemplate></sysmsg>'''
+            row = {"talker": "room@chatroom", "local_id": 101, "kind_name": "system", "text": raw}
+            with patch.object(mirror, "run_lark", return_value={"data": {"message_id": "om_test"}}) as send:
+                mirror.send_row({"lark_profile": "p", "feishu_chat_id": "chat"}, row, {}, store)
+            args = send.call_args.args[1]
+            body = args[args.index("--text") + 1]
+            self.assertIn('<at user_id="ou_test">测试实名</at>', body)
+            self.assertIn('本机微信用户邀请', body)
+            for unwanted in ('wx_test', '$names$', '$revoke$', '撤销', '<sysmsg', '姓名暂不可用'):
+                self.assertNotIn(unwanted, body)
+            self.assertTrue(body.startswith('群事件：'))
+            self.assertEqual(store.status()["pending_senders"], 0)
+            # Frozen output is not resent on replay.
+            with patch.object(mirror, "run_lark") as repeat:
+                mirror.send_row({"lark_profile": "p", "feishu_chat_id": "chat"}, row, {}, store)
+                repeat.assert_not_called()
+
+    def test_xml_members_preserve_roles_nicknames_and_profile_isolation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MirrorStore(Path(directory) / 'mirror.sqlite3')
+            store.initialize({'wechat_talker': 'room@chatroom', 'feishu_chat_id': 'chat', 'lark_profile': 'p', 'lark_app_id': 'app'})
+            person = store.create_person('已确认姓名')
+            store.link_wechat_identity(person['id'], 'default', 'wx_actor', '旧昵称')
+            profile = next(p for p in store.list_profiles() if p['profile_name'] == 'p')
+            store.link_feishu_identity(person['id'], profile['id'], 'ou_actor')
+            raw = '''<sysmsg type="sysmsgtemplate"><sysmsgtemplate><content_template>
+<template><![CDATA["$username$"邀请"$names$"加入了群聊]]></template><link_list>
+<link name="names" type="link_profile"><memberlist><member><username>wx_guest</username><nickname>小 明 😀</nickname></member><member><username>wx_missing</username><nickname>wx_missing</nickname></member></memberlist><separator>、</separator></link>
+<link name="username" type="link_profile"><memberlist><member><username>wx_actor</username><nickname>旧昵称</nickname></member></memberlist></link>
+</link_list></content_template></sysmsgtemplate></sysmsg>'''
+            row = {'kind_name': 'system', 'text': raw}
+            body = mirror.group_event_body(row, {'lark_profile': 'another'}, store)
+            self.assertEqual(body, '"已确认姓名"邀请"小 明 😀、成员"加入了群聊')
+            self.assertNotIn('ou_actor', body)
+            self.assertNotIn('wx_', body)
+            other_account = mirror.group_event_body(row, {'lark_profile': 'p', 'source_account': 'other'}, store)
+            self.assertIn('旧昵称', other_account)
+            self.assertNotIn('已确认姓名', other_account)
+            self.assertNotIn('<at ', other_account)
+            removal = mirror.group_event_body({'text': raw.replace('邀请', '将').replace('加入了', '移出了')}, {'lark_profile': 'p'}, store)
+            self.assertIn('<at user_id="ou_actor">已确认姓名</at>', removal)
+            self.assertIn('移出了群聊', removal)
+
+    def test_malformed_xml_group_event_never_leaks_template_or_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MirrorStore(Path(directory) / 'mirror.sqlite3')
+            store.initialize({'wechat_talker': 'room@chatroom', 'feishu_chat_id': 'chat', 'lark_profile': 'p'})
+            for raw in ('room@chatroom:\n<sysmsg><template>$names$ wx_private', '<sysmsg><broken>private_id</sysmsg>'):
+                row = {'kind_name': 'system', 'sender_wxid': 'room@chatroom', 'text': raw}
+                self.assertTrue(mirror.is_group_event(row))
+                self.assertEqual(mirror.group_event_body(row, {}, store), '群成员变更（姓名暂不可用）')
+
     def test_group_invite_renders_names_and_current_profile_mentions(self):
         with tempfile.TemporaryDirectory() as directory:
             store = MirrorStore(Path(directory) / "mirror.sqlite3")

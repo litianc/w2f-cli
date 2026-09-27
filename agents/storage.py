@@ -6,10 +6,11 @@ import os
 import sqlite3
 import time
 import uuid
+from contextlib import contextmanager, ExitStack
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 STATUSES = {"running", "paused", "stopped"}
 
 
@@ -71,14 +72,32 @@ class MirrorStore:
                 self._migrate_v1(db)
             self._create_schema(db)
             self._upgrade_v3(db)
+            self._quarantine_forward_identities(db)
             if config and config.get("wechat_talker") and config.get("feishu_chat_id"):
                 self._seed_config(db, config)
             db.execute("INSERT INTO schema_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", ("schema_version", str(SCHEMA_VERSION)))
             db.execute("PRAGMA foreign_keys=ON")
 
+    def _quarantine_forward_identities(self, db):
+        # Content positions are not identities. Preserve rows and manual links
+        # for audit, but exclude them from lookup, pending work and reminders.
+        pattern = 'unidentified:%:forward:%'
+        count = db.execute("SELECT COUNT(*) FROM wechat_identities WHERE wechat_sender_id LIKE ? AND status!='rejected'", (pattern,)).fetchone()[0]
+        pending = db.execute("SELECT COUNT(*) FROM confirmations WHERE wechat_sender_id LIKE ? AND status!='rejected'", (pattern,)).fetchone()[0]
+        if not count and not pending:
+            return
+        db.execute("UPDATE wechat_identities SET status='rejected',updated_at=? WHERE wechat_sender_id LIKE ?", (now(), pattern))
+        db.execute("UPDATE confirmations SET status='rejected',notification_status='cancelled',last_error='转发临时定位键，不是真实微信身份；已隔离保留审计',updated_at=? WHERE wechat_sender_id LIKE ?", (now(), pattern))
+        db.execute("INSERT INTO management_actions(action,actor,details_json,result,created_at) VALUES('quarantine_forward_identities','system',?,'accepted',?)", (json.dumps({'identity_count':count,'confirmation_count':pending}),now()))
+
+    def list_quarantined_identities(self):
+        with self.connect() as db:
+            return [dict(row) for row in db.execute("SELECT id,person_id,last_display_name,status FROM wechat_identities WHERE wechat_sender_id LIKE 'unidentified:%:forward:%'")]
+
     def backup(self) -> Path:
         destination = self.path.parent / "backups" / f"{self.path.name}.{time.time_ns()}.bak"
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd=os.open(destination,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600);os.close(fd)
         source = sqlite3.connect(self.path)
         target = sqlite3.connect(destination)
         try:
@@ -90,6 +109,19 @@ class MirrorStore:
         return destination
 
     def _upgrade_v3(self, db):
+        db.execute("""CREATE TABLE IF NOT EXISTS member_tasks(
+            id INTEGER PRIMARY KEY, binding_id INTEGER NOT NULL,
+            event_local_id INTEGER NOT NULL, source_account TEXT NOT NULL,
+            talker TEXT NOT NULL, chat_id TEXT NOT NULL, app_id TEXT NOT NULL,
+            wechat_id TEXT NOT NULL, operation TEXT NOT NULL,
+            identity_json TEXT, state TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0, error TEXT,
+            retry_at REAL NOT NULL DEFAULT 0, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+            UNIQUE(binding_id,event_local_id,wechat_id,operation))""")
+        db.execute("CREATE INDEX IF NOT EXISTS member_tasks_queue ON member_tasks(binding_id,state,retry_at)")
+        confirmation_columns = {r[1] for r in db.execute('PRAGMA table_info(confirmations)')}
+        if 'notification_generation' not in confirmation_columns:
+            db.execute('ALTER TABLE confirmations ADD COLUMN notification_generation INTEGER NOT NULL DEFAULT 0')
         columns = {r[1] for r in db.execute("PRAGMA table_info(runtime_state)")}
         if 'initialized' not in columns:
             db.execute("ALTER TABLE runtime_state ADD COLUMN initialized INTEGER NOT NULL DEFAULT 0")
@@ -312,20 +344,20 @@ class MirrorStore:
         with self.connect() as db:
             return [dict(r) for r in db.execute("SELECT * FROM profiles ORDER BY profile_name").fetchall()]
 
-    def list_people(self) -> list[dict[str, Any]]:
+    def list_people(self, status="active") -> list[dict[str, Any]]:
         with self.connect() as db:
-            rows = db.execute("SELECT p.*,COUNT(DISTINCT w.id) AS wechat_identity_count,COUNT(DISTINCT f.id) AS feishu_identity_count FROM people p LEFT JOIN wechat_identities w ON w.person_id=p.id LEFT JOIN feishu_identities f ON f.person_id=p.id GROUP BY p.id ORDER BY p.confirmed_name").fetchall()
+            rows = db.execute("SELECT p.*,COUNT(DISTINCT w.id) AS wechat_identity_count,COUNT(DISTINCT f.id) AS feishu_identity_count FROM people p LEFT JOIN wechat_identities w ON w.person_id=p.id LEFT JOIN feishu_identities f ON f.person_id=p.id WHERE p.status=? GROUP BY p.id ORDER BY p.confirmed_name", (status,)).fetchall()
         return [dict(x) for x in rows]
 
     def list_wechat_identities(self, person_id: int | None = None) -> list[dict[str, Any]]:
         with self.connect() as db:
-            query = "SELECT w.*,p.confirmed_name FROM wechat_identities w LEFT JOIN people p ON p.id=w.person_id"
-            rows = db.execute(query + (" WHERE w.person_id=?" if person_id else "") + " ORDER BY w.updated_at DESC", (person_id,) if person_id else ()).fetchall()
+            query = "SELECT w.*,p.confirmed_name FROM wechat_identities w LEFT JOIN people p ON p.id=w.person_id AND p.status='active' WHERE w.wechat_sender_id NOT LIKE 'unidentified:%:forward:%'"
+            rows = db.execute(query + (" AND w.person_id=?" if person_id else "") + " ORDER BY w.updated_at DESC", (person_id,) if person_id else ()).fetchall()
         return [dict(x) for x in rows]
 
     def list_feishu_identities(self, person_id: int | None = None) -> list[dict[str, Any]]:
         with self.connect() as db:
-            query = "SELECT f.*,p.confirmed_name,pr.profile_name FROM feishu_identities f JOIN people p ON p.id=f.person_id JOIN profiles pr ON pr.id=f.profile_id"
+            query = "SELECT f.*,p.confirmed_name,pr.profile_name FROM feishu_identities f JOIN people p ON p.id=f.person_id AND p.status='active' JOIN profiles pr ON pr.id=f.profile_id"
             rows = db.execute(query + (" WHERE f.person_id=?" if person_id else "") + " ORDER BY f.updated_at DESC", (person_id,) if person_id else ()).fetchall()
         return [dict(x) for x in rows]
 
@@ -335,7 +367,7 @@ class MirrorStore:
             row=db.execute("""SELECT p.confirmed_name, f.open_id FROM wechat_identities w
                 JOIN people p ON p.id=w.person_id JOIN feishu_identities f ON f.person_id=p.id
                 JOIN profiles pr ON pr.id=f.profile_id
-                WHERE w.source_account=? AND w.wechat_sender_id=? AND pr.profile_name=? AND pr.enabled=1
+                WHERE w.source_account=? AND w.wechat_sender_id=? AND pr.profile_name=? AND pr.enabled=1 AND p.status='active' AND w.status='confirmed'
                 ORDER BY f.id LIMIT 1""", (source_account, sender_id, profile_name)).fetchone()
             return dict(row) if row else None
 
@@ -360,27 +392,111 @@ class MirrorStore:
             db.execute("INSERT INTO management_actions(action,actor,details_json,result,created_at) VALUES(?,?,?,?,?)", ("rename_person", actor, json.dumps({"person_id": person_id, "before":before[0], "name": name.strip()}, ensure_ascii=False), "accepted", now()))
             return dict(row)
 
-    def link_wechat_identity(self, person_id: int, source_account: str, sender_id: str, display_name: str = "") -> dict[str, Any]:
-        with self.connect() as db:
-            if not db.execute("SELECT 1 FROM people WHERE id=?", (person_id,)).fetchone():
-                raise ValueError("人员不存在")
-            db.execute("INSERT INTO wechat_identities(person_id,source_account,wechat_sender_id,last_display_name,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(source_account,wechat_sender_id) DO UPDATE SET person_id=excluded.person_id,last_display_name=excluded.last_display_name,status='confirmed',updated_at=excluded.updated_at", (person_id, source_account, sender_id, display_name, "confirmed", now(), now()))
-            db.execute("UPDATE confirmations SET person_id=?,status='confirmed',updated_at=? WHERE source_account=? AND wechat_sender_id=?", (person_id, now(), source_account, sender_id))
-            return dict(db.execute("SELECT w.*,p.confirmed_name FROM wechat_identities w JOIN people p ON p.id=w.person_id WHERE w.source_account=? AND w.wechat_sender_id=?", (source_account, sender_id)).fetchone())
+    def link_wechat_identity(self, person_id: int, source_account: str, sender_id: str, display_name: str = "", *, actor: str = "codex") -> dict[str, Any]:
+        with self.people_maintenance(person_id):
+            source_account, sender_id = str(source_account or "").strip(), str(sender_id or "").strip()
+            if not source_account or not sender_id or sender_id.startswith("unidentified:") or sender_id.endswith("@chatroom") or any(ch.isspace() for ch in sender_id):
+                raise ValueError("请提供真实的微信账号标识和稳定发送者 ID；无法关联未识别消息或群 ID")
+            with self.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                if not db.execute("SELECT 1 FROM people WHERE id=? AND status='active'", (person_id,)).fetchone():
+                    raise ValueError("人员不存在")
+                existing=db.execute("SELECT person_id,last_display_name FROM wechat_identities WHERE source_account=? AND wechat_sender_id=?", (source_account,sender_id)).fetchone()
+                if existing and existing['person_id'] is not None and existing['person_id']!=person_id:
+                    raise ValueError("此微信 ID 已关联其他人员；请核实身份后使用更正归属，不能直接覆盖")
+                ts=now()
+                name=str(display_name or '').strip() or (existing['last_display_name'] if existing else '')
+                db.execute("INSERT INTO wechat_identities(person_id,source_account,wechat_sender_id,last_display_name,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(source_account,wechat_sender_id) DO UPDATE SET person_id=excluded.person_id,last_display_name=excluded.last_display_name,status='confirmed',updated_at=excluded.updated_at", (person_id, source_account, sender_id, name, "confirmed", ts, ts))
+                db.execute("UPDATE confirmations SET person_id=?,status='confirmed',updated_at=? WHERE source_account=? AND wechat_sender_id=?", (person_id, ts, source_account, sender_id))
+                db.execute("INSERT INTO management_actions(action,actor,details_json,result,created_at) VALUES(?,?,?,?,?)", ("link_wechat_identity", actor, json.dumps({"source_account":source_account,"wechat_sender_id":sender_id,"before":{"person_id":existing['person_id'] if existing else None},"after":{"person_id":person_id}},ensure_ascii=False),"accepted",ts))
+                return dict(db.execute("SELECT w.*,p.confirmed_name FROM wechat_identities w JOIN people p ON p.id=w.person_id WHERE w.source_account=? AND w.wechat_sender_id=?", (source_account, sender_id)).fetchone())
+
+    def reassign_wechat_identity(self, identity_id: int, from_person_id: int, to_person_id: int, reason: str, *, actor: str = "codex") -> dict[str, Any]:
+        with self.people_maintenance(from_person_id,to_person_id):
+            if from_person_id==to_person_id or not str(reason or '').strip():
+                raise ValueError("请指定不同的目标人员并填写更正原因")
+            with self.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                identity=db.execute("SELECT * FROM wechat_identities WHERE id=?",(identity_id,)).fetchone()
+                if not identity or identity['person_id']!=from_person_id or identity['wechat_sender_id'].startswith('unidentified:'):
+                    raise ValueError("微信身份归属已变化，请刷新后重新核对")
+                if not db.execute("SELECT 1 FROM people WHERE id=? AND status='active'",(to_person_id,)).fetchone():
+                    raise ValueError("目标人员不存在")
+                ts=now()
+                db.execute("UPDATE wechat_identities SET person_id=?,status='confirmed',updated_at=? WHERE id=?",(to_person_id,ts,identity_id))
+                db.execute("UPDATE confirmations SET person_id=?,status='confirmed',updated_at=? WHERE source_account=? AND wechat_sender_id=?",(to_person_id,ts,identity['source_account'],identity['wechat_sender_id']))
+                db.execute("INSERT INTO management_actions(action,actor,details_json,result,created_at) VALUES(?,?,?,?,?)",("reassign_wechat_identity",actor,json.dumps({"source_account":identity['source_account'],"wechat_sender_id":identity['wechat_sender_id'],"before":{"person_id":from_person_id},"after":{"person_id":to_person_id},"reason":str(reason).strip()},ensure_ascii=False),"accepted",ts))
+                return dict(db.execute("SELECT w.*,p.confirmed_name FROM wechat_identities w JOIN people p ON p.id=w.person_id WHERE w.id=?",(identity_id,)).fetchone())
 
     def link_feishu_identity(self, person_id: int, profile_id: int, open_id: str, user_id: str = "", display_name: str = "") -> dict[str, Any]:
-        open_id = str(open_id or "").strip()
-        if not open_id.startswith("ou_") or len(open_id) <= 3 or any(ch.isspace() for ch in open_id):
-            raise ValueError("飞书 open_id 格式不正确；请从所选应用读取 ou_ 开头的 ID")
-        with self.connect() as db:
-            if not db.execute("SELECT 1 FROM people WHERE id=?", (person_id,)).fetchone():
-                raise ValueError("人员不存在")
-            existing=db.execute("SELECT person_id FROM feishu_identities WHERE profile_id=? AND open_id=?",
-                                (profile_id,open_id)).fetchone()
-            if existing and existing['person_id']!=person_id:
-                raise ValueError("此飞书 open_id 已关联其他人员；请先核实身份，不能直接覆盖")
-            db.execute("INSERT INTO feishu_identities(person_id,profile_id,open_id,user_id,display_name,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(profile_id,open_id) DO UPDATE SET person_id=excluded.person_id,user_id=excluded.user_id,display_name=excluded.display_name,updated_at=excluded.updated_at", (person_id, profile_id, open_id, user_id, display_name, now(), now()))
-            return dict(db.execute("SELECT f.*,p.confirmed_name,pr.profile_name FROM feishu_identities f JOIN people p ON p.id=f.person_id JOIN profiles pr ON pr.id=f.profile_id WHERE f.profile_id=? AND f.open_id=?", (profile_id, open_id)).fetchone())
+        with self.people_maintenance(person_id):
+            open_id = str(open_id or "").strip()
+            if not open_id.startswith("ou_") or len(open_id) <= 3 or any(ch.isspace() for ch in open_id):
+                raise ValueError("飞书 open_id 格式不正确；请从所选应用读取 ou_ 开头的 ID")
+            with self.connect() as db:
+                if not db.execute("SELECT 1 FROM people WHERE id=? AND status='active'", (person_id,)).fetchone():
+                    raise ValueError("人员不存在")
+                existing=db.execute("SELECT person_id FROM feishu_identities WHERE profile_id=? AND open_id=?",
+                                    (profile_id,open_id)).fetchone()
+                if existing and existing['person_id']!=person_id:
+                    raise ValueError("此飞书 open_id 已关联其他人员；请先核实身份，不能直接覆盖")
+                db.execute("INSERT INTO feishu_identities(person_id,profile_id,open_id,user_id,display_name,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(profile_id,open_id) DO UPDATE SET person_id=excluded.person_id,user_id=excluded.user_id,display_name=excluded.display_name,updated_at=excluded.updated_at", (person_id, profile_id, open_id, user_id, display_name, now(), now()))
+                return dict(db.execute("SELECT f.*,p.confirmed_name,pr.profile_name FROM feishu_identities f JOIN people p ON p.id=f.person_id AND p.status='active' JOIN profiles pr ON pr.id=f.profile_id WHERE f.profile_id=? AND f.open_id=?", (profile_id, open_id)).fetchone())
+
+    @staticmethod
+    def _person_history(db, person_id):
+        if db.execute('SELECT 1 FROM messages WHERE sender_person_id=? LIMIT 1',(person_id,)).fetchone():return True
+        if db.execute('SELECT 1 FROM confirmations WHERE person_id=? LIMIT 1',(person_id,)).fetchone():return True
+        for row in db.execute("SELECT details_json FROM management_actions WHERE action IN ('rename_person','link_wechat_identity','reassign_wechat_identity','unlink_wechat','unlink_feishu')"):
+            detail=json.loads(row[0] or '{}')
+            if detail.get('person_id')==person_id or any((detail.get(key) or {}).get('person_id')==person_id for key in ('before','after')):return True
+        return False
+
+    def change_person_state(self, person_id, operation, *, actor='codex'):
+        with self.people_maintenance(person_id):
+            if operation not in {'archive','restore','delete'}:raise ValueError('不支持的人员操作')
+            with self.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                person=db.execute('SELECT * FROM people WHERE id=?',(person_id,)).fetchone()
+                if not person:
+                    if operation=='delete':return {'deleted':True,'id':person_id}
+                    raise ValueError('人员不存在')
+                linked=any(db.execute(f'SELECT 1 FROM {table} WHERE person_id=? LIMIT 1',(person_id,)).fetchone() for table in ('wechat_identities','feishu_identities'))
+                if operation in {'delete','archive'} and linked:raise ValueError('仍有关联身份，请逐条解除关联后再移除人员')
+                if operation=='delete' and self._person_history(db,person_id):raise ValueError('存在历史引用，请使用归档保留历史记录')
+                status='archived' if operation=='archive' else 'active'
+                if operation!='delete' and person['status']==status:return dict(person)
+                if operation=='delete':db.execute('DELETE FROM people WHERE id=?',(person_id,))
+                else:db.execute('UPDATE people SET status=?,updated_at=? WHERE id=?',(status,now(),person_id))
+                detail={'person_id':person_id,'before':{'status':person['status']},'after':{'status':'deleted' if operation=='delete' else status}}
+                db.execute('INSERT INTO management_actions(action,actor,details_json,result,created_at) VALUES(?,?,?,?,?)',('person_'+operation,actor,json.dumps(detail),'accepted',now()))
+                return {'id':person_id,'deleted':True} if operation=='delete' else dict(db.execute('SELECT * FROM people WHERE id=?',(person_id,)).fetchone())
+
+    def unlink_identity(self, kind, identity_id, person_id, *, actor='codex', protected_feishu=None):
+        with self.people_maintenance(person_id):
+            table={'wechat':'wechat_identities','feishu':'feishu_identities'}.get(kind)
+            if not table:raise ValueError('不支持的身份类型')
+            with self.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                row=db.execute(f'SELECT * FROM {table} WHERE id=?',(identity_id,)).fetchone()
+                if not row or row['person_id'] is None:return {'unlinked':True,'id':identity_id}
+                if row['person_id']!=person_id:raise ValueError('身份归属已变化，请刷新后重新核对')
+                if kind=='feishu':
+                    profile=db.execute('SELECT profile_name FROM profiles WHERE id=?',(row['profile_id'],)).fetchone()
+                    if protected_feishu and (profile['profile_name'],row['open_id'])==protected_feishu:
+                        raise ValueError('此身份正在用于管理员提醒，请先替换或清除管理员提醒配置')
+                    db.execute('DELETE FROM feishu_identities WHERE id=?',(identity_id,))
+                else:
+                    synthetic=row['wechat_sender_id'].startswith('unidentified:')
+                    db.execute('UPDATE wechat_identities SET person_id=NULL,status=?,updated_at=? WHERE id=?',('rejected' if synthetic else 'pending',now(),identity_id))
+                    if not synthetic:
+                        groups=[x[0] for x in db.execute('SELECT DISTINCT binding_id FROM messages WHERE source_account=? AND sender_wxid=?',(row['source_account'],row['wechat_sender_id']))]
+                        db.execute("INSERT INTO confirmations(source_account,wechat_sender_id,display_name,binding_id,status,created_at,updated_at) VALUES(?,?,?,?,'pending',?,?) ON CONFLICT(source_account,wechat_sender_id) DO UPDATE SET person_id=NULL,status='pending',notification_status='pending',notification_generation=confirmations.notification_generation+1,last_error=NULL,updated_at=excluded.updated_at",(row['source_account'],row['wechat_sender_id'],row['last_display_name'],groups[0] if groups else None,now(),now()))
+                        confirmation=db.execute('SELECT id FROM confirmations WHERE source_account=? AND wechat_sender_id=?',(row['source_account'],row['wechat_sender_id'])).fetchone()[0]
+                        db.executemany('INSERT OR IGNORE INTO sender_occurrences VALUES(?,?)',[(confirmation,bid) for bid in groups])
+                detail={'person_id':person_id,'identity_id':identity_id,'before':{'person_id':person_id},'after':{'person_id':None}}
+                db.execute('INSERT INTO management_actions(action,actor,details_json,result,created_at) VALUES(?,?,?,?,?)',('unlink_'+kind,actor,json.dumps(detail),'accepted',now()))
+                return {'unlinked':True,'id':identity_id}
 
     def upsert_profile(self, profile_name: str, app_id: str, *, brand: str = "feishu", purpose: str = "mirror", protected: bool = False) -> dict[str, Any]:
         ts = now()
@@ -404,9 +520,19 @@ class MirrorStore:
         for row in rows:
             item = dict(row)
             item["recovery"] = self.recovery(int(item["id"]))
+            item["member_sync_enabled"] = bool(self.setting(f'member_sync:{item["id"]}',{}).get("enabled"))
+            item["member_tasks"] = self.list_member_tasks(int(item["id"]))
+            item["name_sync_enabled"] = bool(self.setting(f'name_sync_enabled:{item["id"]}',False))
+            item["name_sync"] = self.setting(f'name_sync:{item["id"]}',{})
             item["worker_alive"] = bool(item.get("stopped_at") is None and item.get("heartbeat_at") and now() - float(item["heartbeat_at"]) < 20)
             result.append(item)
         return result
+
+    def list_member_tasks(self, binding_id):
+        with self.connect() as db:
+            exists=db.execute("SELECT 1 FROM sqlite_master WHERE name='member_tasks'").fetchone()
+            if not exists:return []
+            return [dict(row) for row in db.execute("SELECT * FROM member_tasks WHERE binding_id=? ORDER BY id DESC LIMIT 30",(binding_id,))]
 
     def get_binding(self, binding_id: int) -> dict[str, Any] | None:
         return next((x for x in self.list_bindings() if int(x["id"]) == int(binding_id)), None)
@@ -479,9 +605,9 @@ class MirrorStore:
         return self.get_binding(int(bid)) or {}
 
     def archive_binding(self, binding_id: int, actor: str = "codex") -> None:
+        self.set_control(binding_id, "stopped", actor, "binding archived")
         with self.connect() as db:
             db.execute("UPDATE bindings SET archived=1,enabled=0,updated_at=? WHERE id=?", (now(), binding_id))
-        self.set_control(binding_id, "stopped", actor, "binding archived")
 
     def get_control(self, binding_id: int = 1) -> dict[str, Any]:
         with self.connect() as db:
@@ -498,6 +624,29 @@ class MirrorStore:
         with self.connect() as db:
             db.execute("INSERT INTO runtime_state(binding_id,cursor,last_success_at,updated_at) VALUES(?,?,?,?) ON CONFLICT(binding_id) DO UPDATE SET cursor=MAX(runtime_state.cursor,excluded.cursor),last_success_at=excluded.last_success_at,updated_at=excluded.updated_at", (binding_id, int(cursor), ts, ts))
 
+    @contextmanager
+    def _maintenance_lock(self, name):
+        from .wechat_feishu_mirror import _lock_exclusive, _unlock
+        directory=self.path.resolve().parent/'locks';directory.mkdir(parents=True,exist_ok=True)
+        with (directory/f'{name}.lock').open('a+b') as handle:
+            _lock_exclusive(handle,True)
+            try:yield
+            finally:_unlock(handle)
+
+    @contextmanager
+    def binding_maintenance(self, binding_id):
+        # Pause is acknowledged only after in-flight remote maintenance ends.
+        with self._maintenance_lock(f'maintenance-{int(binding_id)}'):yield
+
+    @contextmanager
+    def people_maintenance(self, *person_ids):
+        # Different people/groups remain independent; stable ordering avoids
+        # deadlock when reassigning an identity between two people.
+        with ExitStack() as locks:
+            for person_id in sorted({int(p) for p in person_ids if int(p)>0}):
+                locks.enter_context(self._maintenance_lock(f'person-{person_id}'))
+            yield
+
     def set_control(self, binding_id: int | str, status: str | None = None, actor: str = "codex", reason: str | None = None) -> None:
         # Keep the v0.1 call shape: set_control("paused", actor=...).
         if status is None and isinstance(binding_id, str) and binding_id in STATUSES:
@@ -506,9 +655,10 @@ class MirrorStore:
             raise ValueError(f"invalid status: {status}")
         bid = int(binding_id)
         ts = now()
-        with self.connect() as db:
-            db.execute("INSERT INTO runtime_control(binding_id,status,reason,actor,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(binding_id) DO UPDATE SET status=excluded.status,reason=excluded.reason,actor=excluded.actor,updated_at=excluded.updated_at", (bid, status, reason, actor, ts))
-            db.execute("INSERT INTO management_actions(action,actor,binding_id,details_json,result,created_at) VALUES(?,?,?,?,?,?)", (status, actor, bid, json.dumps({"reason": reason}, ensure_ascii=False), "accepted", ts))
+        with self.binding_maintenance(int(binding_id)):
+            with self.connect() as db:
+                db.execute("INSERT INTO runtime_control(binding_id,status,reason,actor,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(binding_id) DO UPDATE SET status=excluded.status,reason=excluded.reason,actor=excluded.actor,updated_at=excluded.updated_at", (bid, status, reason, actor, ts))
+                db.execute("INSERT INTO management_actions(action,actor,binding_id,details_json,result,created_at) VALUES(?,?,?,?,?,?)", (status, actor, bid, json.dumps({"reason": reason}, ensure_ascii=False), "accepted", ts))
 
     def acquire_lease(self, binding_id: int = 1, pid: int | None = None) -> str:
         pid = pid or os.getpid()
@@ -536,11 +686,15 @@ class MirrorStore:
         return dict(row) if row else None
 
     def resolve_sender(self, source_account: str, sender_id: str) -> dict[str, Any] | None:
+        if sender_id.startswith('unidentified:') and ':forward:' in sender_id:
+            return None
         with self.connect() as db:
-            row = db.execute("SELECT w.*,p.confirmed_name FROM wechat_identities w LEFT JOIN people p ON p.id=w.person_id WHERE w.source_account=? AND w.wechat_sender_id=?", (source_account, sender_id)).fetchone()
+            row = db.execute("SELECT w.*,p.confirmed_name FROM wechat_identities w LEFT JOIN people p ON p.id=w.person_id AND p.status='active' WHERE w.source_account=? AND w.wechat_sender_id=?", (source_account, sender_id)).fetchone()
         return dict(row) if row else None
 
     def record_sender(self, source_account: str, sender_id: str, display_name: str, confirmed_name: str | None = None, *, binding_id: int | None = None) -> int | None:
+        if str(sender_id).startswith('unidentified:') and ':forward:' in str(sender_id):
+            return None
         # Keep compatibility with v0.1 record_sender(sender_id, display, name, status).
         if confirmed_name in {"confirmed", "pending", "rejected"}:
             source_account, sender_id, display_name, confirmed_name = "default", source_account, sender_id, display_name
@@ -553,8 +707,9 @@ class MirrorStore:
             else:
                 person_id = None
                 status = "pending"
-            db.execute("INSERT INTO wechat_identities(person_id,source_account,wechat_sender_id,last_display_name,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(source_account,wechat_sender_id) DO UPDATE SET person_id=COALESCE(excluded.person_id,wechat_identities.person_id),last_display_name=excluded.last_display_name,status=excluded.status,updated_at=excluded.updated_at", (person_id, source_account, sender_id, display_name, status, ts, ts))
-            if not confirmed_name:
+            db.execute("INSERT INTO wechat_identities(person_id,source_account,wechat_sender_id,last_display_name,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(source_account,wechat_sender_id) DO UPDATE SET person_id=COALESCE(excluded.person_id,wechat_identities.person_id),last_display_name=excluded.last_display_name,status=CASE WHEN wechat_identities.person_id IS NOT NULL THEN 'confirmed' ELSE excluded.status END,updated_at=excluded.updated_at", (person_id, source_account, sender_id, display_name, status, ts, ts))
+            identity=db.execute("SELECT person_id FROM wechat_identities WHERE source_account=? AND wechat_sender_id=?",(source_account,sender_id)).fetchone()
+            if not confirmed_name and identity['person_id'] is None:
                 db.execute("INSERT INTO confirmations(source_account,wechat_sender_id,display_name,binding_id,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(source_account,wechat_sender_id) DO UPDATE SET display_name=excluded.display_name,binding_id=COALESCE(confirmations.binding_id,excluded.binding_id),updated_at=excluded.updated_at", (source_account, sender_id, display_name, binding_id, ts, ts))
             if not confirmed_name and binding_id is not None:
                 db.execute("INSERT OR IGNORE INTO sender_occurrences SELECT id,? FROM confirmations WHERE source_account=? AND wechat_sender_id=?", (binding_id,source_account,sender_id))
@@ -565,9 +720,15 @@ class MirrorStore:
             raise ValueError("姓名不能为空")
         ts = now()
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             item = db.execute("SELECT * FROM confirmations WHERE id=?", (confirmation_id,)).fetchone()
             if not item:
                 raise ValueError("待确认事项不存在")
+            if item['wechat_sender_id'].startswith('unidentified:'):
+                raise ValueError('缺少稳定微信 ID，不能将转发定位键确认为人员')
+            identity=db.execute("SELECT person_id FROM wechat_identities WHERE source_account=? AND wechat_sender_id=?",(item['source_account'],item['wechat_sender_id'])).fetchone()
+            if item['status']!='pending' or (identity and identity['person_id'] is not None):
+                raise ValueError("此微信身份已确认；如需改挂，请使用更正归属")
             person = None  # Identical names do not prove identical people.
             person_id = int(person[0]) if person else int(db.execute("INSERT INTO people(confirmed_name,created_at,updated_at) VALUES(?,?,?) RETURNING id", (name.strip(), ts, ts)).fetchone()[0])
             db.execute("UPDATE confirmations SET person_id=?,status='confirmed',updated_at=? WHERE id=?", (person_id, ts, confirmation_id))
@@ -586,9 +747,13 @@ class MirrorStore:
             db.execute("UPDATE confirmations SET notification_status='sending',updated_at=? WHERE id=?", (now(), row["id"]))
             return dict(db.execute("SELECT * FROM confirmations WHERE id=? AND notification_status='sending'", (row["id"],)).fetchone())
 
-    def finish_confirmation_notification(self, confirmation_id: int, *, error: str | None = None) -> None:
+    def finish_confirmation_notification(self, confirmation_id: int, *, error: str | None = None, generation: int | None = None) -> None:
         with self.connect() as db:
-            db.execute("UPDATE confirmations SET notification_status=?,last_error=?,updated_at=? WHERE id=?", ("failed" if error else "sent", error, now(), confirmation_id))
+            sql="UPDATE confirmations SET notification_status=?,last_error=?,updated_at=? WHERE id=?"
+            args=['failed' if error else 'sent',error,now(),confirmation_id]
+            if generation is not None:
+                sql+=" AND notification_generation=? AND status='pending'";args.append(generation)
+            db.execute(sql,args)
 
     def list_confirmations(self, status: str | None = "pending") -> list[dict[str, Any]]:
         with self.connect() as db:
@@ -602,7 +767,7 @@ class MirrorStore:
 
     def upsert_message(self, key: str, row: dict[str, Any], kind: str, state: str = "received", *, binding_id: int = 1, source_account: str = "default", payload: dict[str, Any] | None = None, quoted_message_key: str | None = None) -> int:
         ts = now()
-        safe_payload = payload or {k: row.get(k) for k in ("talker", "local_id", "server_id", "sender_wxid", "sender", "kind_name", "text", "content", "time", "create_time", "forward_items", "voice_transcript") if k in row}
+        safe_payload = payload or {k: row.get(k) for k in ("talker", "local_id", "server_id", "sender_wxid", "sender", "kind_name", "text", "content", "time", "create_time", "local_type", "forward_items", "voice_transcript") if k in row}
         with self.connect() as db:
             db.execute("INSERT INTO messages(binding_id,source_account,wechat_message_key,local_id,server_id,sender_wxid,sender_name,kind,payload_json,quoted_message_key,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(binding_id,wechat_message_key) DO UPDATE SET updated_at=excluded.updated_at", (binding_id, source_account, key, row.get("local_id"), str(row.get("server_id") or ""), row.get("sender_wxid"), row.get("sender"), kind, json.dumps(safe_payload, ensure_ascii=False, default=str), quoted_message_key, state, ts, ts))
             found = db.execute("SELECT id FROM messages WHERE binding_id=? AND wechat_message_key=?", (binding_id, key)).fetchone()

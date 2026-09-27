@@ -1,6 +1,14 @@
 """Structured merged-forward decoding; shared by the reader and mirror."""
 import html
+import re
 import xml.etree.ElementTree as ET
+
+
+def stable_sender_id(value):
+    value = str(value or '').strip()
+    return value if (re.fullmatch(r'[A-Za-z0-9_.@-]+', value)
+                     and not value.endswith('@chatroom')
+                     and not value.startswith('unidentified:')) else ''
 
 
 def parse_record(raw, depth=0):
@@ -28,7 +36,8 @@ def parse_record(raw, depth=0):
         items = record.findall('./dataitem') if record.tag == 'datalist' else record.findall('./datalist/dataitem')
         for item in items:
             sender = field(item, 'sourcename', 'displayname', 'sendername') or '未知发言人'
-            sender_id = field(item, 'dataitemsource/realchatname', 'dataitemsource/fromusr', 'fromusr')
+            sender_id = next((valid for tag in ('dataitemsource/realchatname', 'dataitemsource/fromusr', 'fromusr')
+                              if (valid := stable_sender_id(item.findtext(tag)))), '')
             body = field(item, 'datadesc', 'content', 'datatitle', 'title', 'des')
             kind = {'1': 'text','2': 'image','3': 'voice','4': 'video','5': 'link','8': 'file','17': 'forward'}.get(item.get('datatype'), 'text')
             if not item.get('datatype'):

@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
 import urllib.request
 import xml.etree.ElementTree as ET
 from io import BytesIO
@@ -159,25 +160,19 @@ def notify_confirmation(config: dict[str, Any], store: MirrorStore, source_accou
     if group_names:
         text += f"，出现于：{group_names}"
     try:
-        run_lark({**config, "lark_profile": config.get("admin_profile") or "wechat-mirror"}, ["+messages-send", "--user-id", user_id, "--text", text, "--idempotency-key", f"mirror-confirm-{item['id']}"])
+        run_lark({**config, "lark_profile": config.get("admin_profile") or "wechat-mirror"}, ["+messages-send", "--user-id", user_id, "--text", text, "--idempotency-key", f"mirror-confirm-{item['id']}" + (f"-v{item['notification_generation']}" if item.get('notification_generation') else '')])
     except Exception as exc:
-        store.finish_confirmation_notification(int(item["id"]), error=safe_error(exc))
+        store.finish_confirmation_notification(int(item["id"]), error=safe_error(exc), generation=item.get("notification_generation",0))
         print(f"身份提醒发送失败 confirmation_id={item['id']}: {safe_error(exc)}", file=sys.stderr, flush=True)
     else:
-        store.finish_confirmation_notification(int(item["id"]))
+        store.finish_confirmation_notification(int(item["id"]), generation=item.get("notification_generation",0))
 
 
 def group_event_body(row: dict[str, Any], config: dict[str, Any], store: MirrorStore) -> str:
     raw = str(row.get('text') or row.get('content') or '')
-    invite = re.search(r'\$username\$.*?邀请.*?\$names\$.*?加入了群聊', raw, re.S)
-    removal = re.search(r'\$username\$.*?将.*?\$names\$.*?移出了群聊', raw, re.S)
-    marker = invite or removal
-    if not marker:
-        return '群成员变更（姓名暂不可用）' if ('$username$' in raw or '$names$' in raw) else (raw or '[群成员变更]')
-    tokens = raw[marker.end():].strip().split()
-    pairs = [(tokens[i], tokens[i + 1]) for i in range(0, len(tokens) - 1, 2)]
     source = str(config.get('source_account') or 'default')
     profile = str(config.get('lark_profile') or '')
+
     def member(sender_id, nickname):
         identity = store.resolve_sender(source, sender_id)
         name = str((identity or {}).get('confirmed_name') or nickname or '成员')
@@ -187,7 +182,48 @@ def group_event_body(row: dict[str, Any], config: dict[str, Any], store: MirrorS
         mention = store.mention_identity(source, sender_id, profile)
         if mention and str(mention['open_id']).startswith('ou_'):
             return f'<at user_id="{mention["open_id"]}">{html.escape(name)}</at>'
-        return name
+        return html.escape(name)
+
+    # macOS may retain the room prefix and the full sysmsgtemplate XML. Role
+    # names in link_list, not its ordering or whitespace, identify the members.
+    xml_start = raw.find('<sysmsg')
+    if xml_start >= 0:
+        try:
+            root = ET.fromstring(raw[xml_start:].strip())
+        except ET.ParseError:
+            return '群成员变更（姓名暂不可用）'
+        content = root.find('.//content_template')
+        template = content.findtext('template') if content is not None else None
+        if not template:
+            return '群成员变更（姓名暂不可用）'
+        values = {}
+        for link in content.findall('./link_list/link'):
+            role = link.get('name', '')
+            if link.get('hidden') == '1' or link.get('type') == 'link_revoke':
+                values[role] = ''
+                continue
+            members = link.findall('./memberlist/member')
+            if members:
+                values[role] = '、'.join(member(
+                    (item.findtext('username') or '').strip(),
+                    (item.findtext('nickname') or '').strip(),
+                ) for item in members)
+        # The local reader's "you" is the WeChat account owner, not the bot
+        # or the Feishu reader. Do not guess an inviter ID from a display name.
+        template = re.sub(r'^你(?=邀请|将)', '本机微信用户', template)
+        body = re.sub(r'\$([^$]+)\$', lambda match: values.get(
+            match.group(1), '' if match.group(1) == 'revoke' else '成员'), html.escape(template, quote=False))
+        return body.strip() or '群成员变更（姓名暂不可用）'
+
+    # Compatibility with reader versions that flatten members into ID/name
+    # pairs after the invitation/removal template.
+    invite = re.search(r'\$username\$.*?邀请.*?\$names\$.*?加入了群聊', raw, re.S)
+    removal = re.search(r'\$username\$.*?将.*?\$names\$.*?移出了群聊', raw, re.S)
+    marker = invite or removal
+    if not marker:
+        return '群成员变更（姓名暂不可用）' if ('$username$' in raw or '$names$' in raw) else (raw or '[群成员变更]')
+    tokens = raw[marker.end():].strip().split()
+    pairs = [(tokens[i], tokens[i + 1]) for i in range(0, len(tokens) - 1, 2)]
     inviter = member(*pairs[0]) if pairs else '成员'
     invited = '、'.join(member(*pair) for pair in pairs[1:]) if len(pairs) > 1 else '成员'
     return f'{inviter} 邀请 {invited} 加入了群聊' if invite else f'{inviter} 将 {invited} 移出了群聊'
@@ -195,7 +231,7 @@ def group_event_body(row: dict[str, Any], config: dict[str, Any], store: MirrorS
 
 def is_group_event(row: dict[str, Any]) -> bool:
     raw = str(row.get('text') or row.get('content') or '')
-    return ('$username$' in raw or '$names$' in raw or
+    return (('<sysmsg' in raw and 'sysmsgtemplate' in raw) or '$username$' in raw or '$names$' in raw or
             (str(row.get('sender_wxid') or '').endswith('@chatroom') and
              str(row.get('kind_name') or '').lower() in {'system', 'sys', 'group_event'}))
 
@@ -331,11 +367,64 @@ def quote_info(row: dict[str, Any]) -> dict[str, str] | None:
         return None
 
 
+def sticker_metadata(row: dict[str, Any]) -> dict[str, str]:
+    # Some readers expose a display placeholder in text and the XML in content.
+    for field in ('content', 'text'):
+        raw = str(row.get(field) or '')
+        start = raw.find('<')
+        if start < 0:
+            continue
+        try:
+            root = ET.fromstring(raw[start:])
+            node = root if root.tag == 'emoji' else root.find('.//emoji')
+            if node is not None:
+                return {k.lower(): v for k, v in node.attrib.items()}
+        except ET.ParseError:
+            continue
+    return {}
+
+
+def sticker_sources(row: dict[str, Any]) -> list[tuple[str, str]]:
+    info = sticker_metadata(row)
+    candidates = []
+    for field in ('cdnurl', 'externurl'):
+        url = info.get(field, '')
+        if url.startswith(('http://', 'https://')):
+            digest = info.get('externmd5') if field == 'externurl' else info.get('md5')
+            candidates.append((url, str(digest or info.get('md5') or '').lower()))
+    return list(dict.fromkeys(candidates))
+
+
 def sticker_url(row: dict[str, Any]) -> str | None:
-    """Extract a short-lived WeChat CDN URL without logging its query string."""
-    raw = str(row.get("text") or row.get("content") or "")
-    match = re.search(r'(?:cdnurl|externurl)\s*=\s*["\']([^"\']+)', raw, re.I)
-    return html.unescape(match.group(1)) if match else None
+    sources = sticker_sources(row)
+    return sources[0][0] if sources else None
+
+
+def historical_sticker_sources(row: dict[str, Any]) -> list[tuple[str, str]]:
+    """Recover URLs for precisely the same sticker in this group, bounded to 100 hits."""
+    digest = sticker_metadata(row).get('md5', '').lower()
+    talker = str(row.get('talker') or '')
+    if not talker or not re.fullmatch(r'[0-9a-f]{32}', digest):
+        return []
+    try:
+        proc = subprocess.run([str(WECHAT_READER), 'search', digest, '--talker', talker,
+                               '--limit', '100', '--include-text', '--max-text-chars', '16384'],
+                              cwd=ROOT, capture_output=True, text=True, encoding='utf-8', timeout=45)
+        if proc.returncode:
+            raise CliError('sticker_lookup_failed: 读取器未能查询原始表情记录')
+        value = json.loads(proc.stdout)
+        if value.get('ok') is False:
+            raise CliError('sticker_lookup_failed: 读取器未能查询原始表情记录')
+        found = []
+        for candidate in value.get('data', value).get('messages', []):
+            if str(candidate.get('talker') or '') != talker:
+                continue
+            if sticker_metadata(candidate).get('md5', '').lower() != digest:
+                continue
+            found.extend(sticker_sources(candidate))
+        return list(dict.fromkeys(found))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        raise CliError('sticker_lookup_failed: 原始表情记录查询失败或超时') from None
 
 
 def media_url(row: dict[str, Any]) -> str | None:
@@ -455,6 +544,39 @@ def media_doctor(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def stage_voice_resource(row, media_dir, namespace):
+    """Fallback for Rion versions exposing voice BLOBs outside hardlink.db."""
+    import base64
+    talker = str(row.get('talker') or '')
+    if not talker or not row.get('create_time'):
+        return None
+    args = [str(WECHAT_READER),'voice-resource','--talker',talker,
+            '--local-id',str(int(row.get('local_id') or 0)),
+            '--server-id',str(int(row.get('server_id') or 0)),
+            '--create-time',str(int(row['create_time']))]
+    try:
+        result = subprocess.run(args,cwd=ROOT,capture_output=True,text=True,encoding='utf-8',timeout=45)
+        if result.returncode:
+            return None
+        value = json.loads(result.stdout).get('data',{})
+        if value.get('contract')!='voice_resource_v1' or value.get('talker')!=talker or int(value.get('local_id',-1))!=int(row['local_id']):
+            return None
+        if value.get('extension') not in {'.silk','.amr'} or len(value.get('base64',''))>24*1024*1024:
+            return None
+        data = base64.b64decode(value['base64'],validate=True)
+        if not data.startswith((b'\x02#!SILK_V3',b'#!SILK_V3',b'#!AMR')):
+            return None
+        media_dir.mkdir(parents=True,exist_ok=True)
+        path = media_dir / f"{namespace}-{int(row['local_id'])}{value['extension']}"
+        fd = os.open(path,os.O_WRONLY|os.O_CREAT|os.O_TRUNC|getattr(os,'O_NOFOLLOW',0),0o600)
+        with os.fdopen(fd,'wb') as handle:
+            if hasattr(os,'fchmod'):os.fchmod(handle.fileno(),0o600)
+            handle.write(data)
+        return str(path)
+    except (OSError,ValueError,subprocess.TimeoutExpired):
+        return None
+
+
 def stage_media(row: dict[str, Any], kind: str) -> tuple[str | None, bool]:
     """Stage a reader-provided local file, then fall back to a normal URL.
 
@@ -473,13 +595,17 @@ def stage_media(row: dict[str, Any], kind: str) -> tuple[str | None, bool]:
     media_dir = Path(os.environ.get("W2F_MEDIA_DIR", os.environ.get("CHZ_MEDIA_DIR", str(row.get("media_dir") or MEDIA_DIR)))).expanduser()
     namespace = str(row.get("binding_id",1)) + "-" + hashlib.sha1(str(row.get("talker") or "default").encode()).hexdigest()[:10]
     local_id = int(row.get("local_id") or 0)
+    if not source_path and kind in {'voice','audio'}:
+        voice = stage_voice_resource(row,media_dir,namespace)
+        if voice:
+            return voice,False
     if source_path:
         try:
             media_dir.mkdir(parents=True, exist_ok=True)
             suffix = source_path.suffix.lower() or {"image": ".jpg", "video": ".mp4", "voice": ".ogg", "file": ".bin"}.get(kind, ".bin")
             path = media_dir / f"{namespace}-{local_id}{suffix}"
             if kind == "image" and suffix == ".dat":
-                if not decode_wechat_dat(source_path, path):
+                if not decode_wechat_dat(source_path, path, allow_macos_derivation=row.get('macos_image_key_derivation') is True):
                     raise CliError('decode_failed: 无法解码本机图片资源')
                 path = next((media_dir / f"{namespace}-{local_id}{ext}" for ext in (".png",".jpg",".gif",".webp") if (media_dir / f"{namespace}-{local_id}{ext}").is_file()), path)
             else:
@@ -509,68 +635,116 @@ def stage_media(row: dict[str, Any], kind: str) -> tuple[str | None, bool]:
         raise CliError('download_failed: 媒体下载失败 '+type(exc).__name__) from None
 
 
-def stage_sticker(row: dict[str, Any]) -> str | None:
-    """Download and normalize a WeChat sticker for Feishu image upload.
-
-    WeChat's CDN commonly returns ``application/octet-stream`` even for GIF or
-    WebP data, so Pillow detects the format from the bytes. The normalized
-    image fits a 200x200 box without upscaling, matching the usual WeChat chat
-    bubble size while preserving aspect ratio and animation when possible.
-    """
-    url = sticker_url(row)
-    if not url:
-        return None
+def normalize_sticker(payload: bytes, row: dict[str, Any]) -> str:
+    if len(payload) > STICKER_MAX_BYTES:
+        raise CliError('resource_too_large: 表情超过 15 MB')
     try:
-        request = urllib.request.Request(url, headers={"User-Agent": "wechat-feishu-mirror/1.0"})
-        with urllib.request.urlopen(request, timeout=15) as response:
-            payload = response.read(STICKER_MAX_BYTES + 1)
-        if len(payload) > STICKER_MAX_BYTES:
-            return None
-        source = Image.open(BytesIO(payload))
-        source.load()
-        source_format = (source.format or "PNG").upper()
-        frame_count = getattr(source, "n_frames", 1)
-        frames: list[Image.Image] = []
-        durations: list[int] = []
-        for index in range(frame_count):
-            source.seek(index)
-            frame = source.convert("RGBA")
-            frame.thumbnail((STICKER_MAX_PX, STICKER_MAX_PX), Image.Resampling.LANCZOS)
-            frames.append(frame.copy())
-            durations.append(int(source.info.get("duration", 100) or 100))
-        if not frames:
-            return None
-
-        local_id = int(row.get("local_id") or 0)
-        namespace = str(row.get("binding_id",1)) + "-" + hashlib.sha1(str(row.get("talker") or "default").encode()).hexdigest()[:10]
-        sticker_dir = Path(row.get("media_dir") or STICKER_DIR) / "stickers"
-        sticker_dir.mkdir(parents=True, exist_ok=True)
-        # GIF preserves animated stickers. Other formats are emitted as PNG
-        # because Feishu's image upload path accepts it consistently.
-        if source_format == "GIF" and len(frames) > 1:
-            path = sticker_dir / f"{namespace}-{local_id}.gif"
-            frames[0].convert("P", palette=Image.Palette.ADAPTIVE).save(
-                path, save_all=True, append_images=[f.convert("P", palette=Image.Palette.ADAPTIVE) for f in frames[1:]],
-                duration=durations, loop=int(source.info.get("loop", 0) or 0), disposal=2, optimize=True,
-            )
+        with Image.open(BytesIO(payload)) as source:
+            frames, durations = [], []
+            frame_count = getattr(source, 'n_frames', 1)
+            if frame_count > 500 or source.width * source.height * frame_count > 100_000_000:
+                raise CliError('resource_too_large: 表情帧数或解码尺寸过大')
+            loop = int(source.info.get('loop', 0) or 0)
+            for index in range(frame_count):
+                source.seek(index)
+                frame = source.convert('RGBA')
+                frame.thumbnail((STICKER_MAX_PX, STICKER_MAX_PX), Image.Resampling.LANCZOS)
+                frames.append(frame.copy())
+                durations.append(int(source.info.get('duration', 100) or 100))
+        namespace = str(row.get('binding_id', 1)) + '-' + hashlib.sha1(str(row.get('talker') or 'default').encode()).hexdigest()[:10]
+        directory = Path(row.get('media_dir') or STICKER_DIR) / 'stickers'
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{namespace}-{int(row.get('local_id') or 0)}.{('gif' if len(frames) > 1 else 'png')}"
+        if len(frames) > 1:
+            frames[0].save(path, format='GIF', save_all=True, append_images=frames[1:],
+                           duration=durations, loop=loop, disposal=2, optimize=False)
         else:
-            path = sticker_dir / f"{namespace}-{local_id}.png"
-            frames[0].save(path, format="PNG", optimize=True)
+            frames[0].save(path, format='PNG', optimize=True)
         return str(path)
-    except Exception as exc:
-        print(f"贴图归一化失败 local_id={row.get('local_id')}: {type(exc).__name__}", file=sys.stderr, flush=True)
+    except (OSError, ValueError, Image.DecompressionBombError):
+        raise CliError('sticker_decode_failed: 表情资源不能解码为图片') from None
+
+
+def stage_sticker(row: dict[str, Any]) -> str | None:
+    """Try message URLs/local resources, then recover the same digest from history."""
+    tried = set()
+    errors = []
+
+    def download(candidates):
+        for url, digest in candidates:
+            if url in tried:
+                continue
+            tried.add(url)
+            try:
+                request = urllib.request.Request(url, headers={'User-Agent': 'wechat-feishu-mirror/1.0'})
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    payload = response.read(STICKER_MAX_BYTES + 1)
+                if len(payload) > STICKER_MAX_BYTES:
+                    raise CliError('resource_too_large: 表情超过 15 MB')
+                if re.fullmatch(r'[0-9a-f]{32}', digest) and hashlib.md5(payload).hexdigest() != digest:
+                    raise CliError('sticker_digest_mismatch: 下载内容与原表情摘要不一致')
+                return normalize_sticker(payload, row)
+            except CliError as exc:
+                errors.append(exc)
+            except Exception:
+                errors.append(CliError('sticker_download_failed: 表情下载失败'))
         return None
+
+    staged = download(sticker_sources(row))
+    if staged:
+        return staged
+    digest = sticker_metadata(row).get('md5', '').lower()
+    for path in reader_media_paths(row):
+        try:
+            if path.stat().st_size > STICKER_MAX_BYTES:
+                continue
+            payload = path.read_bytes()
+            if re.fullmatch(r'[0-9a-f]{32}', digest) and hashlib.md5(payload).hexdigest() != digest:
+                continue
+            return normalize_sticker(payload, row)
+        except (OSError, CliError):
+            continue
+    try:
+        staged = download(historical_sticker_sources(row))
+        if staged:
+            return staged
+    except CliError as exc:
+        errors.append(exc)
+    if errors:
+        raise errors[-1]
+    raise CliError('sticker_resource_missing: 当前消息及本群历史中未找到可用表情资源')
 
 
 def voice_upload_args(path: str) -> tuple[list[str], str | None]:
     """Prefer a playable Feishu voice message; preserve unsupported audio as a file."""
     source = Path(path)
+    def private_output(suffix):
+        fd,name=tempfile.mkstemp(prefix=source.stem+'-decode-',suffix=suffix,dir=source.parent)
+        os.close(fd)
+        return Path(name)
     if source.suffix.lower() in {'.opus', '.ogg'}:
         return ['--audio', path], None
+    if source.suffix.lower() in {'.silk','.slk'}:
+        encoder = shutil.which('ffmpeg')
+        if encoder:
+            pcm = private_output('.pcm');converted = private_output('.opus')
+            try:
+                decoded = subprocess.run([sys.executable,'-m','agents.voice_codec',str(source),str(pcm)],
+                    cwd=ROOT,capture_output=True,timeout=30)
+                if decoded.returncode==0 and pcm.is_file() and pcm.stat().st_size:
+                    encoded = subprocess.run([encoder,'-v','error','-y','-f','s16le','-ar','24000','-ac','1',
+                        '-i',str(pcm),'-c:a','libopus','-b:a','24k',str(converted)],capture_output=True,timeout=30)
+                    if encoded.returncode==0 and converted.is_file() and converted.stat().st_size:
+                        return ['--audio',str(converted)],str(converted)
+            except (OSError,subprocess.TimeoutExpired):
+                pass
+            finally:
+                cleanup_staged(str(pcm))
+            cleanup_staged(str(converted))
     if source.suffix.lower() in {'.amr', '.aac', '.m4a', '.mp3', '.wav'}:
         encoder = shutil.which('ffmpeg')
         if encoder:
-            converted = source.with_suffix('.opus')
+            converted = private_output('.opus')
             try:
                 result = subprocess.run([encoder, '-v', 'error', '-y', '-i', str(source),
                                          '-vn', '-c:a', 'libopus', '-b:a', '24k', str(converted)],
@@ -592,28 +766,20 @@ def cleanup_staged(path: str | None) -> None:
         pass
 
 
-def decode_wechat_dat(source: Path, destination: Path) -> bool:
-    """Decode common one-byte-XOR WeChat image .dat files conservatively."""
+def decode_wechat_dat(source: Path, destination: Path, *, allow_macos_derivation=False) -> bool:
+    from agents.media_images import decode_dat, ImageResourceError
     try:
-        payload = source.read_bytes()
-    except OSError:
-        return False
-    signatures = ((b"\xff\xd8\xff", ".jpg"), (b"\x89PNG\r\n\x1a\n", ".png"), (b"GIF8", ".gif"), (b"RIFF", ".webp"))
-    for signature, extension in signatures:
-        if not payload:
-            break
-        key = payload[0] ^ signature[0]
-        decoded = bytes(byte ^ key for byte in payload)
-        if not decoded.startswith(signature):
-            continue
-        try:
-            image = Image.open(BytesIO(decoded))
-            image.verify()
-        except Exception:
-            continue
+        decoded = decode_dat(source, allow_macos_derivation=allow_macos_derivation)
+        with Image.open(BytesIO(decoded)) as image:
+            extension = {'JPEG': '.jpg', 'PNG': '.png', 'GIF': '.gif', 'WEBP': '.webp'}.get(image.format)
+        if not extension:
+            return False
         destination.with_suffix(extension).write_bytes(decoded)
         return True
-    return False
+    except ImageResourceError as exc:
+        raise CliError(str(exc)) from None
+    except OSError:
+        return False
 
 
 def message_key(row: dict[str, Any]) -> str:
@@ -695,7 +861,12 @@ def forward_body(row, config, store):
     def render(records, prefix=''):
         lines=[]
         for i,item in enumerate(records):
-            name,_ = resolve_name(store, config, item.get('sender_id',''), item.get('sender',''), f"{message_key(row)}:forward:{prefix}{i}")
+            from integrations.forward_records import stable_sender_id
+            sender_id = stable_sender_id(item.get('sender_id'))
+            if sender_id:
+                name,_ = resolve_name(store, config, sender_id, item.get('sender',''), f"{message_key(row)}:forward:{prefix}{i}")
+            else:
+                name = item.get('sender') or '未知发言人'
             lines.append(f"{name}：{item.get('body') or '[转发记录]'}")
             if item.get('children'):
                 lines.extend('  '+line for line in render(item['children'], prefix+str(i)+'.'))
@@ -745,7 +916,8 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
                 result = {'data':{'message_id':fallback['feishu_message_id']}}; placeholder=True
             else:
                 label = {'sticker':'表情','emoji':'表情','image':'图片','video':'视频','file':'文件','voice':'语音','audio':'语音'}.get(kind,'媒体')
-                enriched = {**row,'binding_id':bid,'media_dir':config.get('media_dir', str(MEDIA_DIR))}
+                enriched = {**row,'binding_id':bid,'media_dir':config.get('media_dir', str(MEDIA_DIR)),
+                            'macos_image_key_derivation':config.get('macos_image_key_derivation') is True}
                 try:
                     if kind in {'sticker','emoji'}:
                         media_input,thumbnail_only = stage_sticker(enriched),False
@@ -821,7 +993,7 @@ def video_cover(path):
 
 
 def source_page(config, cursor, high=None, after=None):
-    args=[str(WECHAT_READER),'sync-page','--talker',config['wechat_talker'],'--after-local-id',str(cursor),'--limit',str(config.get('page_size',100))]
+    args=[str(config.get('wechat_reader') or WECHAT_READER),'sync-page','--talker',config['wechat_talker'],'--after-local-id',str(cursor),'--limit',str(config.get('page_size',100))]
     if high is not None: args+=['--through-local-id',str(high)]
     if after: args+=['--page-after-time',str(after['time']),'--page-after-local-id',str(after['local_id'])]
     try:
@@ -888,24 +1060,31 @@ def retry_media_jobs(config,store):
     with store.connect() as db:
         jobs=[dict(r) for r in db.execute("SELECT m.id,m.message_id,m.attempts,x.payload_json FROM media_jobs m JOIN messages x ON x.id=m.message_id WHERE x.binding_id=? AND m.state IN ('pending','processing') ORDER BY m.id",(config['binding_id'],))]
     for job in jobs:
-        if job['attempts'] >= 3:
+        baseline=int(store.setting(f"media_retry_base:{job['id']}",0))
+        attempts_this_round=max(0,job['attempts']-baseline)
+        if attempts_this_round >= 3:
             with store.connect() as db: db.execute("UPDATE media_jobs SET state='manual',error=COALESCE(error,'自动重试已达到 3 次'),updated_at=? WHERE id=?",(time.time(),job['id']))
             continue
         check_control(config,store)
         # Back off automatically: attempts 1/2 wait 30s/120s; tests and
         # explicit management retries can bypass this by setting updated_at.
-        delay=(30,120)[min(job['attempts'],2)-1] if job['attempts'] else 0
+        delay=(30,120)[min(attempts_this_round,2)-1] if attempts_this_round else 0
         with store.connect() as db:
             updated=db.execute('SELECT updated_at FROM media_jobs WHERE id=?',(job['id'],)).fetchone()[0]
         if delay and time.time()-updated < delay:
             continue
         with store.connect() as db:db.execute("UPDATE media_jobs SET state='processing' WHERE id=?",(job['id'],))
-        try:send_row({**config,'_retry_media':True},json.loads(job['payload_json']),{},store)
+        try:
+            send_row({**config,'_retry_media':True},json.loads(job['payload_json']),{},store)
+            with store.connect() as db:
+                current=db.execute('SELECT state,attempts FROM media_jobs WHERE id=?',(job['id'],)).fetchone()
+                if current['state']=='placeholder':
+                    db.execute('UPDATE media_jobs SET state=? WHERE id=?',('manual' if current['attempts']-baseline>=3 else 'pending',job['id']))
         except Exception as exc:
             with store.connect() as db:
-                attempts=db.execute('SELECT attempts FROM media_jobs WHERE id=?',(job['id'],)).fetchone()[0]
-                state='manual' if attempts >= 3 else 'pending'
-                db.execute("UPDATE media_jobs SET state=?,error=?,updated_at=? WHERE id=?",(state,safe_error(exc),time.time(),job['id']))
+                attempts=max(job['attempts']+1,db.execute('SELECT attempts FROM media_jobs WHERE id=?',(job['id'],)).fetchone()[0])
+                state='manual' if isinstance(exc,DeliveryUncertain) or attempts-baseline >= 3 else 'pending'
+                db.execute("UPDATE media_jobs SET state=?,attempts=?,error=?,updated_at=? WHERE id=?",(state,attempts,safe_error(exc),time.time(),job['id']))
 
 
 def expire_failed_media(config,store):
@@ -921,11 +1100,14 @@ def expire_failed_media(config,store):
 def reader_wakeup_loop(config: dict[str, Any], wakeup: threading.Event, stopped: threading.Event) -> None:
     """Use Rion's read-only watch as a hint; sync-page remains authoritative."""
     store = MirrorStore(config['sqlite_file'])
+    metadata_watch = True
     while not stopped.is_set():
         cursor = store.get_cursor(int(config['binding_id']))
         cmd = [str(WECHAT_READER), 'watch', '--talker', config['wechat_talker'],
                '--since-local-id', str(cursor), '--follow', '--jsonl',
                '--poll-interval', '2', '--limit', '100', '--scan-limit', '1000']
+        if metadata_watch:
+            cmd = [str(WECHAT_READER),'watch-changes','--poll-interval','1']
         proc = None
         try:
             proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -949,6 +1131,8 @@ def reader_wakeup_loop(config: dict[str, Any], wakeup: threading.Event, stopped:
                 try:proc.wait(timeout=2)
                 except subprocess.TimeoutExpired:proc.kill();proc.wait(timeout=2)
             if proc is not None and proc.stdout:proc.stdout.close()
+            if proc is not None and proc.returncode == 2:
+                metadata_watch = False  # Older reader: retain the original watch fallback.
         stopped.wait(5)
 
 
@@ -985,6 +1169,8 @@ def stream(config, state=None):
     def heartbeat():
         while not stopped.wait(5): store.heartbeat(token,bid)
     thread=threading.Thread(target=heartbeat,daemon=True);thread.start()
+    from agents.group_names import group_name_loop
+    threading.Thread(target=group_name_loop,args=(dict(config),store,stopped),daemon=True).start()
     if config.get('realtime_wakeup'):
         threading.Thread(target=realtime_wakeup_loop,args=(config,wakeup,stopped),daemon=True).start()
     if str(config.get('reader_wakeup', '')).lower() in {'true', '1', 'yes'}:
