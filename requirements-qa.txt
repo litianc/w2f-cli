@@ -1,0 +1,4 @@
+-r requirements.txt
+playwright>=1.51,<2
+psutil>=5.9,<8
+-r requirements-voice.txt

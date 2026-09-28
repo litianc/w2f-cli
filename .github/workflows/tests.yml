@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -12,11 +16,77 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 20 || 15 }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install -r requirements.txt
-      - run: python -m unittest discover -s tests -q
+      - run: python -m pip install -r requirements-qa.txt
+      - name: Install FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+      - name: Install FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install ffmpeg --no-progress -y
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # QA copies the codec into its fixture; a Chocolatey shim cannot be relocated.
+          $codec = Get-ChildItem "$env:ChocolateyInstall\lib\ffmpeg" -Filter ffmpeg.exe -Recurse | Select-Object -First 1
+          if (-not $codec) { throw "FFmpeg executable was not installed" }
+          $codec.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - run: python -m playwright install --with-deps chromium
+      - name: Run isolated checks and confirm failures
+        id: qa
+        continue-on-error: true
+        # Windows filesystem/process startup is slower; retain a bounded timeout
+        # and the same strict gate (no accepted blocked/flaky results).
+        run: python -m qa.run --timeout ${{ runner.os == 'Windows' && 480 || 240 }} --output .qa-results/ci
+      - name: Upload structured evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-${{ matrix.os }}
+          path: .qa-results/ci/
+          if-no-files-found: error
+          retention-days: 14
       - run: python scripts/check_public_tree.py
+      - name: Reject new failures and stale known-failure entries
+        run: python -m qa.gate .qa-results/ci/report.json
+
+  publish:
+    needs: test
+    # PR code never receives an issue-write token. Only trusted main runs publish.
+    if: >-
+      always() && !cancelled() &&
+      github.repository == 'litianc/w2f-cli' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    concurrency:
+      group: w2f-functional-qa-issues
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: qa-*
+          path: .qa-results/platforms
+      - name: Publish only repeatable new findings
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python -m qa.ci_publish .qa-results/platforms --max-new 3

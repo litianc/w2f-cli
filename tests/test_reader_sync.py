@@ -38,3 +38,40 @@ class ReaderPagingAcceptance(unittest.TestCase):
         items=parse_record(raw)
         self.assertEqual(items[0]['body'],'A & B 😀');self.assertEqual(items[0]['sender_id'],'wx_1')
         self.assertEqual(items[1]['kind'],'image');self.assertEqual(items[2]['children'][0]['body'],'嵌套句')
+
+    def test_context_manager_snapshot_once_and_empty_page_skips_contacts(self):
+        from contextlib import contextmanager
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'source.db'
+            with sqlite3.connect(path) as conn:
+                conn.execute('CREATE TABLE Msg_fixture(local_id INTEGER,server_id INTEGER,real_sender_id INTEGER,create_time INTEGER,local_type INTEGER,message_content TEXT)')
+                conn.execute("INSERT INTO Msg_fixture VALUES(1,11,1,100,1,'hello')")
+                conn.execute('CREATE TABLE Name2Id(user_name TEXT)')
+                conn.execute("INSERT INTO Name2Id VALUES('sender')")
+            conn.close();opens=[];closed=[]
+            @contextmanager
+            def connect(source):
+                opens.append(source);conn=sqlite3.connect(source);conn.row_factory=sqlite3.Row
+                try:yield conn
+                finally:conn.close();closed.append(source)
+            contacts=Mock(return_value={'sender':{'display_name':'nickname'}})
+            db=SimpleNamespace(message_dbs=[path],connect=connect,contact_index=contacts,self_username='self')
+            reader=SimpleNamespace(resolve_username=lambda db,chat:chat,message_table=lambda chat:'Msg_fixture',message_projection=lambda db,t:'*',visible_message_content=lambda text,*args:text,decode_message_content=lambda row:row['message_content'],message_kind=lambda *args:'text',time_iso=str,ReaderError=lambda msg,code:RuntimeError(code))
+            args=argparse.Namespace(talker='room',after_local_id=1,through_local_id=None,page_after_time=None,page_after_local_id=0,limit=10)
+            self.assertEqual(read_page(reader,db,args)['messages'],[])
+            contacts.assert_not_called();self.assertEqual(opens,[path]);self.assertEqual(closed,opens)
+            args.after_local_id=0
+            self.assertEqual(read_page(reader,db,args)['messages'][0]['sender'],'nickname')
+            self.assertEqual(len(opens),2);self.assertEqual(closed,opens)
+
+    def test_change_hints_detect_wal_creation_change_and_removal_without_sql(self):
+        from integrations.reader_sync import source_signature
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'message_0.db';path.write_bytes(b'db')
+            db=SimpleNamespace(message_dbs=[path])
+            first=source_signature(db);self.assertEqual(source_signature(db),first)
+            wal=Path(str(path)+'-wal');wal.write_bytes(b'new-message')
+            second=source_signature(db);self.assertNotEqual(first,second)
+            wal.write_bytes(b'next-message');self.assertNotEqual(second,source_signature(db))
+            wal.unlink();self.assertEqual(first,source_signature(db))

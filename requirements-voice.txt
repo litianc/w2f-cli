@@ -1,0 +1,2 @@
+# Optional SILK voice decoder; ffmpeg is also required for playable Opus.
+pilk==0.2.4

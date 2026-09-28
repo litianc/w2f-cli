@@ -20,7 +20,7 @@ from . import autostart
 
 DEFAULT_DB=DATA_DIR/'wechat_feishu_mirror.sqlite3'
 READER=Path(os.environ.get('WECHAT_READER',str(Path(os.environ.get('CODEX_HOME',Path.home()/'.codex'))/'skills/wechat-cli/scripts/reader.sh')))
-SETUP_FIELDS={'source_account','wechat_chat_name','wechat_talker','feishu_chat_name','feishu_chat_id','lark_profile','lark_app_id','admin_feishu_user_id','admin_profile','feishu_app_link','feishu_assistant_link','poll_interval'}
+SETUP_FIELDS={'source_account','wechat_chat_name','wechat_talker','feishu_chat_name','feishu_chat_id','lark_profile','lark_app_id','admin_feishu_user_id','admin_profile','feishu_app_link','feishu_assistant_link','poll_interval','reader_wakeup'}
 
 
 def read_config(path):
@@ -30,7 +30,7 @@ def read_config(path):
 def write_runtime_config(value,path):
     # All values accepted from the browser are allowlisted separately. Runtime
     # paths are supplied only by local config/CLI, never arbitrary HTTP bodies.
-    value={k:v for k,v in value.items() if k in SETUP_FIELDS|{'sqlite_file','data_dir','media_dir','log_dir','state_file'}}
+    value={k:v for k,v in value.items() if k in SETUP_FIELDS|{'sqlite_file','data_dir','media_dir','log_dir','state_file','wechat_reader','realtime_wakeup','realtime_stream_url','sender_map','macos_image_key_derivation'}}
     path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
     tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(value,ensure_ascii=False,indent=2)+'\n',encoding='utf-8');tmp.chmod(0o600);tmp.replace(path)
 
@@ -43,11 +43,15 @@ def run_cli(argv,*,stdin=None):
         p=subprocess.run(argv,cwd=ROOT,input=stdin,text=True,encoding='utf-8',capture_output=True,timeout=60,
                          env={**os.environ,'LARKSUITE_CLI_NO_UPDATE_NOTIFIER':'1','LARKSUITE_CLI_NO_SKILLS_NOTIFIER':'1'})
     except subprocess.TimeoutExpired: raise RuntimeError('CLI 请求超时，请稍后重试') from None
-    try: value=json.loads(p.stdout if p.returncode==0 else p.stderr)
+    try: value=json.loads(p.stdout)
     except ValueError: value={}
+    if p.returncode and not (isinstance(value,dict) and value.get('error')):
+        try: value=json.loads(p.stderr)
+        except ValueError: value={}
     if p.returncode or (isinstance(value,dict) and value.get('ok') is False):
-        error=value.get('error',{})
-        raise RuntimeError(safe_error(error.get('message') or 'CLI 请求失败'))
+        error=value.get('error',{}) if isinstance(value,dict) else {}
+        message=error.get('message') if isinstance(error,dict) else str(error)
+        raise RuntimeError(safe_error(message or 'CLI 请求失败'))
     return value
 
 
@@ -108,8 +112,159 @@ def profile_health(store,name):
     return {'profile':name,'bot_status':bot_status,'user_status':user_status,'error':'; '.join(errors) or None}
 
 
+def discover_profile_user(store, profile_name):
+    """Read the CLI's saved user identity for exactly one registered app."""
+    profile=next((item for item in store.list_profiles() if item['profile_name']==profile_name and item['enabled']),None)
+    if not profile:raise ValueError('请选择已启用的发送 Profile')
+    status=run_cli(['lark-cli','--profile',profile_name,'auth','status','--json','--verify'])
+    if str(status.get('appId') or '')!=str(profile['app_id']):
+        raise ValueError('Profile App ID 与登记应用不一致，请先在「飞书应用」刷新 Profile')
+    user=(status.get('identities') or {}).get('user') or {}
+    open_id=str(user.get('openId') or '').strip()
+    if open_id and not open_id.startswith('ou_'):raise ValueError('CLI 返回的用户 open_id 格式不正确')
+    return {'profile_name':profile_name,'open_id':open_id or None,
+            'display_name':str(user.get('userName') or ''),
+            'available':bool(user.get('available')),
+            'user_status':str(user.get('tokenStatus') or user.get('status') or 'unknown')}
+
+
+def search_feishu_people(store, profile_name, name, query=''):
+    """Find visible contacts for one app; the caller must choose a candidate."""
+    profile=next((item for item in store.list_profiles()
+                  if item['profile_name']==profile_name and item['enabled']),None)
+    if not profile:raise ValueError('请选择已启用的发送 Profile')
+    name=str(name or '').strip()
+    query=str(query or '').strip()
+    if not name or len(name)>50 or ',' in name or '\n' in name:
+        raise ValueError('请先确认人员实名（最多 50 字，不能含逗号或换行）')
+    if query and (len(query)>50 or ',' in query or '\n' in query):
+        raise ValueError('搜索词最多 50 字，不能包含逗号或换行')
+    auth=run_cli(['lark-cli','--profile',profile_name,'auth','status','--json','--verify'])
+    if str(auth.get('appId') or '')!=str(profile['app_id']):
+        raise ValueError('Profile App ID 与登记应用不一致，请先在「飞书应用」刷新 Profile')
+    user=(auth.get('identities') or {}).get('user') or {}
+    if not user.get('available'):
+        raise ValueError('此应用的用户授权不可用；通讯录姓名搜索需要用户授权。请先检查该 Profile 的用户授权，或手动填写 open_id')
+    if query:
+        terms=[query]
+    else:
+        from pypinyin import lazy_pinyin, Style
+        terms=[name]
+        if len(name)>=3:
+            terms.extend([name[:2],name[-2:]])
+        syllables=lazy_pinyin(name)
+        if any('\u4e00'<=ch<='\u9fff' for ch in name):
+            terms.extend([''.join(syllables), ''.join(lazy_pinyin(name,style=Style.FIRST_LETTER))])
+        terms=list(dict.fromkeys(term for term in terms if term and len(term)<=50))
+    argv=['lark-cli','--profile',profile_name,'contact','+search-user','--as','user',
+          '--page-size','30','--format','json']
+    argv+=['--query',terms[0]] if len(terms)==1 else ['--queries',','.join(terms)]
+    result=run_cli(argv)
+    data=result.get('data',result)
+    raw=data.get('users',[]) if isinstance(data,dict) else []
+    candidates={}
+    for item in raw:
+        open_id=str(item.get('open_id') or '').strip()
+        if not open_id.startswith('ou_'):continue
+        display=str(item.get('localized_name') or item.get('name') or '').strip()
+        source=str(item.get('matched_query') or terms[0])
+        if open_id not in candidates:
+            candidates[open_id]={'open_id':open_id,'display_name':display,
+                                 'department':str(item.get('department') or ''),
+                                 'enterprise_email':str(item.get('enterprise_email') or ''),
+                                 'is_cross_tenant':bool(item.get('is_cross_tenant')),
+                                 'matched_queries':[]}
+        if source not in candidates[open_id]['matched_queries']:
+            candidates[open_id]['matched_queries'].append(source)
+    people=sorted(candidates.values(),key=lambda item:(item['display_name']!=name,
+                   terms[0] not in item['matched_queries'],item['display_name'].casefold(),item['open_id']))
+    queries=data.get('queries',[]) if isinstance(data,dict) else []
+    partial=bool(data.get('has_more') or any(q.get('has_more') or q.get('error') for q in queries)) if isinstance(data,dict) else False
+    return {'profile_name':profile_name,'app_id':profile['app_id'],'searched':terms,
+            'candidates':people[:100],'has_more':partial or len(people)>100}
+
+
+def chat_share_link(profile_name, chat_id):
+    payload = run_cli(['lark-cli', '--profile', profile_name, 'im', 'chats', 'link',
+                       '--chat-id', chat_id, '--data', json.dumps({'validity_period': 'week'}),
+                       '--as', 'bot', '--format', 'json'])
+    data = payload.get('data', payload)
+    link = str(data.get('share_link') or '')
+    if not link.startswith('https://'):
+        raise RuntimeError('飞书未返回有效的群分享链接')
+    return {'share_link': link, 'expire_time': data.get('expire_time'),
+            'is_permanent': bool(data.get('is_permanent'))}
+
+
 def search_wechat(query,limit=30):
-    return payload_items(run_cli([str(READER),'resolve-chat',query,'--type-filter','group','--limit',str(limit)]),'candidates')
+    query=str(query or '').strip()
+    if query:
+        return payload_items(run_cli([str(READER),'resolve-chat',query,'--type-filter','group','--limit',str(limit)]),'candidates')
+    # resolve-chat requires a nonempty query. The contacts command filters
+    # groups after its limit, so ask for the full index before limiting here.
+    groups=payload_items(run_cli([str(READER),'contacts','--groups-only','--limit','100000']),'contacts')
+    return sorted(groups,key=lambda item:str(item.get('display_name') or item.get('username') or '').casefold())[:limit]
+
+
+def search_wechat_people(store, config_path, binding_id=None, query='', source_account=''):
+    """Return local WeChat identity candidates; never infer a real person."""
+    query=str(query or '').strip()
+    if len(query)>50 or any(ch in query for ch in '\r\n'):
+        raise ValueError('搜索词最多 50 字，不能包含换行')
+    bindings=[b for b in store.list_bindings() if not b['archived']]
+    binding=None
+    if binding_id not in (None,'',0,'0'):
+        try: selected=int(binding_id)
+        except (TypeError,ValueError): raise ValueError('群映射编号不正确') from None
+        binding=next((b for b in bindings if b['id']==selected),None)
+        if not binding:raise ValueError('请选择有效的微信群映射')
+        account=binding['source_account']
+        result=run_cli([str(READER),'members','--chatroom-id',binding['wechat_talker'],'--limit','100000'])
+        rows=payload_items(result,'members')
+        group_name=binding['wechat_alias'] or binding['wechat_chat_name']
+    else:
+        if not query:raise ValueError('搜索联系人时请填写昵称、备注或微信 ID')
+        config=read_config(config_path)
+        accounts={str(b['source_account']) for b in bindings}
+        if not accounts:accounts.add(str(config.get('source_account') or 'default'))
+        account=str(source_account or (bindings[0]['source_account'] if bindings else config.get('source_account') or 'default')).strip()
+        if account not in accounts:raise ValueError('微信账号标识不属于当前配置')
+        result=run_cli([str(READER),'contacts','--friends-only','--limit','100000'])
+        rows=payload_items(result,'contacts')
+        group_name=''
+    from pypinyin import lazy_pinyin, Style
+    term=query.casefold()
+    known={(r['source_account'],r['wechat_sender_id']):r for r in store.list_wechat_identities()}
+    candidates={}
+    for row in rows:
+        sender_id=str(row.get('username') or '').strip()
+        if not sender_id or sender_id.endswith('@chatroom') or sender_id.startswith('unidentified:'):
+            continue
+        names=[str(row.get(key) or '').strip() for key in ('display_name','remark','nick_name','alias')]
+        display=next((x for x in names if x),sender_id)
+        terms=[*names,sender_id]
+        if term:
+            rank=3
+            for value in terms:
+                folded=value.casefold()
+                if folded==term:rank=min(rank,0)
+                elif folded.startswith(term):rank=min(rank,1)
+                elif term in folded:rank=min(rank,2)
+                if value and any('\u4e00'<=ch<='\u9fff' for ch in value):
+                    roman=''.join(lazy_pinyin(value)).casefold()
+                    initials=''.join(lazy_pinyin(value,style=Style.FIRST_LETTER)).casefold()
+                    if roman.startswith(term) or initials.startswith(term):rank=min(rank,2)
+            if rank==3:continue
+        else:rank=2
+        linked=known.get((account,sender_id),{})
+        candidates[sender_id]={'source_account':account,'wechat_sender_id':sender_id,
+            'display_name':display,'nick_name':names[2],'remark':names[1],'alias':names[3],
+            'group_name':group_name,'person_id':linked.get('person_id'),
+            'confirmed_name':linked.get('confirmed_name'), 'rank':rank}
+    ordered=sorted(candidates.values(),key=lambda item:(item['rank'],item['display_name'].casefold(),item['wechat_sender_id']))
+    for item in ordered:item.pop('rank')
+    return {'source_account':account,'group_name':group_name,'candidates':ordered[:100],
+            'total':len(ordered),'has_more':len(ordered)>100}
 
 
 def search_feishu(profile,query):
@@ -259,8 +414,13 @@ class Manager:
     def get(self,resource,query=None):
         query=query or {};s=self.store
         if resource=='profiles':return s.list_profiles()
+        if resource=='profiles/self':return discover_profile_user(s,str(query.get('profile') or ''))
+        if resource=='people/search-feishu':return search_feishu_people(s,str(query.get('profile') or ''),
+                                                                       query.get('name',''),query.get('q',''))
+        if resource=='people/search-wechat':return search_wechat_people(s,self.config_path,
+                query.get('binding_id'),query.get('q',''),query.get('source_account',''))
         if resource=='bindings':return s.list_bindings()
-        if resource=='people':return {'people':s.list_people(),'wechat':s.list_wechat_identities(),'feishu':s.list_feishu_identities(),'actions':s.actions()}
+        if resource=='people':return {'people':s.list_people(query.get('status','active')),'archived':s.list_people('archived'),'wechat':s.list_wechat_identities(),'feishu':s.list_feishu_identities(),'actions':s.actions(),'quarantined':s.list_quarantined_identities()}
         if resource=='confirmations':return s.list_confirmations()
         if resource=='media-failures':return [{k:v for k,v in r.items() if k not in {'source_ref','staging_path'}} for r in s.list_media_failures()]
         if resource=='uncertain':return s.uncertain_deliveries()
@@ -275,7 +435,7 @@ class Manager:
             return build_report(s.metric_rows(time.time()-days*86400,binding_id=bid),window_days=days)
         if resource=='search/wechat':return search_wechat(query.get('q',''))
         if resource=='search/feishu':return search_feishu(query.get('profile',''),query.get('q',''))
-        if resource=='wizard/wechat':return search_wechat('',200)
+        if resource=='wizard/wechat':return search_wechat(query.get('q',''),200)
         if resource=='wizard/feishu':return search_feishu(query.get('profile',''),'')
         if resource=='wizard/check-source':
             from .wechat_feishu_mirror import source_page
@@ -322,6 +482,35 @@ class Manager:
                     binding=s.get_binding(int(data['id']));check=preflight_binding(binding,s)
                     if not check['ok']:raise ValueError('; '.join(check['errors']))
                 result=binding_action(s,self.config_path,int(data['id']),op)
+            elif op=='member-sync':
+                bid=int(data['id']);binding=s.get_binding(bid)
+                if not binding or binding['archived']:raise ValueError('有效群映射不存在')
+                if data.get('confirm') is not True:raise ValueError('请确认成员同步将实际邀请或移出飞书成员')
+                if not isinstance(data.get('enabled'),bool):raise ValueError('enabled 必须为布尔值')
+                setting=s.setting(f'member_sync:{bid}',{})
+                if data['enabled'] and 'boundary' not in setting:
+                    from .wechat_feishu_mirror import source_page
+                    runtime={**read_config(self.config_path),**binding,'binding_id':bid}
+                    setting['boundary']=int(source_page(runtime,0)['through_local_id'])
+                with s.binding_maintenance(bid):
+                    setting['enabled']=data['enabled'];s.save_setting(f'member_sync:{bid}',setting)
+                result=s.get_binding(bid)
+            elif op=='member-retry':
+                if data.get('confirm') is not True:raise ValueError('请确认重试此成员操作')
+                from .member_sync import retry_member_task
+                result=retry_member_task(s,int(data['id']))
+            elif op=='name-sync':
+                bid=int(data['id']);binding=s.get_binding(bid)
+                if not binding or binding['archived']:raise ValueError('有效群映射不存在')
+                if data.get('confirm') is not True:raise ValueError('请确认自动跟随会修改飞书真实群名')
+                if not isinstance(data.get('enabled'),bool):raise ValueError('enabled 必须为布尔值')
+                with s.binding_maintenance(bid):
+                    s.save_setting(f'name_sync_enabled:{bid}',data['enabled'])
+                result=s.get_binding(bid)
+            elif op=='share-link':
+                binding=s.get_binding(int(data['id']))
+                if not binding or binding['archived']:raise ValueError('有效群映射不存在')
+                result=chat_share_link(binding['lark_profile'],binding['feishu_chat_id'])
             elif op=='rename':
                 bid=int(data['id']);before=s.get_binding(bid)
                 if not before:raise ValueError('绑定不存在')
@@ -343,17 +532,44 @@ class Manager:
         elif resource=='people':
             if op=='create':result=s.create_person(data['name'],data.get('notes',''))
             elif op=='rename':result=s.rename_person(int(data['id']),data['name'],actor)
-            elif op=='link_wechat':result=s.link_wechat_identity(int(data['person_id']),data.get('source_account','default'),data['wechat_sender_id'],data.get('display_name',''))
+            elif op=='link_wechat':result=s.link_wechat_identity(int(data['person_id']),data.get('source_account','default'),data['wechat_sender_id'],data.get('display_name',''),actor=actor)
+            elif op=='reassign_wechat':
+                if data.get('confirm') is not True:raise ValueError('请明确确认更正微信身份归属')
+                result=s.reassign_wechat_identity(int(data['identity_id']),int(data['from_person_id']),int(data['to_person_id']),data.get('reason',''),actor=actor)
             elif op=='link_feishu':result=s.link_feishu_identity(int(data['person_id']),int(data['profile_id']),data['open_id'],data.get('user_id',''),data.get('display_name',''))
+            elif op in {'archive','restore','delete','unlink_wechat','unlink_feishu'}:
+                if data.get('confirm') is not True:raise ValueError('请明确确认人员维护操作')
+                if op.startswith('unlink_'):
+                    runtime=read_config(self.config_path)
+                    result=s.unlink_identity(op.removeprefix('unlink_'),int(data.get('identity_id',data.get('id'))),int(data['person_id']),actor=actor,
+                        protected_feishu=(str(runtime.get('admin_profile') or 'wechat-mirror'),str(runtime.get('admin_feishu_user_id') or '')))
+                else:result=s.change_person_state(int(data['id']),op,actor=actor)
             else:raise ValueError('不支持的人员操作')
         elif resource=='confirmations' and op=='confirm':
             if data.get('person_id'):
                 item=next(r for r in s.list_confirmations() if r['id']==int(data['id']))
-                result=s.link_wechat_identity(int(data['person_id']),item['source_account'],item['wechat_sender_id'],item['display_name'])
+                result=s.link_wechat_identity(int(data['person_id']),item['source_account'],item['wechat_sender_id'],item['display_name'],actor=actor)
             else:result=s.confirm_sender(int(data['id']),data['name'],actor)
         elif resource=='setup':
             if op=='save':
-                draft=s.setting('setup_draft',{});draft.update({k:v for k,v in data.items() if k in SETUP_FIELDS});s.save_setting('setup_draft',draft);result=self.get('setup')
+                draft=s.setting('setup_draft',{});draft.update({k:v for k,v in data.items() if k in SETUP_FIELDS})
+                # After setup, operational settings must reach the runtime
+                # config; otherwise the UI claims success but workers never see them.
+                if s.list_bindings():
+                    mutable={'admin_feishu_user_id','admin_profile','poll_interval','reader_wakeup'}
+                    updates={k:v for k,v in data.items() if k in mutable}
+                    if updates:
+                        runtime=read_config(self.config_path)
+                        runtime.update(updates)
+                        admin_id=str(runtime.get('admin_feishu_user_id') or '').strip()
+                        admin_profile=str(runtime.get('admin_profile') or 'wechat-mirror').strip()
+                        if admin_id and (('admin_feishu_user_id' in updates) or ('admin_profile' in updates)):
+                            profile=next((p for p in s.list_profiles() if p['profile_name']==admin_profile),None)
+                            if not profile or not any(f['profile_id']==profile['id'] and f['open_id']==admin_id
+                                                      for f in s.list_feishu_identities()):
+                                raise ValueError('管理员身份尚未关联到提醒应用；请先在「人员」页关联并核对')
+                        write_runtime_config(runtime,self.config_path)
+                s.save_setting('setup_draft',draft);result=self.get('setup')
             elif op=='check':result=preflight_binding(s.setting('setup_draft',{}),s)
             elif op=='init':
                 draft=s.setting('setup_draft',{}) or data.get('config') or {k:v for k,v in data.items() if k in SETUP_FIELDS}
@@ -365,34 +581,40 @@ class Manager:
                 if not data.get('confirm'):raise ValueError('请确认重置引导草稿；已启动绑定和凭证不会删除')
                 s.save_setting('setup_draft',{});result=self.get('setup')
             else:raise ValueError('不支持的初始化操作')
+        elif resource=='wizard' and op=='share-link':
+            profile=str(data.get('profile') or '').strip()
+            chat_id=str(data.get('chat_id') or '').strip()
+            if not profile or not chat_id:raise ValueError('请选择目标飞书群和发送应用')
+            if not any(p['profile_name']==profile and p['enabled'] for p in s.list_profiles()):
+                raise ValueError('发送应用未启用')
+            result=chat_share_link(profile,chat_id)
         elif resource=='wizard' and op=='create-target':
             profile=str(data.get('profile') or '');name=str(data.get('name') or '').strip()
             if not profile:raise ValueError('请先选择发送 Profile')
+            if not any(p['profile_name']==profile and p['enabled'] for p in s.list_profiles()):raise ValueError('发送应用未接入或已停用')
             if not name:raise ValueError('请填写新群名称')
             if len(name)>60:raise ValueError('群名称最长 60 字')
             args=['lark-cli','--profile',profile,'im','+chat-create','--name',name,'--as','bot','--format','json']
             if data.get('add_owner'):
                 owner=str(data.get('owner_open_id') or '').strip()
-                if not owner.startswith('ou_'):raise ValueError('勾选「拉我进群」时需填写本人 open_id（ou_ 开头）')
+                matched=next((p for p in s.list_profiles() if p['profile_name']==profile and p['enabled']),None)
+                if not matched or not any(identity['open_id']==owner and identity['profile_id']==matched['id']
+                                          for identity in s.list_feishu_identities()):
+                    raise ValueError('请先在「人员」页关联当前 Profile 下的本人飞书身份，再从下拉菜单选择')
                 args+=['--users',owner]
             payload=run_cli(args)
             chat_id=str((payload.get('data') or {}).get('chat_id') or payload.get('chat_id') or '')
             if not chat_id:raise ValueError('飞书未返回 chat_id；请先到飞书确认群是否已建成，再刷新列表选择')
             result={'chat_id':chat_id,'name':name,'profile':profile}
-            # 入群链接是建群后的加分项：拿不到（权限未开通等）绝不阻塞建群。
-            try:
-                link_payload=run_cli(['lark-cli','--profile',profile,'api','POST',f'/open-apis/im/v1/chats/{chat_id}/link','--as','bot','--format','json'])
-                result['chat_link']=(link_payload.get('data') or {}).get('link') or link_payload.get('link')
-                if not result['chat_link']:result['link_note']='飞书未返回入群链接：可联系管理员添加成员入群。'
-            except Exception as exc:
-                from .wechat_feishu_mirror import safe_error
-                result['chat_link']=None
-                result['link_note']='获取入群链接失败（多为应用未开通 im 群链接权限）：可联系管理员添加成员入群。'+safe_error(exc)
+            try:result.update(chat_share_link(profile,chat_id))
+            except Exception as exc:result['share_error']=str(exc)
         elif resource=='media-failures' and op=='retry':
             with s.connect() as db:
                 row=db.execute('SELECT * FROM media_jobs WHERE id=?',(int(data['id']),)).fetchone()
                 if not row or row['state']=='uploaded':raise ValueError('失败项不存在或已成功')
-                db.execute("UPDATE media_jobs SET state='pending',updated_at=? WHERE id=?",(time.time(),row['id']))
+                if row['state'] not in {'pending','processing'}:
+                    db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(f"media_retry_base:{row['id']}",json.dumps(row['attempts'])))
+                    db.execute("UPDATE media_jobs SET state='pending',updated_at=0 WHERE id=?",(row['id'],))
             result={'queued':True,'message':'已排队；绑定运行时处理，停止时保留待办'}
         elif resource=='uncertain' and op=='receipt':
             if not data.get('confirm'):raise ValueError('需要明确确认回执')
@@ -493,7 +715,7 @@ def main():
     p=argparse.ArgumentParser();p.add_argument('--config',type=Path,default=DEFAULT_CONFIG);p.add_argument('--db',type=Path)
     sub=p.add_subparsers(dest='command',required=True)
     for name in ('profiles','bindings','people','confirmations','media-failures','uncertain','setup'):
-        child=sub.add_parser(name);child.add_argument('action',nargs='?',default='list');child.add_argument('--op');child.add_argument('--id',type=int);child.add_argument('--data');child.add_argument('--name');child.add_argument('--profile-name');child.add_argument('--app-id');child.add_argument('--new-name');child.add_argument('--health',action='store_true');child.add_argument('--app-secret-stdin',action='store_true')
+        child=sub.add_parser(name);child.add_argument('action',nargs='?',default='list');child.add_argument('--op');child.add_argument('--id',type=int);child.add_argument('--data');child.add_argument('--name');child.add_argument('--profile-name');child.add_argument('--app-id');child.add_argument('--new-name');child.add_argument('--health',action='store_true');child.add_argument('--app-secret-stdin',action='store_true');child.add_argument('--query');child.add_argument('--binding-id',type=int);child.add_argument('--source-account')
     sub.add_parser('status');sv=sub.add_parser('serve');sv.add_argument('--port',type=int,default=0);sv.add_argument('--host',default='127.0.0.1')
     wd=sub.add_parser('watchdog');wd.add_argument('--interval',type=float,default=15.0);wd.add_argument('--once',action='store_true')
     au=sub.add_parser('autostart');au.add_argument('--register',action='store_true');au.add_argument('--unregister',action='store_true')
@@ -549,6 +771,13 @@ def main():
             if getattr(args,field,None) is not None:data[field]=getattr(args,field)
         if args.app_secret_stdin:data['app_secret']=sys.stdin.readline().rstrip('\n')
         if op in {'list','status'}:result=manager.get(args.command)
+        elif args.command=='people' and op=='search-feishu':
+            result=manager.get('people/search-feishu',{'profile':data.get('profile_name',''),
+                                                       'name':data.get('name',''),'q':args.query or data.get('query','')})
+        elif args.command=='people' and op=='search-wechat':
+            result=manager.get('people/search-wechat',{'binding_id':args.binding_id or data.get('binding_id'),
+                'source_account':args.source_account or data.get('source_account',''),
+                'q':args.query or data.get('query','')})
         else:
             data['op']={'check':'preflight' if args.command=='bindings' else 'check','link-wechat':'link_wechat','link-feishu':'link_feishu'}.get(op,op)
             if args.command=='setup' and op=='init' and not args.data:result=setup_init(args.config,store.path)

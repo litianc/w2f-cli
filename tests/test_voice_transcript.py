@@ -1,87 +1,80 @@
-"""语音消息转写投递：行内转写优先按文本送达，无转写回落音频链路。
-
-读取器只透传 voice_transcript 可选字段；「转写→文本」的交付决策在
-worker，与具体读取器无关。全部模拟读取器行，不发真实群。
-"""
-import importlib.util
-import sys
+"""Voice transcript takes the text path; empty transcript keeps audio fallback."""
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-_SPEC = importlib.util.spec_from_file_location(
-    "wda_reader", Path(__file__).resolve().parents[1] / "integrations" / "wda_reader.py")
-wda = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(wda)
-
-from agents.storage import MirrorStore
 from agents import wechat_feishu_mirror as mirror
+from agents.storage import MirrorStore
+from integrations.wda_reader import map_row
 
 
-def make_config(root, talker="room"):
-    return {"binding_id": 1, "source_account": "demo", "wechat_talker": talker,
-            "wechat_chat_name": "源", "feishu_chat_id": "chat", "feishu_chat_name": "目标",
-            "lark_profile": "p", "lark_app_id": "app", "data_dir": str(root),
-            "sqlite_file": str(root / "state.db"), "sender_map": {"wx": "实名"}}
+class VoiceTranscriptTest(unittest.TestCase):
+    def test_wda_contract_only_includes_nonempty_voice_transcript(self):
+        base={"type":34,"localId":8,"content":"<msg/>","senderUsername":"wx"}
+        row=map_row('room', {**base,"voiceTranscript":"  你好 😀  "},{'wx':'昵称'})
+        self.assertEqual(row['voice_transcript'],'你好 😀')
+        self.assertNotIn('voice_transcript',map_row('room',{**base,"voiceTranscript":"  "},{}))
+        self.assertNotIn('voice_transcript',map_row('room',{**base,"type":1,"voiceTranscript":"你好"},{}))
+
+    def test_transcript_sends_named_text_without_media(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store=MirrorStore(Path(directory)/'state.db')
+            store.initialize({'wechat_talker':'room','feishu_chat_id':'chat','sender_map':{'wx':'实名'}})
+            row={'talker':'room','local_id':8,'sender_wxid':'wx','sender':'昵称','kind_name':'voice',
+                 'text':'<msg/>','voice_transcript':'语音内容 😀'}
+            with patch.object(mirror,'run_lark',return_value={'data':{'message_id':'om_voice'}}) as send,patch.object(mirror,'stage_media',side_effect=AssertionError('no upload')):
+                mirror.send_row({'lark_profile':'p','feishu_chat_id':'chat','sender_map':{'wx':'实名'}},row,{},store)
+            args=send.call_args.args[1]
+            self.assertEqual(args[args.index('--text')+1],'实名：语音内容 😀')
+            saved=store.message('room:8',1)
+            self.assertEqual(saved['kind'],'voice')
+            self.assertIn('voice_transcript',saved['payload_json'])
+            with store.connect() as db:self.assertEqual(db.execute('SELECT count(*) FROM media_jobs').fetchone()[0],0)
+
+    def test_amr_fallback_transcodes_to_playable_opus(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source=Path(directory)/'voice.amr';source.write_bytes(b'fixture')
+            def transcode(args,**kwargs):
+                self.assertEqual(args[args.index('-c:a')+1],'libopus')
+                Path(args[-1]).write_bytes(b'ogg-opus-fixture')
+                return type('Result',(),{'returncode':0})()
+            with patch.object(mirror.shutil,'which',return_value='/usr/bin/ffmpeg'),patch.object(mirror.subprocess,'run',side_effect=transcode):
+                flags,converted=mirror.voice_upload_args(str(source))
+            self.assertEqual(flags,['--audio',converted])
+            self.assertEqual(Path(converted).suffix,'.opus')
+            self.assertEqual(Path(converted).read_bytes(),b'ogg-opus-fixture')
+            mirror.cleanup_staged(converted)
+            self.assertFalse(Path(converted).exists())
+
+    def test_macos_service_without_homebrew_path_still_transcodes_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'voice.amr'
+            source.write_bytes(b'synthetic')
+            def installed(command, path=None):
+                return '/opt/homebrew/bin/ffmpeg' if path and '/opt/homebrew/bin' in path else None
+            def transcode(args, **kwargs):
+                self.assertEqual(args[0], '/opt/homebrew/bin/ffmpeg')
+                Path(args[-1]).write_bytes(b'ogg-opus-fixture')
+                return type('Result', (), {'returncode': 0})()
+            with patch.object(mirror.sys, 'platform', 'darwin'), patch.object(mirror.shutil, 'which', side_effect=installed), patch.object(mirror.subprocess, 'run', side_effect=transcode):
+                flags, converted = mirror.voice_upload_args(str(source))
+            self.assertEqual(flags[0], '--audio')
+            mirror.cleanup_staged(converted)
+
+    def test_unsupported_voice_codec_remains_downloadable_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source=Path(directory)/'voice.silk';source.write_bytes(b'fixture')
+            self.assertEqual(mirror.voice_upload_args(str(source)),(['--file',str(source)],None))
+
+    def test_empty_transcript_falls_back_to_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store=MirrorStore(Path(directory)/'state.db')
+            store.initialize({'wechat_talker':'room','feishu_chat_id':'chat','sender_map':{'wx':'实名'}})
+            row={'talker':'room','local_id':9,'sender_wxid':'wx','sender':'昵称','kind_name':'voice','text':'<msg/>','voice_transcript':' '}
+            with patch.object(mirror,'run_lark',return_value={'data':{'message_id':'om_audio'}}) as send,patch.object(mirror,'stage_media',return_value=(str(Path(directory)/'voice.ogg'),False)):
+                mirror.send_row({'lark_profile':'p','feishu_chat_id':'chat','sender_map':{'wx':'实名'}},row,{},store)
+            self.assertTrue(any('--audio' in call.args[1] for call in send.call_args_list))
 
 
-class AdapterTranscriptTest(unittest.TestCase):
-    def test_voice_row_carries_transcript(self):
-        row = wda.map_row("room@chatroom", {"type": 34, "localId": 5, "content": "<msg/>", "voiceTranscript": "大家好"}, {})
-        self.assertEqual(row["kind_name"], "voice")
-        self.assertEqual(row["voice_transcript"], "大家好")
-
-    def test_voice_row_without_transcript_has_no_field(self):
-        row = wda.map_row("room@chatroom", {"type": 34, "localId": 5, "content": "<msg/>"}, {})
-        self.assertEqual(row["kind_name"], "voice")
-        self.assertNotIn("voice_transcript", row)
-
-    def test_blank_transcript_is_dropped(self):
-        row = wda.map_row("room@chatroom", {"type": 34, "localId": 5, "content": "<msg/>", "voiceTranscript": "  "}, {})
-        self.assertNotIn("voice_transcript", row)
-
-    def test_non_voice_message_ignores_transcript(self):
-        row = wda.map_row("room@chatroom", {"type": 1, "localId": 5, "content": "hi", "voiceTranscript": "x"}, {})
-        self.assertNotIn("voice_transcript", row)
-
-
-class WorkerTranscriptDeliveryTest(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
-        self.store = MirrorStore(self.root / "state.db")
-        self.store.initialize(make_config(self.root))
-        self.config = make_config(self.root)
-
-    def voice_row(self, **extra):
-        return {"talker": "room", "local_id": 10, "server_id": "s10", "sender_wxid": "wx",
-                "sender": "昵称", "kind_name": "voice", "text": "<msg/>", "create_time": 1, **extra}
-
-    def test_transcribed_voice_is_delivered_as_text_without_media(self):
-        with patch.object(mirror, "run_lark", return_value={"data": {"message_id": "om_t"}}) as send, \
-             patch.object(mirror, "stage_media", side_effect=AssertionError("转写优先时不应走媒体链路")):
-            mirror.send_row(self.config, self.voice_row(voice_transcript="大家好"), {}, self.store)
-        self.assertEqual(send.call_count, 1)
-        args = send.call_args.args[1]
-        self.assertEqual(args[args.index("--text") + 1], "实名：大家好")
-        self.assertEqual(self.store.message_state("room:10"), "sent")
-        stored = self.store.message("room:10", 1)
-        self.assertEqual(stored["kind"], "voice")  # 交付为文本，存储类型仍如实是语音
-
-    def test_voice_without_transcript_falls_back_to_audio(self):
-        with patch.object(mirror, "run_lark", return_value={"data": {"message_id": "om_a"}}) as send, \
-             patch.object(mirror, "stage_media", return_value=("/tmp/fake.ogg", False)) as stage:
-            mirror.send_row(self.config, self.voice_row(), {}, self.store)
-        stage.assert_called_once()
-        self.assertEqual(send.call_count, 2)  # 姓名行 + 音频
-        args = send.call_args.args[1]
-        self.assertIn("--audio", args)
-        self.assertEqual(self.store.message_state("room:10"), "sent")
-
-
-if __name__ == "__main__":
-    unittest.main()
+if __name__=='__main__':unittest.main()

@@ -13,12 +13,14 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import signal
 import shutil
 import subprocess
 import sys
 import threading
 import time
+import tempfile
 import urllib.request
 import xml.etree.ElementTree as ET
 from io import BytesIO
@@ -158,39 +160,80 @@ def notify_confirmation(config: dict[str, Any], store: MirrorStore, source_accou
     if group_names:
         text += f"，出现于：{group_names}"
     try:
-        run_lark({**config, "lark_profile": config.get("admin_profile") or "wechat-mirror"}, ["+messages-send", "--user-id", user_id, "--text", text, "--idempotency-key", f"mirror-confirm-{item['id']}"])
+        run_lark({**config, "lark_profile": config.get("admin_profile") or "wechat-mirror"}, ["+messages-send", "--user-id", user_id, "--text", text, "--idempotency-key", f"mirror-confirm-{item['id']}" + (f"-v{item['notification_generation']}" if item.get('notification_generation') else '')])
     except Exception as exc:
-        store.finish_confirmation_notification(int(item["id"]), error=safe_error(exc))
+        store.finish_confirmation_notification(int(item["id"]), error=safe_error(exc), generation=item.get("notification_generation",0))
         print(f"身份提醒发送失败 confirmation_id={item['id']}: {safe_error(exc)}", file=sys.stderr, flush=True)
     else:
-        store.finish_confirmation_notification(int(item["id"]))
+        store.finish_confirmation_notification(int(item["id"]), generation=item.get("notification_generation",0))
 
 
-def system_event_body(raw: str) -> str | None:
-    """渲染邀请/群事件类系统消息模板，避免 $占位$ 原样透出（#3）。
+def group_event_body(row: dict[str, Any], config: dict[str, Any], store: MirrorStore) -> str:
+    raw = str(row.get('text') or row.get('content') or '')
+    source = str(config.get('source_account') or 'default')
+    profile = str(config.get('lark_profile') or '')
 
-    微信库里模板形如 ``"$username$"邀请"$names$"加入了群聊``，真实成员以
-    「ID 显示名」对跟在模板后（$username$ 取第一个显示名，$names$ 取其余）。
-    返回渲染后的文本；不含占位符的普通系统消息返回 None（走原渲染）。
-    """
-    text = str(raw or "").strip()
-    matches = list(re.finditer(r"\$(\w+)\$", text))
-    if not matches:
-        return None
-    # 模板（含占位符后的中文后缀）与成员值以空白分界；无空白则整串是模板。
-    rest = text[matches[-1].end():]
-    boundary = re.search(r"\s", rest)
-    template = text if boundary is None else text[:matches[-1].end() + boundary.start()]
-    tail = [] if boundary is None else rest[boundary.start():].split()
-    # 「ID 显示名」成对（偶数个）取显示名；奇数个视为纯显示名列表。
-    names = (tail[1::2] if len(tail) % 2 == 0 else tail) if tail else []
-    def substitute(match):
-        if match.group(1) == "username":
-            return names[0] if names else "成员"
-        if match.group(1) == "names":
-            return "、".join(names[1:]) if len(names) > 1 else "成员"
-        return "成员"
-    return re.sub(r"\$(\w+)\$", substitute, template)
+    def member(sender_id, nickname):
+        identity = store.resolve_sender(source, sender_id)
+        name = str((identity or {}).get('confirmed_name') or nickname or '成员')
+        # Raw WeChat IDs must never appear as a substitute for a display name.
+        if name == sender_id or name.endswith('@chatroom'):
+            name = '成员'
+        mention = store.mention_identity(source, sender_id, profile)
+        if mention and str(mention['open_id']).startswith('ou_'):
+            return f'<at user_id="{mention["open_id"]}">{html.escape(name)}</at>'
+        return html.escape(name)
+
+    # macOS may retain the room prefix and the full sysmsgtemplate XML. Role
+    # names in link_list, not its ordering or whitespace, identify the members.
+    xml_start = raw.find('<sysmsg')
+    if xml_start >= 0:
+        try:
+            root = ET.fromstring(raw[xml_start:].strip())
+        except ET.ParseError:
+            return '群成员变更（姓名暂不可用）'
+        content = root.find('.//content_template')
+        template = content.findtext('template') if content is not None else None
+        if not template:
+            return '群成员变更（姓名暂不可用）'
+        values = {}
+        for link in content.findall('./link_list/link'):
+            role = link.get('name', '')
+            if link.get('hidden') == '1' or link.get('type') == 'link_revoke':
+                values[role] = ''
+                continue
+            members = link.findall('./memberlist/member')
+            if members:
+                values[role] = '、'.join(member(
+                    (item.findtext('username') or '').strip(),
+                    (item.findtext('nickname') or '').strip(),
+                ) for item in members)
+        # The local reader's "you" is the WeChat account owner, not the bot
+        # or the Feishu reader. Do not guess an inviter ID from a display name.
+        template = re.sub(r'^你(?=邀请|将)', '本机微信用户', template)
+        body = re.sub(r'\$([^$]+)\$', lambda match: values.get(
+            match.group(1), '' if match.group(1) == 'revoke' else '成员'), html.escape(template, quote=False))
+        return body.strip() or '群成员变更（姓名暂不可用）'
+
+    # Compatibility with reader versions that flatten members into ID/name
+    # pairs after the invitation/removal template.
+    invite = re.search(r'\$username\$.*?邀请.*?\$names\$.*?加入了群聊', raw, re.S)
+    removal = re.search(r'\$username\$.*?将.*?\$names\$.*?移出了群聊', raw, re.S)
+    marker = invite or removal
+    if not marker:
+        return '群成员变更（姓名暂不可用）' if ('$username$' in raw or '$names$' in raw) else (raw or '[群成员变更]')
+    tokens = raw[marker.end():].strip().split()
+    pairs = [(tokens[i], tokens[i + 1]) for i in range(0, len(tokens) - 1, 2)]
+    inviter = member(*pairs[0]) if pairs else '成员'
+    invited = '、'.join(member(*pair) for pair in pairs[1:]) if len(pairs) > 1 else '成员'
+    return f'{inviter} 邀请 {invited} 加入了群聊' if invite else f'{inviter} 将 {invited} 移出了群聊'
+
+
+def is_group_event(row: dict[str, Any]) -> bool:
+    raw = str(row.get('text') or row.get('content') or '')
+    return (('<sysmsg' in raw and 'sysmsgtemplate' in raw) or '$username$' in raw or '$names$' in raw or
+            (str(row.get('sender_wxid') or '').endswith('@chatroom') and
+             str(row.get('kind_name') or '').lower() in {'system', 'sys', 'group_event'}))
 
 
 def clean_body(row: dict[str, Any]) -> str:
@@ -208,6 +251,10 @@ def clean_body(row: dict[str, Any]) -> str:
     if kind in {"image", "video", "file", "voice", "audio", "media"}:
         labels = {"image": "图片", "video": "视频", "file": "文件", "voice": "语音", "audio": "语音", "media": "媒体"}
         return f"[{labels.get(kind, '媒体')}]"
+    from integrations.article_shares import article_share, article_body
+    article = article_share(row)
+    if article is not None:
+        return article_body(article)
     if raw.startswith("<"):
         # Keep useful fields from app messages while never forwarding raw XML.
         title = re.search(r"<title>(.*?)</title>", raw, re.S)
@@ -324,31 +371,77 @@ def quote_info(row: dict[str, Any]) -> dict[str, str] | None:
         return None
 
 
+def sticker_metadata(row: dict[str, Any]) -> dict[str, str]:
+    # Some readers expose a display placeholder in text and the XML in content.
+    for field in ('content', 'text'):
+        raw = str(row.get(field) or '')
+        start = raw.find('<')
+        if start < 0:
+            continue
+        try:
+            root = ET.fromstring(raw[start:])
+            node = root if root.tag == 'emoji' else root.find('.//emoji')
+            if node is not None:
+                return {k.lower(): v for k, v in node.attrib.items()}
+        except ET.ParseError:
+            continue
+    return {}
+
+
+def sticker_sources(row: dict[str, Any]) -> list[tuple[str, str]]:
+    info = sticker_metadata(row)
+    candidates = []
+    for field in ('cdnurl', 'externurl'):
+        url = info.get(field, '')
+        if url.startswith(('http://', 'https://')):
+            digest = info.get('externmd5') if field == 'externurl' else info.get('md5')
+            candidates.append((url, str(digest or info.get('md5') or '').lower()))
+    return list(dict.fromkeys(candidates))
+
+
 def sticker_url(row: dict[str, Any]) -> str | None:
-    """Extract a short-lived WeChat CDN URL without logging its query string."""
+    sources = sticker_sources(row)
+    return sources[0][0] if sources else None
+
+
+def historical_sticker_sources(row: dict[str, Any]) -> list[tuple[str, str]]:
+    """Recover URLs for precisely the same sticker in this group, bounded to 100 hits."""
+    digest = sticker_metadata(row).get('md5', '').lower()
+    talker = str(row.get('talker') or '')
+    if not talker or not re.fullmatch(r'[0-9a-f]{32}', digest):
+        return []
+    try:
+        proc = subprocess.run([str(WECHAT_READER), 'search', digest, '--talker', talker,
+                               '--limit', '100', '--include-text', '--max-text-chars', '16384'],
+                              cwd=ROOT, capture_output=True, text=True, encoding='utf-8', timeout=45)
+        if proc.returncode:
+            raise CliError('sticker_lookup_failed: 读取器未能查询原始表情记录')
+        value = json.loads(proc.stdout)
+        if value.get('ok') is False:
+            raise CliError('sticker_lookup_failed: 读取器未能查询原始表情记录')
+        found = []
+        for candidate in value.get('data', value).get('messages', []):
+            if str(candidate.get('talker') or '') != talker:
+                continue
+            if sticker_metadata(candidate).get('md5', '').lower() != digest:
+                continue
+            found.extend(sticker_sources(candidate))
+        return list(dict.fromkeys(found))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        raise CliError('sticker_lookup_failed: 原始表情记录查询失败或超时') from None
+
+
+def media_url(row: dict[str, Any]) -> str | None:
+    """Extract a downloadable URL from common WeChat XML media fields."""
     raw = str(row.get("text") or row.get("content") or "")
-    match = re.search(r'(?:cdnurl|externurl)\s*=\s*["\']([^"\']+)', raw, re.I)
-    return html.unescape(match.group(1)) if match else None
-
-
-def media_url(row: dict[str, Any], kind: str | None = None) -> str | None:
-    """Extract a downloadable URL from common WeChat XML media fields.
-
-    图片消息的缩略图在 cdnurl，大图在 cdnbigimgurl / cdnmidimgurl（#2）；
-    仅图片 kind 时优先取大图字段。
-    """
-    raw = str(row.get("text") or row.get("content") or "")
-    fields = ("cdnurl", "url", "videourl", "voiceurl", "fileurl", "externurl")
-    if kind == "image":
-        fields = ("cdnbigimgurl", "cdnmidimgurl") + fields
-    for field in fields:
+    for field in ("cdnurl", "url", "videourl", "voiceurl", "fileurl", "externurl"):
         match = re.search(rf'{re.escape(field)}\s*=\s*["\']([^"\']+)', raw, re.I)
         if match:
             return html.unescape(match.group(1))
     return None
 
 
-def reader_media_result(row: dict[str, Any]) -> tuple[list[Path], bool]:
+def reader_media_result(row: dict[str, Any], *, preview_only: bool = False) -> tuple[list[Path], bool]:
     """Ask the read-only reader for local resources belonging to one message.
 
     Returns (paths, thumbnail_only); the optional contract field
@@ -359,31 +452,40 @@ def reader_media_result(row: dict[str, Any]) -> tuple[list[Path], bool]:
     local_id = str(row.get("local_id") or "")
     if not talker or not local_id:
         return [], False
-    cmd = [str(WECHAT_READER), "media", "--talker", talker, "--local-id", local_id, "--include-local-paths", "true"]
+    # Rion uses a boolean flag. Its positional chat argument silently accepts
+    # a trailing "true", which makes the lookup return an empty resource list.
+    cmd = [str(WECHAT_READER), "media", "--talker", talker, "--local-id", local_id, "--include-local-paths"]
     server_id = str(row.get("server_id") or "")
     if server_id:
         cmd.extend(["--server-id", server_id])
     try:
         proc = subprocess.run(cmd, cwd=ROOT, text=True, encoding="utf-8", capture_output=True, timeout=45)
+        if proc.returncode == 2 and "--include-local-paths" in proc.stderr and "expected one argument" in proc.stderr:
+            # Older WDA adapters require the explicit value. Keep deployed
+            # Windows readers working until they are updated.
+            legacy = list(cmd)
+            legacy.insert(legacy.index("--include-local-paths") + 1, "true")
+            proc = subprocess.run(legacy, cwd=ROOT, text=True, encoding="utf-8", capture_output=True, timeout=45)
         if proc.returncode:
             return [], False
         payload = json.loads(proc.stdout)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return [], False
-    found = []
-    thumbnail_only = False
+    originals, previews = [], []
     for resource in payload.get('data', payload).get('resources', []):
-        thumbnail_only = thumbnail_only or bool(resource.get('thumbnail_only'))
-        for value in resource.get('local_paths', []):
+        candidates = previews if resource.get('thumbnail_only') else originals
+        paths = list(resource.get('local_paths') or [])
+        if resource.get('local_path'):
+            paths.append(resource['local_path'])
+        for value in paths:
             path = Path(value).expanduser()
             if path.is_file():
-                found.append(path)
-        # Older reader versions used one local_path.
-        if resource.get('local_path'):
-            path = Path(resource['local_path']).expanduser()
-            if path.is_file():
-                found.append(path)
-    return list(dict.fromkeys(found)), thumbnail_only
+                candidates.append(path)
+    # Explicit quality is stronger evidence than compressed file size. Do not
+    # label an original degraded merely because a preview also exists.
+    if preview_only:
+        return list(dict.fromkeys(previews)), bool(previews)
+    return list(dict.fromkeys(originals or previews)), bool(previews and not originals)
 
 
 def reader_media_paths(row: dict[str, Any]) -> list[Path]:
@@ -447,40 +549,90 @@ def media_doctor(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def stage_media(row: dict[str, Any], kind: str) -> tuple[str | None, bool]:
-    """Stage a reader-provided local file, then fall back to a normal URL.
+def stage_voice_resource(row, media_dir, namespace):
+    """Fallback for Rion versions exposing voice BLOBs outside hardlink.db."""
+    import base64
+    talker = str(row.get('talker') or '')
+    if not talker or not row.get('create_time'):
+        return None
+    args = [str(WECHAT_READER),'voice-resource','--talker',talker,
+            '--local-id',str(int(row.get('local_id') or 0)),
+            '--server-id',str(int(row.get('server_id') or 0)),
+            '--create-time',str(int(row['create_time']))]
+    try:
+        result = subprocess.run(args,cwd=ROOT,capture_output=True,text=True,encoding='utf-8',timeout=45)
+        if result.returncode:
+            return None
+        value = json.loads(result.stdout).get('data',{})
+        if value.get('contract')!='voice_resource_v1' or value.get('talker')!=talker or int(value.get('local_id',-1))!=int(row['local_id']):
+            return None
+        if value.get('extension') not in {'.silk','.amr'} or len(value.get('base64',''))>24*1024*1024:
+            return None
+        data = base64.b64decode(value['base64'],validate=True)
+        if not data.startswith((b'\x02#!SILK_V3',b'#!SILK_V3',b'#!AMR')):
+            return None
+        media_dir.mkdir(parents=True,exist_ok=True)
+        path = media_dir / f"{namespace}-{int(row['local_id'])}{value['extension']}"
+        fd = os.open(path,os.O_WRONLY|os.O_CREAT|os.O_TRUNC|getattr(os,'O_NOFOLLOW',0),0o600)
+        with os.fdopen(fd,'wb') as handle:
+            if hasattr(os,'fchmod'):os.fchmod(handle.fileno(),0o600)
+            handle.write(data)
+        return str(path)
+    except (OSError,ValueError,subprocess.TimeoutExpired):
+        return None
 
-    Returns (path, thumbnail_only). When several local candidates exist the
-    largest file wins: the desktop WeChat cache often keeps a thumbnail next
-    to the original, and size reliably prefers the original.
+
+def stage_media(row: dict[str, Any], kind: str) -> tuple[str | None, bool]:
+    """Prefer explicit originals; stage a preview if all originals are unusable.
+
+    Size only orders candidates of the same quality. Preview resources are
+    queried again on staging failure so normal delivery needs one reader call.
+    Upload/permission failures do not silently downgrade the selected image.
     """
     local_candidates, thumbnail_only = reader_media_result(row)
     if not local_candidates:
         local_candidates = wechat_cache_paths(row)
-    try:
-        local_candidates = sorted(local_candidates, key=lambda item: item.stat().st_size, reverse=True)
-    except OSError:
-        pass
-    source_path = local_candidates[0] if local_candidates else None
     media_dir = Path(os.environ.get("W2F_MEDIA_DIR", os.environ.get("CHZ_MEDIA_DIR", str(row.get("media_dir") or MEDIA_DIR)))).expanduser()
     namespace = str(row.get("binding_id",1)) + "-" + hashlib.sha1(str(row.get("talker") or "default").encode()).hexdigest()[:10]
     local_id = int(row.get("local_id") or 0)
-    if source_path:
+    if not local_candidates and kind in {'voice','audio'}:
+        voice = stage_voice_resource(row,media_dir,namespace)
+        if voice:
+            return voice,False
+    last_error = None
+    try_previews = bool(local_candidates) and not thumbnail_only and kind == 'image'
+    while local_candidates:
         try:
-            media_dir.mkdir(parents=True, exist_ok=True)
-            suffix = source_path.suffix.lower() or {"image": ".jpg", "video": ".mp4", "voice": ".ogg", "file": ".bin"}.get(kind, ".bin")
-            path = media_dir / f"{namespace}-{local_id}{suffix}"
-            if kind == "image" and suffix == ".dat":
-                if not decode_wechat_dat(source_path, path):
-                    raise CliError('decode_failed: 无法解码本机图片资源')
-                path = next((media_dir / f"{namespace}-{local_id}{ext}" for ext in (".png",".jpg",".gif",".webp") if (media_dir / f"{namespace}-{local_id}{ext}").is_file()), path)
-            else:
-                shutil.copy2(source_path, path)
-            return str(path), thumbnail_only
-        except OSError as exc:
-            print(f"本地媒体暂存失败 local_id={local_id}: {type(exc).__name__}", file=sys.stderr, flush=True)
-    url = media_url(row, kind=kind)
+            local_candidates = sorted(local_candidates, key=lambda item: item.stat().st_size, reverse=True)
+        except OSError:
+            pass
+        for source_path in local_candidates:
+            try:
+                if source_path.stat().st_size == 0:
+                    raise CliError('decode_failed: 本机媒体资源为空')
+                media_dir.mkdir(parents=True, exist_ok=True)
+                suffix = source_path.suffix.lower() or {"image": ".jpg", "video": ".mp4", "voice": ".ogg", "file": ".bin"}.get(kind, ".bin")
+                path = media_dir / f"{namespace}-{local_id}{suffix}"
+                if kind == "image" and suffix == ".dat":
+                    if not decode_wechat_dat(source_path, path, allow_macos_derivation=row.get('macos_image_key_derivation') is True):
+                        raise CliError('decode_failed: 无法解码本机图片资源')
+                    path = next((media_dir / f"{namespace}-{local_id}{ext}" for ext in (".png",".jpg",".gif",".webp") if (media_dir / f"{namespace}-{local_id}{ext}").is_file()), path)
+                else:
+                    shutil.copy2(source_path, path)
+                return str(path), thumbnail_only
+            except CliError as exc:
+                last_error = exc
+            except OSError as exc:
+                last_error = CliError('resource_missing: 本地媒体暂存失败 ' + type(exc).__name__)
+        if try_previews:
+            local_candidates, thumbnail_only = reader_media_result(row, preview_only=True)
+            try_previews = False
+        else:
+            break
+    url = media_url(row)
     if not url or not url.startswith(("http://", "https://")):
+        if last_error:
+            raise last_error
         return None, thumbnail_only
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "wechat-feishu-mirror/1.0"})
@@ -501,57 +653,134 @@ def stage_media(row: dict[str, Any], kind: str) -> tuple[str | None, bool]:
         raise CliError('download_failed: 媒体下载失败 '+type(exc).__name__) from None
 
 
-def stage_sticker(row: dict[str, Any]) -> str | None:
-    """Download and normalize a WeChat sticker for Feishu image upload.
-
-    WeChat's CDN commonly returns ``application/octet-stream`` even for GIF or
-    WebP data, so Pillow detects the format from the bytes. The normalized
-    image fits a 200x200 box without upscaling, matching the usual WeChat chat
-    bubble size while preserving aspect ratio and animation when possible.
-    """
-    url = sticker_url(row)
-    if not url:
-        return None
+def normalize_sticker(payload: bytes, row: dict[str, Any]) -> str:
+    if len(payload) > STICKER_MAX_BYTES:
+        raise CliError('resource_too_large: 表情超过 15 MB')
     try:
-        request = urllib.request.Request(url, headers={"User-Agent": "wechat-feishu-mirror/1.0"})
-        with urllib.request.urlopen(request, timeout=15) as response:
-            payload = response.read(STICKER_MAX_BYTES + 1)
-        if len(payload) > STICKER_MAX_BYTES:
-            return None
-        source = Image.open(BytesIO(payload))
-        source.load()
-        source_format = (source.format or "PNG").upper()
-        frame_count = getattr(source, "n_frames", 1)
-        frames: list[Image.Image] = []
-        durations: list[int] = []
-        for index in range(frame_count):
-            source.seek(index)
-            frame = source.convert("RGBA")
-            frame.thumbnail((STICKER_MAX_PX, STICKER_MAX_PX), Image.Resampling.LANCZOS)
-            frames.append(frame.copy())
-            durations.append(int(source.info.get("duration", 100) or 100))
-        if not frames:
-            return None
-
-        local_id = int(row.get("local_id") or 0)
-        namespace = str(row.get("binding_id",1)) + "-" + hashlib.sha1(str(row.get("talker") or "default").encode()).hexdigest()[:10]
-        sticker_dir = Path(row.get("media_dir") or STICKER_DIR) / "stickers"
-        sticker_dir.mkdir(parents=True, exist_ok=True)
-        # GIF preserves animated stickers. Other formats are emitted as PNG
-        # because Feishu's image upload path accepts it consistently.
-        if source_format == "GIF" and len(frames) > 1:
-            path = sticker_dir / f"{namespace}-{local_id}.gif"
-            frames[0].convert("P", palette=Image.Palette.ADAPTIVE).save(
-                path, save_all=True, append_images=[f.convert("P", palette=Image.Palette.ADAPTIVE) for f in frames[1:]],
-                duration=durations, loop=int(source.info.get("loop", 0) or 0), disposal=2, optimize=True,
-            )
+        with Image.open(BytesIO(payload)) as source:
+            frames, durations = [], []
+            frame_count = getattr(source, 'n_frames', 1)
+            if frame_count > 500 or source.width * source.height * frame_count > 100_000_000:
+                raise CliError('resource_too_large: 表情帧数或解码尺寸过大')
+            loop = int(source.info.get('loop', 0) or 0)
+            for index in range(frame_count):
+                source.seek(index)
+                frame = source.convert('RGBA')
+                frame.thumbnail((STICKER_MAX_PX, STICKER_MAX_PX), Image.Resampling.LANCZOS)
+                frames.append(frame.copy())
+                durations.append(int(source.info.get('duration', 100) or 100))
+        namespace = str(row.get('binding_id', 1)) + '-' + hashlib.sha1(str(row.get('talker') or 'default').encode()).hexdigest()[:10]
+        directory = Path(row.get('media_dir') or STICKER_DIR) / 'stickers'
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{namespace}-{int(row.get('local_id') or 0)}.{('gif' if len(frames) > 1 else 'png')}"
+        if len(frames) > 1:
+            frames[0].save(path, format='GIF', save_all=True, append_images=frames[1:],
+                           duration=durations, loop=loop, disposal=2, optimize=False)
         else:
-            path = sticker_dir / f"{namespace}-{local_id}.png"
-            frames[0].save(path, format="PNG", optimize=True)
+            frames[0].save(path, format='PNG', optimize=True)
         return str(path)
-    except Exception as exc:
-        print(f"贴图归一化失败 local_id={row.get('local_id')}: {type(exc).__name__}", file=sys.stderr, flush=True)
+    except (OSError, ValueError, Image.DecompressionBombError):
+        raise CliError('sticker_decode_failed: 表情资源不能解码为图片') from None
+
+
+def stage_sticker(row: dict[str, Any]) -> str | None:
+    """Try message URLs/local resources, then recover the same digest from history."""
+    tried = set()
+    errors = []
+
+    def download(candidates):
+        for url, digest in candidates:
+            if url in tried:
+                continue
+            tried.add(url)
+            try:
+                request = urllib.request.Request(url, headers={'User-Agent': 'wechat-feishu-mirror/1.0'})
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    payload = response.read(STICKER_MAX_BYTES + 1)
+                if len(payload) > STICKER_MAX_BYTES:
+                    raise CliError('resource_too_large: 表情超过 15 MB')
+                if re.fullmatch(r'[0-9a-f]{32}', digest) and hashlib.md5(payload).hexdigest() != digest:
+                    raise CliError('sticker_digest_mismatch: 下载内容与原表情摘要不一致')
+                return normalize_sticker(payload, row)
+            except CliError as exc:
+                errors.append(exc)
+            except Exception:
+                errors.append(CliError('sticker_download_failed: 表情下载失败'))
         return None
+
+    staged = download(sticker_sources(row))
+    if staged:
+        return staged
+    digest = sticker_metadata(row).get('md5', '').lower()
+    for path in reader_media_paths(row):
+        try:
+            if path.stat().st_size > STICKER_MAX_BYTES:
+                continue
+            payload = path.read_bytes()
+            if re.fullmatch(r'[0-9a-f]{32}', digest) and hashlib.md5(payload).hexdigest() != digest:
+                continue
+            return normalize_sticker(payload, row)
+        except (OSError, CliError):
+            continue
+    try:
+        staged = download(historical_sticker_sources(row))
+        if staged:
+            return staged
+    except CliError as exc:
+        errors.append(exc)
+    if errors:
+        raise errors[-1]
+    raise CliError('sticker_resource_missing: 当前消息及本群历史中未找到可用表情资源')
+
+
+def ffmpeg_executable() -> str | None:
+    """Respect PATH, then macOS package locations for GUI-launched services."""
+    encoder = shutil.which('ffmpeg')
+    if not encoder and sys.platform == 'darwin':
+        encoder = shutil.which('ffmpeg', path='/opt/homebrew/bin:/usr/local/bin')
+    return encoder
+
+
+def voice_upload_args(path: str) -> tuple[list[str], str | None]:
+    """Prefer a playable Feishu voice message; preserve unsupported audio as a file."""
+    source = Path(path)
+    def private_output(suffix):
+        fd,name=tempfile.mkstemp(prefix=source.stem+'-decode-',suffix=suffix,dir=source.parent)
+        os.close(fd)
+        return Path(name)
+    if source.suffix.lower() in {'.opus', '.ogg'}:
+        return ['--audio', path], None
+    if source.suffix.lower() in {'.silk','.slk'}:
+        encoder = ffmpeg_executable()
+        if encoder:
+            pcm = private_output('.pcm');converted = private_output('.opus')
+            try:
+                decoded = subprocess.run([sys.executable,'-m','agents.voice_codec',str(source),str(pcm)],
+                    cwd=ROOT,capture_output=True,timeout=30)
+                if decoded.returncode==0 and pcm.is_file() and pcm.stat().st_size:
+                    encoded = subprocess.run([encoder,'-v','error','-y','-f','s16le','-ar','24000','-ac','1',
+                        '-i',str(pcm),'-c:a','libopus','-b:a','24k',str(converted)],capture_output=True,timeout=30)
+                    if encoded.returncode==0 and converted.is_file() and converted.stat().st_size:
+                        return ['--audio',str(converted)],str(converted)
+            except (OSError,subprocess.TimeoutExpired):
+                pass
+            finally:
+                cleanup_staged(str(pcm))
+            cleanup_staged(str(converted))
+    if source.suffix.lower() in {'.amr', '.aac', '.m4a', '.mp3', '.wav'}:
+        encoder = ffmpeg_executable()
+        if encoder:
+            converted = private_output('.opus')
+            try:
+                result = subprocess.run([encoder, '-v', 'error', '-y', '-i', str(source),
+                                         '-vn', '-c:a', 'libopus', '-b:a', '24k', str(converted)],
+                                        capture_output=True, timeout=60)
+                if result.returncode == 0 and converted.is_file() and converted.stat().st_size:
+                    return ['--audio', str(converted)], str(converted)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            cleanup_staged(str(converted))
+    return ['--file', path], None
 
 
 def cleanup_staged(path: str | None) -> None:
@@ -563,28 +792,20 @@ def cleanup_staged(path: str | None) -> None:
         pass
 
 
-def decode_wechat_dat(source: Path, destination: Path) -> bool:
-    """Decode common one-byte-XOR WeChat image .dat files conservatively."""
+def decode_wechat_dat(source: Path, destination: Path, *, allow_macos_derivation=False) -> bool:
+    from agents.media_images import decode_dat, ImageResourceError
     try:
-        payload = source.read_bytes()
-    except OSError:
-        return False
-    signatures = ((b"\xff\xd8\xff", ".jpg"), (b"\x89PNG\r\n\x1a\n", ".png"), (b"GIF8", ".gif"), (b"RIFF", ".webp"))
-    for signature, extension in signatures:
-        if not payload:
-            break
-        key = payload[0] ^ signature[0]
-        decoded = bytes(byte ^ key for byte in payload)
-        if not decoded.startswith(signature):
-            continue
-        try:
-            image = Image.open(BytesIO(decoded))
-            image.verify()
-        except Exception:
-            continue
+        decoded = decode_dat(source, allow_macos_derivation=allow_macos_derivation)
+        with Image.open(BytesIO(decoded)) as image:
+            extension = {'JPEG': '.jpg', 'PNG': '.png', 'GIF': '.gif', 'WEBP': '.webp'}.get(image.format)
+        if not extension:
+            return False
         destination.with_suffix(extension).write_bytes(decoded)
         return True
-    return False
+    except ImageResourceError as exc:
+        raise CliError(str(exc)) from None
+    except OSError:
+        return False
 
 
 def message_key(row: dict[str, Any]) -> str:
@@ -666,7 +887,12 @@ def forward_body(row, config, store):
     def render(records, prefix=''):
         lines=[]
         for i,item in enumerate(records):
-            name,_ = resolve_name(store, config, item.get('sender_id',''), item.get('sender',''), f"{message_key(row)}:forward:{prefix}{i}")
+            from integrations.forward_records import stable_sender_id
+            sender_id = stable_sender_id(item.get('sender_id'))
+            if sender_id:
+                name,_ = resolve_name(store, config, sender_id, item.get('sender',''), f"{message_key(row)}:forward:{prefix}{i}")
+            else:
+                name = item.get('sender') or '未知发言人'
             lines.append(f"{name}：{item.get('body') or '[转发记录]'}")
             if item.get('children'):
                 lines.extend('  '+line for line in render(item['children'], prefix+str(i)+'.'))
@@ -674,31 +900,42 @@ def forward_body(row, config, store):
     return '\n'.join(render(items)) if items else '[转发聊天记录内容暂不可用]'
 
 
+def send_article_cover(store, message, plan, text_result, send):
+    article = plan.get('article') or {}
+    cover = article.get('cover_url')
+    if not cover or not article.get('url'):
+        return False
+    try:
+        # Use the existing CLI upload and persisted delivery receipts. Keeping
+        # the cover attached to its article also makes manual repair unambiguous.
+        send('article-cover', ['+messages-reply', '--message-id', text_result['data']['message_id'], '--image', cover])
+        store.add_media_job(message['id'], 'article_cover', None, None, 'uploaded')
+        return False
+    except (CliError, DeliveryUncertain) as exc:
+        # The article text already has a receipt. Optional cover uncertainty
+        # stays visible for reconciliation without blocking subsequent messages.
+        uncertain = isinstance(exc, DeliveryUncertain) or exc.uncertain
+        store.add_media_job(message['id'], 'article_cover', None, None, 'manual' if uncertain else 'placeholder', safe_error(exc))
+        return True
+
+
 def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any], store: MirrorStore) -> None:
     key = message_key(row); bid = int(config.get('binding_id',1))
     kind = str(row.get('kind_name') or 'text')
-    transcript = str(row.get('voice_transcript') or '').strip() if kind in {'voice','audio'} else ''
     store.upsert_message(key,row,kind,binding_id=bid,source_account=str(config.get('source_account','default')))
     message = store.message(key,bid)
     if message['state'] in {'sent','placeholder'} and not config.get('_retry_media'):
         return
-    if transcript:
-        # 转写优先（Spec P1）：行内转写就是这条语音的文本形态，按文本投递，
-        # 不再进入媒体链路；存储类型保持 voice 如实记录来源。
-        row = {**row, 'kind_name': 'text', 'text': transcript}
-        kind = 'text'
     if config.get('_guard') and config.get('_check_profile'):
         from agents.manage import profile_list
         profile_list(store)
     check_control(config,store)
     # Freeze attribution on the first send attempt so a partially delivered
-    # message does not change names when it resumes. 群事件类系统消息没有
-    # 个人发送者：不进入实名解析，来源统一标「群事件」（#3）。
-    event_text = system_event_body(str(row.get('text') or row.get('content') or ''))
-    if event_text:
-        name, person = '群事件', None
-    elif str(message.get('idempotency_key') or '').startswith('wx-'):
+    # message does not change names when it resumes.
+    if str(message.get('idempotency_key') or '').startswith('wx-'):
         name, person = message['sender_name'], message.get('sender_person_id')
+    elif is_group_event(row):
+        name, person = '群事件', None
     else:
         name,person = resolve_name(store,config,str(row.get('sender_wxid') or ''),str(row.get('sender') or ''),key)
     store.mark_message(key,'processing',binding_id=bid,sender_name=name,sender_person_id=person,idempotency_key=delivery_key(config,key,'message'))
@@ -709,7 +946,10 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
         target=['+messages-reply','--message-id',message['feishu_message_id']]
     placeholder = False
     try:
-        if kind in {'sticker','emoji','image','video','file','voice','audio','media'}:
+        transcript = str(row.get('voice_transcript') or row.get('voiceTranscript') or '').strip()
+        if kind in {'voice','audio'} and transcript:
+            result=send('text-0',target+['--text',f'{name}：{transcript}'])
+        elif kind in {'sticker','emoji','image','video','file','voice','audio','media'}:
             # A saved receipt lets an upload survive a crash after the file was
             # deleted, without attempting to download an expired URL again.
             sent_media = store.delivery(message['id'],'media')
@@ -721,7 +961,8 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
                 result = {'data':{'message_id':fallback['feishu_message_id']}}; placeholder=True
             else:
                 label = {'sticker':'表情','emoji':'表情','image':'图片','video':'视频','file':'文件','voice':'语音','audio':'语音'}.get(kind,'媒体')
-                enriched = {**row,'binding_id':bid,'media_dir':config.get('media_dir', str(MEDIA_DIR))}
+                enriched = {**row,'binding_id':bid,'media_dir':config.get('media_dir', str(MEDIA_DIR)),
+                            'macos_image_key_derivation':config.get('macos_image_key_derivation') is True}
                 try:
                     if kind in {'sticker','emoji'}:
                         media_input,thumbnail_only = stage_sticker(enriched),False
@@ -734,13 +975,17 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
                         send('name',target+['--text',f'{name}：{note}'])
                     flag='--image' if kind in {'image','sticker','emoji'} else '--file'
                     media_args = [flag,media_input]
+                    converted_voice=None
                     if kind=='video':
                         cover = video_cover(Path(media_input))
                         if cover:
                             media_args=['--video',media_input,'--video-cover',str(cover)]
-                    elif kind in {'audio','voice'} and Path(media_input).suffix in {'.opus','.ogg'}:
-                        media_args=['--audio',media_input]
-                    result=send('media',target+media_args)
+                    elif kind in {'audio','voice'}:
+                        media_args,converted_voice=voice_upload_args(media_input)
+                    try:
+                        result=send('media',target+media_args)
+                    finally:
+                        cleanup_staged(converted_voice)
                     store.add_media_job(message['id'],kind,None,media_input,'uploaded')
                     cleanup_staged(media_input)
                     if kind=='video' and cover: cleanup_staged(str(cover))
@@ -753,7 +998,7 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
             plan_key=f'render:{message["id"]}'
             plan=store.setting(plan_key)
             if not plan:
-                body = event_text or (forward_body(row,config,store) if is_forward_row(row) else clean_body(row))
+                body = group_event_body(row,config,store) if is_group_event(row) else (forward_body(row,config,store) if is_forward_row(row) else clean_body(row))
                 quote=quote_info(row)
                 parent=store.find_message_by_server_id(bid,quote['server_id']) if quote and quote.get('server_id') else None
                 if quote and parent and parent.get('feishu_message_id'):
@@ -771,10 +1016,14 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
                 total=len(raw_parts)
                 parts=[f'{name}转发聊天记录（第 {i}/{total} 段）\n{part}' for i,part in enumerate(raw_parts,1)] if is_forward_row(row) else [f'{name}：{part}' for part in raw_parts]
                 plan={'target':target,'parts':parts,'placeholder':is_forward_row(row) and body=='[转发聊天记录内容暂不可用]'}
+                from integrations.article_shares import article_share
+                if not is_forward_row(row) and not is_group_event(row) and not quote:
+                    plan['article'] = article_share(row)
                 store.save_setting(plan_key,plan)
             for index,part in enumerate(plan['parts']):
                 result=send(f'text-{index}',plan['target']+['--text',part])
-            placeholder=plan['placeholder']
+            cover_missing=send_article_cover(store,message,plan,result,send)
+            placeholder=plan['placeholder'] or cover_missing
         store.mark_message(key,'placeholder' if placeholder else 'sent',binding_id=bid,feishu_message_id=message['feishu_message_id'] if config.get('_retry_media') else str(result['data']['message_id']))
     except Exception as exc:
         store.mark_message(key,'failed',binding_id=bid,error=safe_error(exc))
@@ -783,17 +1032,18 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
 
 
 def video_cover(path):
-    if not shutil.which('ffmpeg'):
+    encoder = ffmpeg_executable()
+    if not encoder:
         return None
     cover = path.with_suffix('.cover.jpg')
     try:
-        result=subprocess.run(['ffmpeg','-v','error','-y','-i',str(path),'-frames:v','1','-vf','scale=640:-2',str(cover)],capture_output=True,timeout=30)
+        result=subprocess.run([encoder,'-v','error','-y','-i',str(path),'-frames:v','1','-vf','scale=640:-2',str(cover)],capture_output=True,timeout=30)
         return cover if result.returncode==0 and cover.exists() else None
     except (OSError,subprocess.TimeoutExpired): return None
 
 
 def source_page(config, cursor, high=None, after=None):
-    args=[str(WECHAT_READER),'sync-page','--talker',config['wechat_talker'],'--after-local-id',str(cursor),'--limit',str(config.get('page_size',100))]
+    args=[str(config.get('wechat_reader') or WECHAT_READER),'sync-page','--talker',config['wechat_talker'],'--after-local-id',str(cursor),'--limit',str(config.get('page_size',100))]
     if high is not None: args+=['--through-local-id',str(high)]
     if after: args+=['--page-after-time',str(after['time']),'--page-after-local-id',str(after['local_id'])]
     try:
@@ -860,24 +1110,31 @@ def retry_media_jobs(config,store):
     with store.connect() as db:
         jobs=[dict(r) for r in db.execute("SELECT m.id,m.message_id,m.attempts,x.payload_json FROM media_jobs m JOIN messages x ON x.id=m.message_id WHERE x.binding_id=? AND m.state IN ('pending','processing') ORDER BY m.id",(config['binding_id'],))]
     for job in jobs:
-        if job['attempts'] >= 3:
+        baseline=int(store.setting(f"media_retry_base:{job['id']}",0))
+        attempts_this_round=max(0,job['attempts']-baseline)
+        if attempts_this_round >= 3:
             with store.connect() as db: db.execute("UPDATE media_jobs SET state='manual',error=COALESCE(error,'自动重试已达到 3 次'),updated_at=? WHERE id=?",(time.time(),job['id']))
             continue
         check_control(config,store)
         # Back off automatically: attempts 1/2 wait 30s/120s; tests and
         # explicit management retries can bypass this by setting updated_at.
-        delay=(30,120)[min(job['attempts'],2)-1] if job['attempts'] else 0
+        delay=(30,120)[min(attempts_this_round,2)-1] if attempts_this_round else 0
         with store.connect() as db:
             updated=db.execute('SELECT updated_at FROM media_jobs WHERE id=?',(job['id'],)).fetchone()[0]
         if delay and time.time()-updated < delay:
             continue
         with store.connect() as db:db.execute("UPDATE media_jobs SET state='processing' WHERE id=?",(job['id'],))
-        try:send_row({**config,'_retry_media':True},json.loads(job['payload_json']),{},store)
+        try:
+            send_row({**config,'_retry_media':True},json.loads(job['payload_json']),{},store)
+            with store.connect() as db:
+                current=db.execute('SELECT state,attempts FROM media_jobs WHERE id=?',(job['id'],)).fetchone()
+                if current['state']=='placeholder':
+                    db.execute('UPDATE media_jobs SET state=? WHERE id=?',('manual' if current['attempts']-baseline>=3 else 'pending',job['id']))
         except Exception as exc:
             with store.connect() as db:
-                attempts=db.execute('SELECT attempts FROM media_jobs WHERE id=?',(job['id'],)).fetchone()[0]
-                state='manual' if attempts >= 3 else 'pending'
-                db.execute("UPDATE media_jobs SET state=?,error=?,updated_at=? WHERE id=?",(state,safe_error(exc),time.time(),job['id']))
+                attempts=max(job['attempts']+1,db.execute('SELECT attempts FROM media_jobs WHERE id=?',(job['id'],)).fetchone()[0])
+                state='manual' if isinstance(exc,DeliveryUncertain) or attempts-baseline >= 3 else 'pending'
+                db.execute("UPDATE media_jobs SET state=?,attempts=?,error=?,updated_at=? WHERE id=?",(state,attempts,safe_error(exc),time.time(),job['id']))
 
 
 def expire_failed_media(config,store):
@@ -888,6 +1145,45 @@ def expire_failed_media(config,store):
             path=Path(job['staging_path']).resolve()
             if path.is_relative_to(root):path.unlink(missing_ok=True)
             db.execute('UPDATE media_jobs SET staging_path=NULL WHERE id=?',(job['id'],))
+
+
+def reader_wakeup_loop(config: dict[str, Any], wakeup: threading.Event, stopped: threading.Event) -> None:
+    """Use Rion's read-only watch as a hint; sync-page remains authoritative."""
+    store = MirrorStore(config['sqlite_file'])
+    metadata_watch = True
+    while not stopped.is_set():
+        cursor = store.get_cursor(int(config['binding_id']))
+        cmd = [str(WECHAT_READER), 'watch', '--talker', config['wechat_talker'],
+               '--since-local-id', str(cursor), '--follow', '--jsonl',
+               '--poll-interval', '2', '--limit', '100', '--scan-limit', '1000']
+        if metadata_watch:
+            cmd = [str(WECHAT_READER),'watch-changes','--poll-interval','1']
+        proc = None
+        try:
+            proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            with selectors.DefaultSelector() as selector:
+                selector.register(proc.stdout, selectors.EVENT_READ)
+                while not stopped.is_set() and proc.poll() is None:
+                    for _key, _mask in selector.select(timeout=0.5):
+                        chunk = os.read(proc.stdout.fileno(), 65536)
+                        if not chunk: break
+                        # Rows are only wake-up signals. Never log or trust this
+                        # stream for ordering; recover_once scans the durable DB.
+                        wakeup.set()
+                # Drain a final chunk from a reader that exited after emitting.
+                if proc.poll() is not None and not stopped.is_set():
+                    if os.read(proc.stdout.fileno(), 65536):wakeup.set()
+        except (OSError, ValueError):
+            pass  # Keep the normal poll as the safety net.
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:proc.kill();proc.wait(timeout=2)
+            if proc is not None and proc.stdout:proc.stdout.close()
+            if proc is not None and proc.returncode == 2:
+                metadata_watch = False  # Older reader: retain the original watch fallback.
+        stopped.wait(5)
 
 
 def realtime_wakeup_loop(config: dict[str, Any], wakeup: threading.Event, stopped: threading.Event) -> None:
@@ -923,8 +1219,12 @@ def stream(config, state=None):
     def heartbeat():
         while not stopped.wait(5): store.heartbeat(token,bid)
     thread=threading.Thread(target=heartbeat,daemon=True);thread.start()
+    from agents.group_names import group_name_loop
+    threading.Thread(target=group_name_loop,args=(dict(config),store,stopped),daemon=True).start()
     if config.get('realtime_wakeup'):
         threading.Thread(target=realtime_wakeup_loop,args=(config,wakeup,stopped),daemon=True).start()
+    if str(config.get('reader_wakeup', '')).lower() in {'true', '1', 'yes'}:
+        threading.Thread(target=reader_wakeup_loop,args=(config,wakeup,stopped),daemon=True).start()
     try:
         wait_until=0
         while True:
@@ -973,7 +1273,6 @@ def main():
     parser.add_argument('--config',type=Path,default=DEFAULT_CONFIG)
     parser.add_argument('--db',type=Path)
     parser.add_argument('--binding-id',type=int,default=1)
-    parser.add_argument('--start-reason',default='manual start',help='Control reason recorded when start flips the binding to running')
     parser.add_argument('--once',action='store_true',help='Read one source page without sending or advancing cursor')
     args=parser.parse_args();config=runtime_paths(load_json(args.config,{}))
     # A configured reader path must hold for every process in the chain
@@ -1016,7 +1315,7 @@ def main():
                 except OSError:
                     print(json.dumps(store.status(bid),ensure_ascii=False));return 0
                 _unlock(check)
-            store.set_control(bid,'running',reason=args.start_reason)
+            store.set_control(bid,'running',reason='manual start')
             log=Path(config['log_dir'])/f'binding-{bid}.log';log.parent.mkdir(parents=True,exist_ok=True)
             with log.open('a', encoding='utf-8', errors='replace') as out:
                 child=subprocess.Popen([sys.executable,'-m','agents.wechat_feishu_mirror','run','--config',str(args.config.resolve()),'--db',str(store.path.resolve()),'--binding-id',str(bid)],cwd=ROOT,stdout=out,stderr=subprocess.STDOUT,start_new_session=True)

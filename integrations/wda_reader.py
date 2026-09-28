@@ -106,6 +106,7 @@ def map_row(talker: str, message: dict, names: dict[str, str]) -> dict:
     sender_wxid = str(message.get("senderUsername") or "")
     row = {
         "talker": talker,
+        "local_type": base,
         "local_id": int(message.get("localId") or 0),
         "server_id": str(message.get("serverId") or ""),
         "sender_wxid": sender_wxid,
@@ -143,6 +144,19 @@ def map_row(talker: str, message: dict, names: dict[str, str]) -> dict:
 
     row["kind_name"] = kind
     row["text"] = text
+    if base == 49 and sub == 5:
+        try:
+            from .article_shares import reader_article, article_share, article_body
+        except ImportError:
+            from article_shares import reader_article, article_share, article_body
+        article = reader_article(message)
+        xml_article = article_share({'content': content}) or {}
+        row['article'] = {key: value or xml_article.get(key, '') for key, value in article.items()}
+        row['text'] = article_body(row['article'])
+    if kind == "voice":
+        transcript = str(message.get("voiceTranscript") or "").strip()
+        if transcript:
+            row["voice_transcript"] = transcript
     if kind == "forward_chat":
         row["forward_items"] = _forward_items(content)
     return row
@@ -358,6 +372,21 @@ def cmd_media(args: argparse.Namespace) -> dict:
     return {"ok": True, "data": {"resources": []}}
 
 
+def cmd_members(args):
+    """Fail closed unless WDA explicitly proves a complete same-group list."""
+    payload=api_get('/api/chat/contacts/group_members',username=args.talker,limit=args.limit,offset=args.offset)
+    members=payload.get('members')
+    total=payload.get('total',payload.get('totalCount'))
+    if not isinstance(members,list) or not isinstance(total,int) or payload.get('hasMore') or len(members)!=total or args.offset!=0:
+        raise WdaError('WDA 未提供完整成员快照，成员同步暂需人工核验；不会调用其他账号读取器')
+    ids=[str(row.get('username') or '') for row in members]
+    if not ids or any(not x for x in ids) or len(set(ids))!=len(ids):
+        raise WdaError('WDA 成员 ID 缺失或重复，不能自动增删')
+    returned=payload.get('username',payload.get('chatroomId'))
+    if returned!=args.talker:raise WdaError('WDA 返回源群不匹配')
+    return {'ok':True,'data':{'chatroom_id':args.talker,'members':members,'total':total}}
+
+
 def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")   # Windows 默认 GBK 会损坏中文
@@ -379,6 +408,12 @@ def main() -> int:
     resolve.add_argument("--type-filter", default="group")
     resolve.add_argument("--limit", type=int, default=30)
     resolve.set_defaults(handler=cmd_resolve_chat)
+
+    members = sub.add_parser('members',help='Complete membership snapshot or explicit unavailability')
+    members.add_argument('talker')
+    members.add_argument('--limit',type=int,default=10000)
+    members.add_argument('--offset',type=int,default=0)
+    members.set_defaults(handler=cmd_members)
 
     media = sub.add_parser("media", help="单条消息的本地媒体资源（票 05 实现）")
     media.add_argument("--talker", required=True)
