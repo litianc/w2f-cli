@@ -233,6 +233,25 @@ class WizardMultipleMembers(unittest.TestCase):
         self.assertEqual(result['chat_id'], 'oc_once')
         self.assertEqual(sum('+chat-create' in c.args[0] for c in run.call_args_list), 1)
 
+    def test_real_cli_error_envelopes_distinguish_refusal_from_uncertain_result(self):
+        import json
+        from types import SimpleNamespace
+        for category in ['authorization', 'authentication', 'confirmation', 'validation', 'config', 'policy', 'network', 'internal', 'api']:
+            raw = SimpleNamespace(returncode=1, stdout='', stderr=json.dumps(
+                {'ok': False, 'error': {'type': category, 'message': 'synthetic ' + category}}))
+            with self.subTest(category=category), patch.object(manage.subprocess, 'run', return_value=raw):
+                result = self.manager.post('wizard', self.request([], 'qa-envelope-' + category))
+            self.assertEqual(result['creation_status'], 'uncertain' if category in {'network', 'internal', 'api'} else 'failed')
+
+    def test_saved_receipt_is_readable_after_profile_disabled(self):
+        data = self.request([])
+        with patch.object(manage, 'run_cli', return_value={'data': {'chat_id': 'oc_saved'}}):
+            result = self.manager.post('wizard', data)
+        with self.store.connect() as db:
+            db.execute("UPDATE profiles SET enabled=0 WHERE profile_name='p'")
+        with patch.object(manage, 'run_cli', side_effect=AssertionError('read-only receipt')):
+            self.assertEqual(self.manager.post('wizard', data), result)
+
     def test_request_cannot_be_reused_for_different_input(self):
         data = self.request([])
         with patch.object(manage, 'run_cli', return_value={'data': {'chat_id': 'oc_once'}}):

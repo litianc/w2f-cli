@@ -10,45 +10,53 @@ class CliRequestError(RuntimeError):
         self.uncertain = uncertain
 
 
+class CreateValidationError(ValueError):
+    """This request has no prior uncertain/successful receipt and was not sent."""
+
+
 def create_target(store, data, run_cli, share_link):
-    profile_name = str(data.get('profile') or '')
-    name = str(data.get('name') or '').strip()
-    profile = next((p for p in store.list_profiles() if p['profile_name'] == profile_name and p['enabled']), None)
-    if not profile:
-        raise ValueError('请先选择已接入且启用的发送 Profile')
-    if not name or len(name) > 60:
-        raise ValueError('请填写 1 至 60 字的新群名称')
-    if 'member_open_ids' in data and data.get('add_owner'):
-        raise ValueError('请使用初始成员列表，不要同时提交旧版本人选项')
-    members = data.get('member_open_ids', [data.get('owner_open_id')] if data.get('add_owner') else [])
-    if not isinstance(members, list) or any(not isinstance(uid, str) or not re.fullmatch(r'ou_[A-Za-z0-9_-]+', uid) for uid in members):
-        raise ValueError('初始成员必须是有效 open_id 列表；空 ID 不可提交，请核对当前 Profile 下的关联')
-    members = list(dict.fromkeys(members))
-    if len(members) > 50:
-        raise ValueError('一次最多选择 50 名初始成员，请减少选择后重试')
     request_id = data.get('request_id') or uuid.uuid4().hex
     if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', request_id):
-        raise ValueError('建群请求编号无效')
+        raise CreateValidationError('建群请求编号无效')
     key = 'create_target:' + request_id
-    inputs = {'app_id': profile['app_id'], 'profile': profile_name, 'name': name, 'members': members}
-    result = {'request_id': request_id, 'profile': profile_name, 'name': name, 'chat_id': None,
-              'creation_status': 'uncertain', 'creation_error': '建群结果待核实，请刷新已有群列表核对，勿重复建群。',
-              'members': {'status': 'pending' if members else 'not_requested', 'requested': members,
-                          'joined': [], 'missing': [], 'pending': members}}
-    # Claim before calling the CLI, across HTTP handlers and manager restarts.
-    # A crash/timeout leaves an uncertain receipt; it is never blindly replayed.
+    # Validate and claim in one transaction. Only failures with no previously
+    # dispatched request may tell the client it is safe to start a new request.
     with store.connect() as db:
         db.execute('BEGIN IMMEDIATE')
         existing = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
-        if existing:
-            saved = json.loads(existing[0])
-            if saved['inputs'] != inputs:
-                raise ValueError('同一建群请求的内容已改变，请先核对之前的创建结果')
+        saved = json.loads(existing[0]) if existing else None
+        def reject(message):
+            error = ValueError if saved and saved['result']['creation_status'] != 'failed' else CreateValidationError
+            raise error(message)
+
+        profile_name = str(data.get('profile') or '')
+        name = str(data.get('name') or '').strip()
+        if not name or len(name) > 60:
+            reject('请填写 1 至 60 字的新群名称')
+        if 'member_open_ids' in data and data.get('add_owner'):
+            reject('请使用初始成员列表，不要同时提交旧版本人选项')
+        members = data.get('member_open_ids', [data.get('owner_open_id')] if data.get('add_owner') else [])
+        if not isinstance(members, list) or any(not isinstance(uid, str) or not re.fullmatch(r'ou_[A-Za-z0-9_-]+', uid) for uid in members):
+            reject('初始成员必须是有效 open_id 列表；空 ID 不可提交，请核对当前 Profile 下的关联')
+        members = list(dict.fromkeys(members))
+        if len(members) > 50:
+            reject('一次最多选择 50 名初始成员，请减少选择后重试')
+        if saved:
+            if any(saved['inputs'][k] != v for k, v in {'profile': profile_name, 'name': name, 'members': members}.items()):
+                reject('同一建群请求的内容已改变，请先核对之前的创建结果')
             if saved['result']['creation_status'] != 'failed':
-                return saved['result']
+                return saved['result']  # A disabled/renamed profile cannot erase a creation receipt.
+        profile = next((p for p in store.list_profiles() if p['profile_name'] == profile_name and p['enabled']), None)
+        if not profile:
+            reject('请先选择已接入且启用的发送 Profile')
         linked = {i['open_id'] for i in store.list_feishu_identities() if i['profile_id'] == profile['id']}
         if any(uid not in linked for uid in members):
-            raise ValueError('初始成员未关联到当前 Profile，或关联已失效；请到「人员与实名」核对后重新选择')
+            reject('初始成员未关联到当前 Profile，或关联已失效；请到「人员与实名」核对后重新选择')
+        inputs = {'app_id': profile['app_id'], 'profile': profile_name, 'name': name, 'members': members}
+        result = {'request_id': request_id, 'profile': profile_name, 'name': name, 'chat_id': None,
+                  'creation_status': 'uncertain', 'creation_error': '建群结果待核实，请刷新已有群列表核对，勿重复建群。',
+                  'members': {'status': 'pending' if members else 'not_requested', 'requested': members,
+                              'joined': [], 'missing': [], 'pending': members}}
         db.execute('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
                    (key, json.dumps({'inputs': inputs, 'result': result}, ensure_ascii=False)))
 

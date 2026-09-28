@@ -169,7 +169,7 @@ python3 -m agents.manage status
 
 ### 写法一：直接使用 Lark CLI
 
-**1. 检查 Profile 和授权状态。** 以下示例在已安装 CLI 的终端执行；macOS 若提示找不到命令，先执行 `export PATH="$HOME/.local/bin:$PATH`。
+**1. 检查 Profile 和授权状态。** 以下示例在已安装 CLI 的终端执行；macOS 若提示找不到命令，先执行 `export PATH="$HOME/.local/bin:$PATH"`。
 
 ```bash
 lark-cli --version

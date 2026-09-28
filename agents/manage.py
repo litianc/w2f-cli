@@ -15,7 +15,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from .storage import MirrorStore
-from .chat_creation import CliRequestError, create_target
+from .chat_creation import CliRequestError, CreateValidationError, create_target
 from .paths import DATA_DIR, DEFAULT_CONFIG, ROOT, runtime_paths
 
 DEFAULT_DB=DATA_DIR/'wechat_feishu_mirror.sqlite3'
@@ -53,7 +53,7 @@ def run_cli(argv,*,stdin=None):
         error=value.get('error',{}) if isinstance(value,dict) else {}
         message=error.get('message') if isinstance(error,dict) else str(error)
         raise CliRequestError(safe_error(message or 'CLI 请求失败'),
-            uncertain=not (isinstance(error,dict) and error.get('type') in {'validation','permission','auth','confirmation_required'}))
+            uncertain=not (isinstance(error,dict) and error.get('type') in {'validation','authorization','authentication','config','confirmation','policy'}))
     return value
 
 
@@ -578,7 +578,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(self.manager.post(urllib.parse.urlparse(self.path).path.removeprefix('/api/'),data,'web'))
         except Exception as exc:
             from .wechat_feishu_mirror import safe_error
-            self.send_json({'error':safe_error(exc)},400)
+            self.send_json({'error':safe_error(exc),'request_not_started':isinstance(exc,CreateValidationError)},400)
 
 
 def serve(store,config_path,host,port,token=None):

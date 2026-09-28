@@ -12,7 +12,7 @@ def _start(page, fixture, *, people=False):
         {'username': 'qa-source-a', 'display_name': '项目 😀 <b>讨论</b> "群"'},
         {'username': 'qa-source-b', 'display_name': '第二个项目群'},
         {'username': 'qa-source-long', 'display_name': '长' * 61},
-        {'username': 'qa-source-empty', 'display_name': ''},
+        {'username': 'qa-source-empty', 'display_name': 'qa-source-empty'},
     ]
     other = fixture.store.upsert_profile('qa-other', 'cli_qa_other')
     if people:
@@ -141,6 +141,17 @@ def creation_results(page, fixture):
     page.get_by_text('群已创建 · 部分成员未在群中', exact=True).wait_for()
     page.get_by_label('群邀请链接').wait_for()
     _require(len(fixture.wizard.targets) == 1, 'Member failure duplicated a group')
+    page.get_by_role('button', name='新建群', exact=True).click()
+    name.fill('审计失败测试')
+    from unittest.mock import patch
+    with patch.object(fixture.store, 'audit', side_effect=RuntimeError('合成审计故障')):
+        _create(page)
+    expect(page.get_by_role('button', name='创建并选中', exact=True)).to_be_disabled()
+    count = len(fixture.wizard.creates)
+    with page.expect_response(lambda r: r.url.endswith('/api/wizard') and r.request.method == 'POST'):
+        page.get_by_role('button', name='检查本次请求', exact=True).click()
+    page.get_by_label('群邀请链接').wait_for()
+    _require(len(fixture.wizard.creates) == count, 'Post-create HTTP error caused a second group')
     page.get_by_role('button', name='新建群', exact=True).click()
     name.fill('超时测试')
     fixture.wizard.error = CliRequestError('合成超时')
