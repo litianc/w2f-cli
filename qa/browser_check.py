@@ -183,7 +183,13 @@ def _binding_maintenance_controls(page, fixture):
     return ['Both opt-in controls persisted only after explicit confirmation','Cancel caused no change','No remote group was renamed and no member was changed']
 
 
+from . import wizard_checks
+
 CHECKS = (
+    ('browser.wizard_name', '向导一键使用微信群名', 'Literal name fill, editing, limits and responsive layout', wizard_checks.name_fill),
+    ('browser.wizard_members', '向导初始成员多选', 'Zero/single/multiple members stay scoped to the selected profile', wizard_checks.member_selection),
+    ('browser.wizard_creation_results', '建群失败与部分结果', 'Created groups survive member failures; uncertain requests are not replayed', wizard_checks.creation_results),
+    ('browser.wizard_busy', '建群请求进行中防重', 'Busy state prevents another remote creation', wizard_checks.busy_guard),
     ("browser.binding_maintenance", "群名与成员同步确认开关", "Explicit controls persist and cancellation has no effect", _binding_maintenance_controls),
     ("browser.people_unlink_archive", "人员解绑、归档与恢复", "Unlink and restore preserve history without recreating identity links", _people_unlink_archive),
     ("browser.navigation", "管理台核心页面可加载", "All six navigation pages render successfully", _navigation),
@@ -245,7 +251,7 @@ def run_checks() -> list[dict]:
                                 result = _result(spec, "blocked", "An unconfigured external boundary was blocked")
                             else:
                                 result = _result(spec, "passed", "Expected behavior observed", evidence)
-                    except ProductFailure as exc:
+                    except AssertionError as exc:
                         if fixture and fixture.violations:
                             result = _result(spec, "blocked", "An unconfigured external boundary was blocked")
                         else:

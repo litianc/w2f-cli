@@ -15,6 +15,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from .storage import MirrorStore
+from .chat_creation import CliRequestError, create_target
 from .paths import DATA_DIR, DEFAULT_CONFIG, ROOT, runtime_paths
 
 DEFAULT_DB=DATA_DIR/'wechat_feishu_mirror.sqlite3'
@@ -41,7 +42,8 @@ def run_cli(argv,*,stdin=None):
             argv = [shutil.which('lark-cli') or str(Path.home()/'.local/bin/lark-cli'), *argv[1:]]
         p=subprocess.run(argv,cwd=ROOT,input=stdin,text=True,encoding='utf-8',capture_output=True,timeout=60,
                          env={**os.environ,'LARKSUITE_CLI_NO_UPDATE_NOTIFIER':'1','LARKSUITE_CLI_NO_SKILLS_NOTIFIER':'1'})
-    except subprocess.TimeoutExpired: raise RuntimeError('CLI 请求超时，请稍后重试') from None
+    except subprocess.TimeoutExpired: raise CliRequestError('CLI 请求超时，写入结果需核对') from None
+    except OSError: raise CliRequestError('CLI 未能启动，请检查安装路径', uncertain=False) from None
     try: value=json.loads(p.stdout)
     except ValueError: value={}
     if p.returncode and not (isinstance(value,dict) and value.get('error')):
@@ -50,7 +52,8 @@ def run_cli(argv,*,stdin=None):
     if p.returncode or (isinstance(value,dict) and value.get('ok') is False):
         error=value.get('error',{}) if isinstance(value,dict) else {}
         message=error.get('message') if isinstance(error,dict) else str(error)
-        raise RuntimeError(safe_error(message or 'CLI 请求失败'))
+        raise CliRequestError(safe_error(message or 'CLI 请求失败'),
+            uncertain=not (isinstance(error,dict) and error.get('type') in {'validation','permission','auth','confirmation_required'}))
     return value
 
 
@@ -511,25 +514,7 @@ class Manager:
                 raise ValueError('发送应用未启用')
             result=chat_share_link(profile,chat_id)
         elif resource=='wizard' and op=='create-target':
-            profile=str(data.get('profile') or '');name=str(data.get('name') or '').strip()
-            if not profile:raise ValueError('请先选择发送 Profile')
-            if not any(p['profile_name']==profile and p['enabled'] for p in s.list_profiles()):raise ValueError('发送应用未接入或已停用')
-            if not name:raise ValueError('请填写新群名称')
-            if len(name)>60:raise ValueError('群名称最长 60 字')
-            args=['lark-cli','--profile',profile,'im','+chat-create','--name',name,'--as','bot','--format','json']
-            if data.get('add_owner'):
-                owner=str(data.get('owner_open_id') or '').strip()
-                matched=next((p for p in s.list_profiles() if p['profile_name']==profile and p['enabled']),None)
-                if not matched or not any(identity['open_id']==owner and identity['profile_id']==matched['id']
-                                          for identity in s.list_feishu_identities()):
-                    raise ValueError('请先在「人员」页关联当前 Profile 下的本人飞书身份，再从下拉菜单选择')
-                args+=['--users',owner]
-            payload=run_cli(args)
-            chat_id=str((payload.get('data') or {}).get('chat_id') or payload.get('chat_id') or '')
-            if not chat_id:raise ValueError('飞书未返回 chat_id；请先到飞书确认群是否已建成，再刷新列表选择')
-            result={'chat_id':chat_id,'name':name,'profile':profile}
-            try:result.update(chat_share_link(profile,chat_id))
-            except Exception as exc:result['share_error']=str(exc)
+            result=create_target(s,data,run_cli,chat_share_link)
         elif resource=='media-failures' and op=='retry':
             with s.connect() as db:
                 row=db.execute('SELECT * FROM media_jobs WHERE id=?',(int(data['id']),)).fetchone()

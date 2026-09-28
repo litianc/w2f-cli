@@ -920,23 +920,17 @@ def forward_body(row, config, store):
     return '\n'.join(render(items)) if items else '[转发聊天记录内容暂不可用]'
 
 
-def send_article_cover(store, message, plan, text_result, send):
-    article = plan.get('article') or {}
-    cover = article.get('cover_url')
-    if not cover or not article.get('url'):
-        return False
-    try:
-        # Use the existing CLI upload and persisted delivery receipts. Keeping
-        # the cover attached to its article also makes manual repair unambiguous.
-        send('article-cover', ['+messages-reply', '--message-id', text_result['data']['message_id'], '--image', cover])
-        store.add_media_job(message['id'], 'article_cover', None, None, 'uploaded')
-        return False
-    except (CliError, DeliveryUncertain) as exc:
-        # The article text already has a receipt. Optional cover uncertainty
-        # stays visible for reconciliation without blocking subsequent messages.
-        uncertain = isinstance(exc, DeliveryUncertain) or exc.uncertain
-        store.add_media_job(message['id'], 'article_cover', None, None, 'manual' if uncertain else 'placeholder', safe_error(exc))
-        return True
+def retain_legacy_article_cover_failure(store, message):
+    # Article previews belong to Feishu's original-link rendering. CLI image
+    # URLs can silently fall back to text, so never send a separate cover,
+    # including from plans or retry jobs saved by older workers.
+    # Keep unresolved historical deliveries visible; skipping the old upload
+    # must not turn an uncertain receipt into a reported success.
+    with store.connect() as db:
+        jobs = db.execute("SELECT id FROM media_jobs WHERE message_id=? AND media_type='article_cover' AND state!='uploaded'", (message['id'],)).fetchall()
+        for job in jobs:
+            db.execute("UPDATE media_jobs SET state='manual',error=COALESCE(error,'文章独立封面补发已停用；历史发送结果保留待核对'),updated_at=? WHERE id=?", (time.time(), job['id']))
+    return bool(jobs)
 
 
 def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any], store: MirrorStore) -> None:
@@ -1042,7 +1036,7 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
                 store.save_setting(plan_key,plan)
             for index,part in enumerate(plan['parts']):
                 result=send(f'text-{index}',plan['target']+['--text',part])
-            cover_missing=send_article_cover(store,message,plan,result,send)
+            cover_missing=retain_legacy_article_cover_failure(store,message)
             placeholder=plan['placeholder'] or cover_missing
         store.mark_message(key,'placeholder' if placeholder else 'sent',binding_id=bid,feishu_message_id=message['feishu_message_id'] if config.get('_retry_media') else str(result['data']['message_id']))
     except Exception as exc:

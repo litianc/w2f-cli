@@ -6,7 +6,7 @@ W2F CLI（WeChat to Feishu）是一个由 Codex 控制与维护的本地会话�
 
 **本地运行 · 多群管理 · 实名映射 · 离线续传**
 
-[效果展示](#效果展示) · [功能特点](#功能特点) · [快速开始](#快速开始) · [常用命令](#常用命令) · [项目文档](#项目文档)
+[效果展示](#效果展示) · [功能特点](#功能特点) · [快速开始](#快速开始) · [飞书权限申请](#飞书权限申请) · [常用命令](#常用命令) · [项目文档](#项目文档)
 
 ## 效果展示
 
@@ -22,6 +22,7 @@ W2F CLI（WeChat to Feishu）是一个由 Codex 控制与维护的本地会话�
 | --- | --- |
 | 本地管理台 | 查看运行概览，管理群映射、飞书应用、人员实名、失败项和首次接入 |
 | 多应用、多群 | 同一微信账号下支持最多 10 组一对一绑定；每组指定飞书 CLI Profile，以机器人身份发送 |
+| 向导内建群 | 一键填入当前微信群名，继续编辑后创建；搜索并勾选当前应用下最多 50 名初始成员，创建后核验成员结果 |
 | 群名称管理 | 按稳定 ID 绑定群；修改本地显示名、刷新群名，并在明确确认后修改飞书真实群名；可逐群开启群名自动跟随（默认关闭） |
 | 群成员同步 | 逐群确认开启，默认关闭；可信微信事件结合已确认双端身份，执行飞书成员变更；不确定情况保留待办 |
 | 统一实名 | 多个微信 ID 可人工关联同一人；关联飞书身份时可按实名、相近姓名和拼音查通讯录，核对候选 ID 后选择；未知身份先用昵称同步，并生成待确认事项 |
@@ -71,7 +72,7 @@ Codex 负责服务控制和维护，Worker 负责持续读取与发送。项目�
 
 - Python 3.10+。
 - 已安装并登录微信。
-- `lark-cli`，以及具备目标群访问、消息发送和所需媒体权限的飞书机器人应用（Worker 优先用 PATH 中的 `lark-cli`，找不到时自动检查 `~/.local/bin/lark-cli`）。
+- `lark-cli`，以及具备目标群访问、消息发送和所需媒体权限的飞书机器人应用（[权限清单、申请命令与模型提示词](#飞书权限申请)；Worker 优先用 PATH 中的 `lark-cli`，找不到时自动检查 `~/.local/bin/lark-cli`）。
 - `ffmpeg`（可选）：用于生成视频封面；缺少时使用文件附件。
 
 Node.js 只用于网页脚本检查和可选的 Remotion 宣传片制作，不是同步服务的运行依赖。
@@ -140,6 +141,104 @@ python3 -m agents.manage status
 
 示例中的 `1` 应替换为实际绑定 ID。默认每 600 秒检查一次，可在接入配置中设置间隔。
 
+## 飞书权限申请
+
+以下以独立 Profile `wechat-mirror` 为例，命令按 **Lark CLI v1.0.95** 核对。换应用时替换 Profile 名称，并核对它对应的 App ID；保留原有通用应用 `feishu-mcp`。先在飞书开放平台启用机器人能力，将应用凭证接入该 Profile，凭证由 CLI 保存。
+
+**权限分两层：机器人应用权限在开放平台开通；用户授权通过 `lark-cli auth login` 完成。** 自动镜像、群管理、管理员提醒都用 `--as bot`；后台按实名搜索飞书人员用 `--as user`。用户扫码成功不能证明机器人权限已齐全。[CLI 官方权限说明](https://github.com/larksuite/cli/blob/main/skills/lark-shared/references/lark-shared-identity-and-permissions.md)
+
+### 需要哪些权限
+
+在开放平台“权限管理”中按对应身份搜索权限标识，按所需功能开通：
+
+| 功能 | 身份 | 权限标识 | 使用条件 |
+| --- | --- | --- | --- |
+| 同步文字、链接、引用回复；发送管理员私聊提醒 | bot | `im:message:send_as_bot` | 基础必需 |
+| 上传图片、表情、视频、语音、文件 | bot | `im:resource` | 媒体镜像必需；部分 API 也接受细分上传权限，以实际 CLI 错误为准 |
+| 列出/搜索目标群、读取群名、获取邀请链接 | bot | `im:chat:read` | 管理台接入必需 |
+| 检查机器人在群、读取成员、核验成员同步结果 | bot | `im:chat.members:read` | 创建绑定预检必需 |
+| 从管理台创建飞书群 | bot | `im:chat:create` | 使用创建群功能时 |
+| 修改飞书真实群名、开启群名跟随 | bot | `im:chat:update` | 仅修改本地显示名不需要 |
+| 邀请本人入群、同步成员加入/移除 | bot | `im:chat.members:write_only` | 使用邀请或成员同步时 |
+| 按消息 ID 读取飞书群消息，核对不确定发送回执 | bot | `im:message.group_msg` | 使用回执核验时；本项目加 `--no-reactions`，不为此申请表情回复读取权限 |
+| 按实名、相近姓名、拼音搜索飞书候选人 | user | `contact:user:search` | 使用人员搜索时；手工关联已核实的 `open_id` 可不启用 |
+
+创建者机器人需要以群主身份操作时，按实际群设置补充 `im:chat:operate_as_owner`；它不能让机器人管理任意群。权限之外还要满足：机器人在目标群内、邀请对象和提醒接收人在应用可用范围内、修改群信息/移除成员符合该群角色要求。成员同步仍须在项目内逐组确认开启，取得权限不会自动打开开关。
+
+上述清单对应项目实际调用的 [消息发送](https://github.com/larksuite/cli/blob/v1.0.95/shortcuts/im/im_messages_send.go)、[消息核验](https://github.com/larksuite/cli/blob/v1.0.95/shortcuts/im/im_messages_mget.go)、[人员搜索](https://github.com/larksuite/cli/blob/v1.0.95/shortcuts/contact/contact_search_user.go) 等接口；不需要为了单向镜像申请日历、云盘或全部业务域权限。
+
+### 写法一：直接使用 Lark CLI
+
+**1. 检查 Profile 和授权状态。** 以下示例在已安装 CLI 的终端执行；macOS 若提示找不到命令，先执行 `export PATH="$HOME/.local/bin:$PATH`。
+
+```bash
+lark-cli --version
+lark-cli profile list
+lark-cli --profile wechat-mirror auth status --json --verify
+lark-cli --profile wechat-mirror auth scopes --json
+```
+
+`auth scopes` 在上述版本返回 `userScopes`，用于检查应用支持的用户权限，不能据此断言 bot 权限齐全。`auth status` 中用户令牌过期，也不等于机器人不可用。
+
+**2. 开通机器人权限。** 当前 CLI 没有一条 `auth login` 命令能开通上述 bot 权限。前往 `https://open.feishu.cn/app/<你的 App ID>/auth`，在“应用身份权限”中按表申请缺项，按后台要求创建版本、发布并完成组织审批。CLI 报错若给出 `console_url`，优先使用该入口；`permission_violations` 中可能是“任选其一”，不必把等价权限全部开通。
+
+**3. 需要人员搜索时，申请用户授权。** 先在同一应用的“用户身份权限”中开通 `contact:user:search` 并完成发布/审批，再执行：
+
+```bash
+lark-cli --profile wechat-mirror auth login --scope "contact:user:search"
+```
+
+打开本次命令返回的链接，使用自己的飞书账号完成授权。此命令等待授权完成；不要省略 `--scope`，也不用 `--domain all`。授权后检查实际取得的权限，再做只读验证：
+
+```bash
+lark-cli --profile wechat-mirror auth check --scope "contact:user:search" --json
+lark-cli --profile wechat-mirror auth status --json --verify
+lark-cli --profile wechat-mirror contact +search-user --user-ids me --as user
+lark-cli --profile wechat-mirror im +chat-list --page-size 1 --as bot
+```
+
+从管理台或群列表取得真实 `chat_id`，再核对目标群成员：
+
+```bash
+lark-cli --profile wechat-mirror im +chat-members-list \
+  --chat-id "<目标群 chat_id>" --member-types bot --page-all --as bot
+```
+
+这些是只读检查，不能证明消息发送、媒体上传、成员增删已经验收；写操作需在你指定的测试群内另行验证。若返回“需要管理员审批”，用户扫码不能代替组织审批；保留具体缺项和审批入口，可先使用已获批功能，或接入另一个获准使用的应用。
+
+### 写法二：交给 Codex 或其他模型的提示词
+
+复制下面整段即可使用；如需换 Profile，请修改第一行：
+
+```text
+请帮我配置 W2F CLI 的飞书权限，使用独立 Profile：wechat-mirror。
+
+先阅读本项目 README 的“飞书权限申请”，检查已安装 lark-cli 的版本、
+命令帮助、Profile 对应的 App ID、应用已开通权限和用户实际授权状态。
+不要改动通用应用 feishu-mcp，也不要把其他应用的 open_id 拿来复用。
+
+按 README 权限表检查消息/媒体同步、群读取和成员预检的基础权限；
+同时准备创建群、修改群名、邀请和移除成员、群消息回执核验，以及
+按姓名搜索人员所需的权限。区分 bot 与 user，只申请对应功能的缺项，
+不要使用 --domain all，不要把 auth scopes 的 userScopes 当作 bot 权限。
+
+用户授权用当前 CLI 支持的精确 scope 发起；人员搜索需要
+contact:user:search。代理执行时用 auth login --scope ... --no-wait --json，
+把本轮返回的原始授权链接及用 auth qrcode 生成的二维码展示给我，
+告诉我需要扫码，并先交还对话。等我回复已授权，再用本轮 device_code
+完成授权流程；过期就重新发起。授权材料保存在仓库外，不写进 Git。
+
+bot 缺权限时，不用 auth login 冒充机器人授权：列出具体缺项及
+console_url，协助在开放平台开通、发布。需要组织审批时告诉我
+由谁审批、审批入口和目前受影响的功能，不把扫码成功当作审批完成。
+不要在聊天、日志或仓库里输出 App Secret 或访问令牌。
+
+完成后用 auth check、auth status 和只读 API 分别核验用户身份、
+机器人可用性、目标群成员及应用可用范围，给出“已通过/待审批/待实测”
+清单。只读检查通过后不要直接声称发送或成员增删验收成功；需要写入
+测试时先让我指定测试群与操作内容，不向工作群试发消息或移除成员。
+```
+
 ## 常用命令
 
 以下命令供用户或 Codex 调用，返回 JSON，并与网页共享同一份状态。
@@ -183,7 +282,7 @@ python3 -m agents.manage status
 - **时效性**：默认定时兜底为 10 分钟；macOS 端可在引导页开启 Rion `reader_wakeup` 只读事件唤醒，Windows 端可开启 `realtime_wakeup`。秒级端到端时延仍须按真实群消息实测。
 - **媒体可用性**：图片已支持旧 XOR、V1/V2；未知加密格式、缺少本机解码条件、转发记录内独立媒体和超过 100 MB 的文件仍需另行处理；源端缺失的资源会保留占位。图片优先同步原图（Windows 端经 WDA 拉取 CDN 原图；原图过期时回落缩略图，并在飞书消息上标注「原图未同步」）。
 - **语音回退**：macOS 读取器可从已授权的语音库按群与消息身份提取 SILK；安装可选 pilk 和 FFmpeg 后转为 Opus。macOS 后台优先使用 PATH 中的 FFmpeg，缺失时检查 Homebrew 常见安装目录，视频封面共用此规则。已有 Opus 文件按语音发送；AMR/AAC/M4A/MP3/WAV 在安装 FFmpeg 后转为 Opus。无法转码的原始文件作为附件发送，客户端内播放能力需按格式验收。
-- **文章分享**：type-5 微信分享保留标题、摘要和完整原文链接，用户要求的是微信链接的原生标题/封面预览，不使用 interactive 卡片替代；原生预览由飞书决定。已有源封面可作为关联图片补充，但不视为原生预览验收通过。封面失败保留链接和人工补发待办，纯粘贴链接不主动抓网页。真实飞书图文效果仍待对照验收（#23）。
+- **文章分享**：type-5 微信分享保留标题、摘要和完整原文链接，用户要求的是微信链接的原生标题/封面预览，不使用 interactive 卡片替代；原生预览由飞书决定。不再额外发送封面图片或图片链接，避免 CLI 上传降级产生多余回复；源封面元数据仍保留。旧版封面失败和不确定回执保留待核对，重试不会再补发封面。纯粘贴链接不主动抓网页，原生预览效果受原文可访问性及飞书解析影响；同文长短链接对照仍待验收（#23）。
 - **视频号**：卡片与链接已做解析处理，跨应用跳转仍待完善，不能保证在飞书中直接播放或打开。
 - **恢复条件**：续传依赖微信历史仍可读取；已删除的历史或缺失的原文件无法凭空重建。
 - **不确定回执**：发送结果不确定且超过平台去重窗口时暂停等待核对，避免盲目重复发送。
