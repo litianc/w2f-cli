@@ -311,8 +311,21 @@ def _channel_share_url(value: str) -> str:
         query = urllib.parse.parse_qs(page.query, keep_blank_values=True)
         private_keys = {'encfilekey', 'token', 'urltoken', 'aeskey', 'authkey', 'auth_key',
                         'access_token', 'refresh_token', 'signature'}
-        if any(key.lower() in private_keys for key in query):
-            return ''
+        private_parameter = r'(?:^|[?&#;=/])(?:' + '|'.join(sorted(private_keys)) + r')='
+        for component in (page.query, page.fragment):
+            # Inspect encoded/nested values as well as top-level keys. Only use
+            # decoded copies for screening; the accepted URL stays byte-for-byte
+            # unchanged. Reject embedded resource URLs and excessive nesting.
+            for _ in range(4):
+                if (re.search(private_parameter, component, re.I)
+                        or re.search(r'(?:https?:)?[/\\]{2}', component, re.I)):
+                    return ''
+                decoded = urllib.parse.unquote(component)
+                if decoded == component:
+                    break
+                component = decoded
+            else:
+                return ''
         if page.hostname == 'weixin.qq.com' and re.fullmatch(r'/sph/[A-Za-z0-9_-]+/?', page.path):
             return value
         if page.hostname != 'channels.weixin.qq.com':

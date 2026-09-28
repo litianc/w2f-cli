@@ -88,6 +88,26 @@ class ChannelSharesTest(unittest.TestCase):
                     raw = '<msg><appmsg><finderFeed><' + path + '><![CDATA[' + url + ']]></' + path + '></finderFeed></appmsg></msg>'
                     self.assertEqual(mirror.channel_video_body(raw), '视频号\n' + url)
 
+    def test_fragment_and_nested_parameters_cannot_expose_resource_data(self):
+        suffixes = [
+            '#token=private', '#section?access_token=private',
+            '#https://wxapp.tc.qq.com/stodownload?encfilekey=private',
+            '?next=https%3A%2F%2Fwxapp.tc.qq.com%2Fstodownload%3Fencfilekey%3Dprivate',
+            '?context=signature%3Dprivate', '#%2574oken%253Dprivate',
+            '?context=%2574oken%253Dprivate',
+            '#%252525252574oken%25252525253Dprivate',
+            '?image=https%3A%2F%2Fmmbiz.qpic.cn%2Fsynthetic-cover',
+        ]
+        for suffix in suffixes:
+            with self.subTest(suffix=suffix):
+                field = '<url><![CDATA[https://weixin.qq.com/sph/example' + suffix + ']]></url>'
+                raw = '<msg><appmsg>' + field + '</appmsg></msg>'
+                self.assertEqual(mirror.channel_video_body(raw), '视频号\n' + UNAVAILABLE)
+                # An unsafe supplied URL does not suppress independently valid IDs.
+                raw = '<msg><appmsg>' + field + IDS + '</appmsg></msg>'
+                self.assertEqual(mirror.channel_video_body(raw),
+                                 '视频号\nhttps://channels.weixin.qq.com/web/pages/feed?oid=z4lFRwCKGX4&nid=SuZgeu3RR6A')
+
     def test_metadata_is_read_from_the_feed_and_decoded_only_once(self):
         description = '文字 &lt;tag&gt; &amp; 😀'
         raw = ('<msg><appmsg><title>当前微信版本不支持展示该内容，请升级</title>'
