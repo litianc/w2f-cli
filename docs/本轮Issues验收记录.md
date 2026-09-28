@@ -384,3 +384,12 @@
 上述验收使用合成人员、临时数据库、真实本地 HTTP 和浏览器，飞书 CLI 为替身；未创建真实飞书群或邀请真实人员。平台的应用可用范围、群角色和权限仍由真实调用决定，界面不会把“群创建成功”等同于“所有成员入群”。
 
 完整隔离 QA 结果：268 项通过，报告 `.qa-results/wizard-24-25/report.md`；JavaScript 语法、Git 空白检查及当前树隐私检查通过。
+
+
+交付前双轴审查完成：需求轴发现 3 项、代码规范轴发现 2 项（其中 HTTP 异常防重为共同发现），均已修正并复核通过：
+
+- 新增“明确未发起写入”错误标识；HTTP 400 不再默认等同于建群失败。实际浏览器模拟远端成功后本地审计异常，重查原请求取得同一 chat_id，未创建第二个群。
+- 按 CLI v1.0.95 的真实 `authorization/authentication/confirmation/config/policy/validation` 错误信封识别明确拒绝，网络/API未知结果仍待核实；补充 subprocess 信封解析测试。
+- 排除读取器把 display_name 回退为稳定群 ID 的情况；README 的 PATH 示例补齐引号。
+- 最终完整隔离 QA **270 项通过**（`.qa-results/wizard-24-25-final/report.md`），20 项向导接口测试及定向浏览器场景另经独立审查复跑通过。
+- 本机管理服务已更新，保留原端口和会话 token；4 组现有 Worker 全部 running/alive，PID 未变。部署过程未创建真实群、邀请或移除成员。
