@@ -188,7 +188,23 @@ lark-cli --profile wechat-mirror auth scopes --json
 lark-cli --profile wechat-mirror auth login --scope "contact:user:search"
 ```
 
-打开本次命令返回的链接，使用自己的飞书账号完成授权。此命令等待授权完成；不要省略 `--scope`，也不用 `--domain all`。授权后检查实际取得的权限，再做只读验证：
+打开本次命令返回的链接，使用自己的飞书账号完成授权。此命令等待授权完成；不要省略 `--scope`，也不用 `--domain all`。
+
+如果由 Codex 等模型代办，使用下面的分步方式，先取得授权链接，方便模型交还对话让你扫码：
+
+```bash
+lark-cli --profile wechat-mirror auth login \
+  --scope "contact:user:search" --no-wait --json
+```
+
+模型应展示本次返回的原始授权链接及二维码。你完成授权并回复后，再由模型执行下一条命令；占位符替换为**同一次请求**返回的 `device_code`，过期则重新发起：
+
+```bash
+lark-cli --profile wechat-mirror auth login \
+  --device-code "<本次返回的 device_code>"
+```
+
+授权链接、二维码及 `device_code` 不放进仓库。授权后检查实际取得的权限，再做只读验证：
 
 ```bash
 lark-cli --profile wechat-mirror auth check --scope "contact:user:search" --json
@@ -223,9 +239,11 @@ lark-cli --profile wechat-mirror im +chat-members-list \
 不要使用 --domain all，不要把 auth scopes 的 userScopes 当作 bot 权限。
 
 用户授权用当前 CLI 支持的精确 scope 发起；人员搜索需要
-contact:user:search。代理执行时用 auth login --scope ... --no-wait --json，
+contact:user:search。代理执行时运行：
+lark-cli --profile wechat-mirror auth login --scope "contact:user:search" --no-wait --json
 把本轮返回的原始授权链接及用 auth qrcode 生成的二维码展示给我，
 告诉我需要扫码，并先交还对话。等我回复已授权，再用本轮 device_code
+运行 lark-cli --profile wechat-mirror auth login --device-code "<本次 device_code>"
 完成授权流程；过期就重新发起。授权材料保存在仓库外，不写进 Git。
 
 bot 缺权限时，不用 auth login 冒充机器人授权：列出具体缺项及
