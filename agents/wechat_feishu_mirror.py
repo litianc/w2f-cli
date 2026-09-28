@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import base64
 import html
 import hashlib
 import json
@@ -271,46 +272,108 @@ def clean_body(row: dict[str, Any]) -> str:
     return normalize_pasted_article_url(raw) or "[空消息]"
 
 
-def _cdata(value: str) -> str:
-    value = html.unescape(str(value or ""))
-    value = re.sub(r"^<!\[CDATA\[(.*?)\]\]>$", r"\1", value, flags=re.S)
-    return value.strip()
+def _channel_page_from_ids(object_id: str, nonce: str) -> str:
+    """Encode the uint64 IDs, never the full nonce context, as page parameters.
+
+    Reference: wx_channels_download at 124f044235bc706fe796c043a14ff442a150ae5d,
+    BuildJumpURLFromParts / EncodeUint64ToBase64. This is not an official
+    playback contract; a correctly encoded URL may still be inaccessible.
+    """
+    parts = nonce.split('_')
+    if len(parts) not in {1, 5, 7}:
+        return ''
+    numeric = parts[:-1] if len(parts) == 7 else parts
+    if any(not re.fullmatch(r'[0-9]{1,20}', part) for part in [object_id, *numeric]):
+        return ''
+    if len(parts) == 7 and not re.fullmatch(
+        r'(?:[0-9a-fA-F]{8,64}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})', parts[-1]
+    ):
+        return ''
+    identifiers = [int(object_id), int(parts[0])]
+    if any(value >= 1 << 64 for value in identifiers):
+        return ''
+    oid, nid = [base64.urlsafe_b64encode(value.to_bytes(8, 'big')).decode('ascii').rstrip('=')
+                for value in identifiers]
+    return f'https://channels.weixin.qq.com/web/pages/feed?oid={oid}&nid={nid}'
+
+
+def _channel_share_url(value: str) -> str:
+    """Accept sharing pages, not media resources or URLs resembling their host."""
+    value = value.strip()
+    if (not value or any(c.isspace() or ord(c) < 32 or c in '\\<>"\'\x7f' for c in value)
+            or re.search(r'%(?![0-9a-fA-F]{2})', value)):
+        return ''
+    try:
+        page = urllib.parse.urlsplit(value)
+        if (page.scheme not in {'http', 'https'} or page.username is not None
+                or page.password is not None or page.port not in {None, 443 if page.scheme == 'https' else 80}):
+            return ''
+        query = urllib.parse.parse_qs(page.query, keep_blank_values=True)
+        private_keys = {'encfilekey', 'token', 'urltoken', 'aeskey', 'authkey', 'auth_key',
+                        'access_token', 'refresh_token', 'signature'}
+        if any(key.lower() in private_keys for key in query):
+            return ''
+        if page.hostname == 'weixin.qq.com' and re.fullmatch(r'/sph/[A-Za-z0-9_-]+/?', page.path):
+            return value
+        if page.hostname != 'channels.weixin.qq.com':
+            return ''
+        if page.path == '/finder-preview/pages/sph':
+            ids = query.get('id', [])
+            return value if len(ids) == 1 and re.fullmatch(r'[A-Za-z0-9_-]+', ids[0]) else ''
+        if page.path == '/web/pages/feed':
+            if 'oid' not in query and 'nid' not in query:
+                # Native shares can already carry an opaque encrypted ID.
+                ids = query.get('eid', [])
+                return value if len(ids) == 1 and re.fullmatch(r'[A-Za-z0-9_=-]+', ids[0]) else ''
+            for key in ('oid', 'nid'):
+                ids = query.get(key, [])
+                if len(ids) != 1 or not re.fullmatch(r'[A-Za-z0-9_-]{11}', ids[0]):
+                    return ''
+                binary = base64.urlsafe_b64decode(ids[0] + '=')
+                if base64.urlsafe_b64encode(binary).decode('ascii').rstrip('=') != ids[0]:
+                    return ''
+            return value
+    except ValueError:
+        pass
+    return ''
 
 
 def channel_video_body(raw: str) -> str:
-    """Render a WeChat Channels share as a stable page link.
+    """Render a Channels share, preferring the original sharing page.
 
     Type-51 XML contains several signed CDN URLs (video, thumbnail, avatar),
     often mixed with an upgrade/help URL. Those URLs expire and must not be
-    forwarded. ``objectId`` + ``objectNonceId`` gives a stable page address;
-    a short ``weixin.qq.com/sph/`` share URL is the fallback when available.
+    forwarded. Internal IDs must be encoded before use as page parameters.
+    URL syntax and encoding alone do not establish whether a video can play.
     """
     try:
         root = ET.fromstring(raw)
     except ET.ParseError:
         root = None
-    def values(tag: str) -> list[str]:
-        if root is None:
-            return []
-        return [_cdata(node.text or "") for node in root.findall(f".//{tag}") if _cdata(node.text or "")]
-    object_id = next(iter(values("objectId")), "")
-    nonce = next(iter(values("objectNonceId")), "")
-    share = next((u for u in re.findall(r"https?://[^\s<>\"']+", raw) if re.search(r"(?:weixin\.qq\.com/sph/|channels\.weixin\.qq\.com/)", u)), "")
-    if object_id and nonce:
-        url = "https://channels.weixin.qq.com/web/pages/feed?oid=" + urllib.parse.quote(object_id, safe="") + "&nid=" + urllib.parse.quote(nonce, safe="")
-    elif share:
-        url = html.unescape(share)
-    else:
-        url = ""
-    desc = next(iter(values("desc")), "")
-    title = next(iter(values("title")), "")
+    # XML already unwraps CDATA and decodes entities. Do not scan raw XML or
+    # decode URL values a second time, which changes query parameter semantics.
+    app = root if root is None or root.tag == 'appmsg' else root.find('appmsg')
+    if app is None:
+        app = root
+    feed = None if app is None else app if app.tag == 'finderFeed' else app.find('finderFeed')
+    def text(node, tag):
+        return (node.findtext(tag) or '').strip() if node is not None else ''
+
+    share = ''
+    for node, tag in ((app, 'url'), (feed, 'url'), (feed, 'shareUrl')):
+        share = _channel_share_url(text(node, tag))
+        if share:
+            break
+    url = share or _channel_page_from_ids(text(feed, 'objectId'), text(feed, 'objectNonceId'))
+    desc = text(feed, 'desc')
+    title = text(app, 'title')
     # Old clients use an upgrade notice as title while the real description is
     # still present in finderFeed.
     if not desc or "升级" in desc or "版本不支持" in desc:
         desc = ""
     if not desc and title and "升级" not in title and "版本不支持" not in title:
         desc = title
-    creator = next(iter(values("nickname")), "")
+    creator = text(feed, 'nickname')
     lines = ["视频号" + (f"：{desc}" if desc else "")]
     if creator:
         lines.append(f"作者：{creator}")
