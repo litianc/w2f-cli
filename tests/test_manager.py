@@ -43,10 +43,10 @@ class ManagementAcceptance(unittest.TestCase):
         person=self.store.create_person('管理员')
         profile=next(p for p in self.store.list_profiles() if p['profile_name']=='p')
         self.store.link_feishu_identity(person['id'],profile['id'],'ou_admin')
-        self.manager.config_path.write_text(json.dumps({'wechat_reader':'/tmp/reader', 'realtime_wakeup':True, 'realtime_stream_url':'http://127.0.0.1:10392', 'sender_map':{'wx':'实名'}}))
+        self.manager.config_path.write_text(json.dumps({'wechat_reader':'/tmp/reader', 'realtime_wakeup':True, 'realtime_stream_url':'http://127.0.0.1:10392', 'sender_map':{'wx':'实名'}}),encoding='utf-8')
         result=self.manager.post('setup',{'op':'save','reader_wakeup':'true','poll_interval':600,
                                          'admin_profile':'p','admin_feishu_user_id':'ou_admin'})
-        stored=json.loads((self.root/'config.json').read_text())
+        stored=json.loads((self.root/'config.json').read_text(encoding='utf-8'))
         self.assertEqual(stored['reader_wakeup'],'true')
         self.assertEqual(stored['admin_feishu_user_id'],'ou_admin')
         self.assertEqual(stored['wechat_reader'],'/tmp/reader')
@@ -56,7 +56,7 @@ class ManagementAcceptance(unittest.TestCase):
         self.assertEqual(result['draft']['admin_profile'],'p')
         with self.assertRaisesRegex(ValueError,'管理员身份尚未关联'):
             self.manager.post('setup',{'op':'save','admin_feishu_user_id':'ou_other','admin_profile':'p'})
-        self.assertEqual(json.loads((self.root/'config.json').read_text())['admin_feishu_user_id'],'ou_admin')
+        self.assertEqual(json.loads((self.root/'config.json').read_text(encoding='utf-8'))['admin_feishu_user_id'],'ou_admin')
 
     def test_feishu_identity_cannot_be_linked_with_empty_id(self):
         person=self.store.create_person('测试人员')

@@ -431,10 +431,17 @@ def historical_sticker_sources(row: dict[str, Any]) -> list[tuple[str, str]]:
         raise CliError('sticker_lookup_failed: 原始表情记录查询失败或超时') from None
 
 
-def media_url(row: dict[str, Any]) -> str | None:
-    """Extract a downloadable URL from common WeChat XML media fields."""
+def media_url(row: dict[str, Any], kind: str | None = None) -> str | None:
+    """Extract a downloadable URL from common WeChat XML media fields.
+
+    图片消息的缩略图在 cdnurl，大图在 cdnbigimgurl / cdnmidimgurl（#2）；
+    仅图片 kind 时优先取大图字段。
+    """
     raw = str(row.get("text") or row.get("content") or "")
-    for field in ("cdnurl", "url", "videourl", "voiceurl", "fileurl", "externurl"):
+    fields = ("cdnurl", "url", "videourl", "voiceurl", "fileurl", "externurl")
+    if kind == "image":
+        fields = ("cdnbigimgurl", "cdnmidimgurl") + fields
+    for field in fields:
         match = re.search(rf'{re.escape(field)}\s*=\s*["\']([^"\']+)', raw, re.I)
         if match:
             return html.unescape(match.group(1))
@@ -629,7 +636,7 @@ def stage_media(row: dict[str, Any], kind: str) -> tuple[str | None, bool]:
             try_previews = False
         else:
             break
-    url = media_url(row)
+    url = media_url(row, kind=kind)
     if not url or not url.startswith(("http://", "https://")):
         if last_error:
             raise last_error

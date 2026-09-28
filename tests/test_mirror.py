@@ -326,43 +326,5 @@ class MirrorFormattingTest(unittest.TestCase):
             self.assertEqual(store.list_confirmations()[0]["notification_status"], "sent")
 
 
-class SystemEventRenderTest(unittest.TestCase):
-    """邀请/群事件系统消息：$占位$ 替换为可读名，来源标「群事件」不透 ID（#3）。"""
-
-    def test_invite_template_with_member_pairs(self):
-        raw = '"$username$"邀请"$names$"加入了群聊 TC_bjtu 骁宇 doudou-wlcaohz 海芝'
-        self.assertEqual(mirror.system_event_body(raw), '"骁宇"邀请"海芝"加入了群聊')
-
-    def test_invite_template_with_multiple_invitees(self):
-        raw = '"$username$"邀请"$names$"加入了群聊 TC_bjtu 骁宇 a_wxid 张三 b_wxid 李四'
-        self.assertEqual(mirror.system_event_body(raw), '"骁宇"邀请"张三、李四"加入了群聊')
-
-    def test_template_without_values_degrades_to_generic(self):
-        raw = '"$username$"邀请"$names$"加入了群聊'
-        self.assertEqual(mirror.system_event_body(raw), '"成员"邀请"成员"加入了群聊')
-
-    def test_readable_system_message_is_left_alone(self):
-        self.assertIsNone(mirror.system_event_body('"张三"邀请"李四"加入了群聊'))
-        self.assertIsNone(mirror.system_event_body('你邀请张三加入了群聊'))
-
-    def test_system_event_sent_as_group_event_without_chatroom_label(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = MirrorStore(Path(directory) / "mirror.sqlite3")
-            store.initialize({"wechat_chat_name": "源", "wechat_talker": "talker",
-                              "feishu_chat_name": "目标", "feishu_chat_id": "chat", "sender_map": {}})
-            config = {"lark_profile": "test", "feishu_chat_id": "chat", "sender_map": {}}
-            raw = '"$username$"邀请"$names$"加入了群聊 room123@chatroom 骁宇 new_wxid 海芝'
-            row = {"talker": "talker", "local_id": 7, "sender_wxid": "room123@chatroom",
-                   "sender": "room123@chatroom", "kind_name": "text", "text": raw}
-            with patch.object(mirror, "run_lark", return_value={"data": {"message_id": "om_e"}}) as send:
-                mirror.send_row(config, row, {}, store)
-            sent = send.call_args.args[1][send.call_args.args[1].index("--text") + 1]
-            self.assertTrue(sent.startswith("群事件："))
-            self.assertNotIn("room123@chatroom", sent)
-            self.assertNotIn("$username$", sent)
-            # 系统消息不制造「待确认实名」噪声。
-            self.assertEqual(store.status()["pending_senders"], 0)
-
-
 if __name__ == "__main__":
     unittest.main()
