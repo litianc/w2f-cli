@@ -146,3 +146,22 @@ class ArticleSharesTest(unittest.TestCase):
             mirror.send_row(self.config, row, {}, self.store)
         self.assertEqual(len(self.calls), 1)
         self.assertIn(url, self.calls[0][self.calls[0].index('--text') + 1])
+
+    def test_native_link_repairs_literal_html_parameter_separators(self):
+        url = 'https://mp.weixin.qq.com/s?__biz=fixture&mid=123&idx=1&sn=signature&srcid=keep%26amp%3Bvalue#rd'
+        row = self.row(url.replace('&', '&amp;'))
+        with patch.object(mirror, 'run_lark', side_effect=self.transport):
+            mirror.send_row(self.config, row, {}, self.store)
+            mirror.send_row(self.config, row, {}, self.store)
+        self.assertEqual(len(self.calls), 1)
+        args = self.calls[0]
+        self.assertEqual(args[args.index('--text')+1], '实名：'+url)
+        self.assertNotIn('--content', args)
+
+    def test_native_link_does_not_change_other_urls_or_decoded_values(self):
+        from integrations.article_shares import normalize_pasted_article_url
+        for raw in [SHORT, LONG, 'https://example.com/?x=1&amp;mid=2',
+                    'https://mp.weixin.qq.com/s?__biz=x&mid=1&literal=one&amp;sn=literal',
+                    '说明 https://mp.weixin.qq.com/s?__biz=x&amp;mid=1',
+                    'https://mp.weixin.qq.com/s?__biz=x&mid=1#amp;mid=2']:
+            self.assertEqual(normalize_pasted_article_url(raw), raw)

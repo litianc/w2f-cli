@@ -267,7 +267,8 @@ def clean_body(row: dict[str, Any]) -> str:
         if pieces:
             return "\n".join(dict.fromkeys(pieces))
         return "[富文本消息]"
-    return raw or "[空消息]"
+    from integrations.article_shares import normalize_pasted_article_url
+    return normalize_pasted_article_url(raw) or "[空消息]"
 
 
 def _cdata(value: str) -> str:
@@ -471,8 +472,27 @@ def reader_media_result(row: dict[str, Any], *, preview_only: bool = False) -> t
         payload = json.loads(proc.stdout)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return [], False
+    resources = list(payload.get('data', payload).get('resources', []))
+    available = [r for r in resources if any(Path(p).expanduser().is_file() for p in
+                 [*(r.get('local_paths') or []), *([r['local_path']] if r.get('local_path') else [])])]
+    if (row.get('kind_name') == 'image' and row.get('create_time') and
+        (not available or (preview_only and not any(r.get('thumbnail_only') for r in available)))):
+        command = [str(WECHAT_READER), 'image-resource', '--talker', talker,
+                   '--local-id', local_id, '--server-id', str(row.get('server_id') or 0),
+                   '--create-time', str(row['create_time'])]
+        try:
+            result = subprocess.run(command, cwd=ROOT, text=True, encoding='utf-8', capture_output=True, timeout=45)
+            if result.returncode == 0:
+                extra = json.loads(result.stdout).get('data', {})
+                if (extra.get('contract') == 'image_resource_v1' and extra.get('talker') == talker
+                    and int(extra.get('local_id', -1)) == int(local_id)
+                    and int(extra.get('server_id', -1)) == int(row.get('server_id') or 0)
+                    and int(extra.get('create_time', -1)) == int(row['create_time'])):
+                    resources.extend(extra.get('resources', []))
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
     originals, previews = [], []
-    for resource in payload.get('data', payload).get('resources', []):
+    for resource in resources:
         candidates = previews if resource.get('thumbnail_only') else originals
         paths = list(resource.get('local_paths') or [])
         if resource.get('local_path'):

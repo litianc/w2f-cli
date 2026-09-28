@@ -107,6 +107,27 @@ def target_members(binding):
     return users,bots
 
 
+def check_removal_owner(info, member, bots):
+    """im.chats.get omits owner_id and owner_id_type for a bot-owned group."""
+    data=info.get('data',info)
+    if 'owner_id' in data:
+        owner=data['owner_id']
+        if not isinstance(owner,str) or not owner or data.get('owner_id_type','open_id')!='open_id':
+            raise NeedsReview('群主身份返回不完整，请人工核验')
+        if owner==member:
+            raise NeedsReview('目标为群主，不自动移出；请人工核验')
+        return
+    # Absence has a documented meaning for a normal group, but an empty,
+    # malformed or p2p response is not evidence of a bot owner. Cross-check
+    # the bot count against the complete member listing already obtained.
+    count=str(data.get('bot_count',''))
+    if ('owner_id_type' not in data and data.get('chat_mode') in {'group','topic'}
+            and data.get('chat_status')=='normal' and count.isdigit()
+            and int(count)==len(bots) and bots):
+        return
+    raise NeedsReview('群主身份未知，未获得机器人群主的完整群信息；请人工核验')
+
+
 def complete_task(store,task,state,error=None,attempts=None):
     with store.connect() as db:
         db.execute('UPDATE member_tasks SET state=?,error=?,attempts=COALESCE(?,attempts),retry_at=?,updated_at=? WHERE id=?',
@@ -152,8 +173,7 @@ def process_member_tasks(config,store):
                     prefix=['lark-cli','--profile',current['lark_profile'],'im']
                     if not desired:
                         info=run_cli(prefix+['chats','get','--chat-id',current['feishu_chat_id'],'--user-id-type','open_id','--as','bot','--format','json'])
-                        owner=info.get('data',info).get('owner_id')
-                        if not owner or owner==member:raise NeedsReview('群主身份未知或目标为群主，不自动移出；请人工核验')
+                        check_removal_owner(info,member,bots)
                     # Re-read after network calls for both directions. A
                     # leave or rejoin can supersede the event while querying.
                     if (task['wechat_id'] in source_members(current))!=desired:
