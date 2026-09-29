@@ -124,14 +124,21 @@ def _macos_candidates(source: Path):
                     yield candidate
 
 
-def decode_dat(source: Path, *, keys=(), allow_macos_derivation=False) -> bytes:
+def decode_dat(source: Path, *, keys=(), allow_macos_derivation=False,
+               expected_md5=None, expected_size=None) -> bytes:
+    def checked(data):
+        # Check source content identity before a WXGF-to-PNG conversion.
+        if ((expected_size is not None and len(data)!=expected_size)
+                or (expected_md5 is not None and hashlib.md5(data).hexdigest()!=expected_md5)):
+            raise ImageResourceError('image_identity_mismatch: 图片内容与源记录不匹配')
+        return data
     if source.stat().st_size > MAX_BYTES:
         raise ImageResourceError('resource_too_large: 图片超过 100 MB')
     data = source.read_bytes()
     if verified_image(data):
-        return data
+        return checked(data)
     if data.startswith(b'wxgf'):
-        return decode_wxgf(data)
+        return decode_wxgf(checked(data))
     if data[:6] in (V1, V2):
         if len(data) < 15:
             raise ImageResourceError('invalid_image_header: 图片文件头不完整')
@@ -157,9 +164,9 @@ def decode_dat(source: Path, *, keys=(), allow_macos_derivation=False) -> bytes:
                 continue
             decoded = first[:head] + data[end:raw_end] + bytes(x ^ xor for x in data[raw_end:])
             if decoded.startswith(b'wxgf'):
-                return decode_wxgf(decoded)
+                return decode_wxgf(checked(decoded))
             if verified_image(decoded):
-                return decoded
+                return checked(decoded)
         raise ImageResourceError('decode_failed: V2 图片解码或完整性校验失败')
     signatures = (b'\xff\xd8\xff', b'\x89PNG\r\n\x1a\n', b'GIF8', b'RIFF')
     for signature in signatures:
@@ -170,5 +177,5 @@ def decode_dat(source: Path, *, keys=(), allow_macos_derivation=False) -> bytes:
             continue
         decoded = bytes(x ^ key for x in data)
         if verified_image(decoded):
-            return decoded
+            return checked(decoded)
     raise ImageResourceError('decode_failed: 不支持或损坏的本机图片资源')

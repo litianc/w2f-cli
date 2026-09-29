@@ -189,7 +189,7 @@ class OfflineAcceptance(unittest.TestCase):
         parts=self.texts()[:-1]
         self.assertEqual(len(parts),5)
         self.assertTrue(parts[0].startswith('已确认姓名转发聊天记录（第 1/5 段）'))
-        self.assertTrue(parts[-1].startswith('已确认姓名转发聊天记录（第 5/5 段）'))
+        self.assertTrue(parts[-1].startswith('转发聊天记录（第 5/5 段，续上一条）'))
         self.assertEqual(''.join(p.split('\n',1)[1] for p in parts),'已确认姓名：'+'😀长记录'*4000)
         self.assertEqual(self.texts()[-1],'新实名：'+rows[1]['text'])
 

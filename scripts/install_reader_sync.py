@@ -36,6 +36,9 @@ def install(engine):
             if text.count(old)!=1:raise RuntimeError('Reader layout changed; review before installing')
             text=text.replace(old,new)
     extensions = {
+        'from reader_forward import read_forward':('forward-resource',
+            '                from reader_forward import read_forward\n'
+            '                emit(command, read_forward(sys.modules[__name__], db, args), args.pretty)\n'),
         'from reader_images import read_images':('image-resource',
             '                from reader_images import read_images\n'
             '                emit(command, read_images(sys.modules[__name__], db, args), args.pretty)\n'),
@@ -53,7 +56,7 @@ def install(engine):
             text=text.replace(old,f'            elif command == "{command}":\n'+body+old)
     compile(text,str(engine),'exec')
     sources=Path(__file__).resolve().parents[1]/'integrations'
-    changes={engine.parent/name:(sources/name).read_bytes() for name in ('reader_sync.py','forward_records.py','reader_voice.py','reader_images.py')}
+    changes={engine.parent/name:(sources/name).read_bytes() for name in ('reader_sync.py','forward_records.py','reader_voice.py','reader_images.py','reader_forward.py')}
     changes[engine]=text.encode('utf-8')
     changes={path:data for path,data in changes.items() if not path.exists() or path.read_bytes()!=data}
     if not changes:return

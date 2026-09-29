@@ -789,11 +789,11 @@ class MirrorStore:
 
     def add_media_job(self,message_id,media_type,source_ref,staging_path,state='pending',error=None):
         with self.connect() as db:
-            existing=db.execute("SELECT id FROM media_jobs WHERE message_id=? AND media_type=? ORDER BY id LIMIT 1",(message_id,media_type)).fetchone()
+            existing=db.execute("SELECT id FROM media_jobs WHERE message_id=? AND media_type=? AND source_ref IS ? ORDER BY id LIMIT 1",(message_id,media_type,source_ref)).fetchone()
             if existing:
                 db.execute("UPDATE media_jobs SET staging_path=?,state=?,error=?,attempts=attempts+1,updated_at=? WHERE id=?",(staging_path,state,error,now(),existing[0]))
             else:
-                db.execute("INSERT INTO media_jobs(message_id,media_type,staging_path,state,error,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",(message_id,media_type,staging_path,state,error,now(),now()))
+                db.execute("INSERT INTO media_jobs(message_id,media_type,source_ref,staging_path,state,error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",(message_id,media_type,source_ref,staging_path,state,error,now(),now()))
 
     def audit(self,action,before=None,after=None,actor='codex',binding_id=None,result='accepted'):
         with self.connect() as db:

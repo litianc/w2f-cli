@@ -978,7 +978,7 @@ def split_text(text, byte_limit=12000):
     return parts or ['']
 
 
-def forward_body(row, config, store):
+def forward_record_texts(row, config, store):
     items = row.get('forward_items') or forward_items(str(row.get('text') or row.get('content') or ''))
     def render(records, prefix=''):
         lines=[]
@@ -993,7 +993,11 @@ def forward_body(row, config, store):
             if item.get('children'):
                 lines.extend('  '+line for line in render(item['children'], prefix+str(i)+'.'))
         return lines
-    return '\n'.join(render(items)) if items else '[转发聊天记录内容暂不可用]'
+    return render(items) if items else ['[转发聊天记录内容暂不可用]']
+
+
+def forward_body(row, config, store):
+    return '\n'.join(forward_record_texts(row, config, store))
 
 
 def retain_legacy_article_cover_failure(store, message):
@@ -1088,7 +1092,8 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
             plan_key=f'render:{message["id"]}'
             plan=store.setting(plan_key)
             if not plan:
-                body = group_event_body(row,config,store) if is_group_event(row) else (forward_body(row,config,store) if is_forward_row(row) else clean_body(row))
+                records = forward_record_texts(row,config,store) if is_forward_row(row) else None
+                body = group_event_body(row,config,store) if is_group_event(row) else ('\n'.join(records) if records else clean_body(row))
                 quote=quote_info(row)
                 parent=store.find_message_by_server_id(bid,quote['server_id']) if quote and quote.get('server_id') else None
                 if quote and parent and parent.get('feishu_message_id'):
@@ -1101,19 +1106,32 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
                         if sender_id.endswith('@chatroom'): sender_id=''
                     except (ET.ParseError,AttributeError): sender_id=''
                     quoted_name,_=resolve_name(store,config,sender_id,quote['sender'],key+':quote')
-                    body += f"\n> {quoted_name}：{quote['content']}"
-                raw_parts=split_text(body)
-                total=len(raw_parts)
-                parts=[f'{name}转发聊天记录（第 {i}/{total} 段）\n{part}' for i,part in enumerate(raw_parts,1)] if is_forward_row(row) else [f'{name}：{part}' for part in raw_parts]
+                    suffix = f"\n> {quoted_name}：{quote['content']}"
+                    body += suffix
+                    if records:
+                        records[-1] += suffix
+                if records:
+                    from integrations.forward_layout import split_forward_records
+                    parts, record_parts = split_forward_records(records, name, with_record_parts=True)
+                else:
+                    parts = [f'{name}：{part}' for part in split_text(body)]
                 plan={'target':target,'parts':parts,'placeholder':is_forward_row(row) and body=='[转发聊天记录内容暂不可用]'}
+                if records:
+                    from agents.forward_media import video_plan, image_plan
+                    plan['videos'] = video_plan(row, records, record_parts)
+                    plan['images'] = image_plan(row, records, record_parts)
                 from integrations.article_shares import article_share
                 if not is_forward_row(row) and not is_group_event(row) and not quote:
                     plan['article'] = article_share(row)
                 store.save_setting(plan_key,plan)
             for index,part in enumerate(plan['parts']):
                 result=send(f'text-{index}',plan['target']+['--text',part])
+                if plan.get('videos') or plan.get('images'):
+                    from agents.forward_media import deliver_media
+                    deliver_media(sys.modules[__name__],config,store,message,row,plan,index)
             cover_missing=retain_legacy_article_cover_failure(store,message)
-            placeholder=plan['placeholder'] or cover_missing
+            from agents.forward_media import has_media_failures
+            placeholder=plan['placeholder'] or cover_missing or has_media_failures(store,message['id'])
         store.mark_message(key,'placeholder' if placeholder else 'sent',binding_id=bid,feishu_message_id=message['feishu_message_id'] if config.get('_retry_media') else str(result['data']['message_id']))
     except Exception as exc:
         store.mark_message(key,'failed',binding_id=bid,error=safe_error(exc))
@@ -1215,7 +1233,7 @@ def retry_media_jobs(config,store):
             continue
         with store.connect() as db:db.execute("UPDATE media_jobs SET state='processing' WHERE id=?",(job['id'],))
         try:
-            send_row({**config,'_retry_media':True},json.loads(job['payload_json']),{},store)
+            send_row({**config,'_retry_media':True,'_retry_media_job_id':job['id']},json.loads(job['payload_json']),{},store)
             with store.connect() as db:
                 current=db.execute('SELECT state,attempts FROM media_jobs WHERE id=?',(job['id'],)).fetchone()
                 if current['state']=='placeholder':

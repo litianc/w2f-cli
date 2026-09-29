@@ -515,6 +515,15 @@ class Manager:
             result=chat_share_link(profile,chat_id)
         elif resource=='wizard' and op=='create-target':
             result=create_target(s,data,run_cli,chat_share_link)
+        elif resource=='media-failures' and op in {'forward-videos','forward-images'}:
+            from agents import wechat_feishu_mirror as mirror
+            from agents.forward_media import queue_media_repair
+            with s.connect() as db:
+                message=db.execute('SELECT binding_id FROM messages WHERE id=?',(int(data['id']),)).fetchone()
+            if not message:raise ValueError('消息不存在')
+            binding=s.get_binding(message['binding_id'])
+            config={**read_config(self.config_path),**binding,'binding_id':binding['id']}
+            result=queue_media_repair(mirror,s,config,int(data['id']),'image' if op=='forward-images' else 'video')
         elif resource=='media-failures' and op=='retry':
             with s.connect() as db:
                 row=db.execute('SELECT * FROM media_jobs WHERE id=?',(int(data['id']),)).fetchone()

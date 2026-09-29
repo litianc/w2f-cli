@@ -1,6 +1,7 @@
 """Structured merged-forward decoding; shared by the reader and mirror."""
 import html
 import re
+import urllib.parse
 import xml.etree.ElementTree as ET
 
 
@@ -9,6 +10,21 @@ def stable_sender_id(value):
     return value if (re.fullmatch(r'[A-Za-z0-9_.@-]+', value)
                      and not value.endswith('@chatroom')
                      and not value.startswith('unidentified:')) else ''
+
+
+def _http_url(value):
+    value = str(value or '').strip()
+    if not value or any(c.isspace() or ord(c) < 32 or c in '\\<>"\x7f' for c in value):
+        return ''
+    try:
+        page = urllib.parse.urlsplit(value)
+        if (page.scheme not in {'http', 'https'} or not page.hostname
+                or page.username is not None or page.password is not None
+                or (page.port is not None and not 0 < page.port < 65536)):
+            return ''
+    except ValueError:
+        return ''
+    return value
 
 
 def parse_record(raw, depth=0):
@@ -47,12 +63,54 @@ def parse_record(raw, depth=0):
                 children = parse_record(nested, depth + 1)
             else:
                 children = []
-            url = field(item, 'weburl', 'url')
-            if url.startswith(('http://','https://')) and url not in body:
+            if kind == 'link':
+                # Native merged forwards store article fields in weburlitem,
+                # not datatitle/datadesc. Read only those explicit fields so
+                # avatars and signed cover resources never become article URLs.
+                title = field(item, 'weburlitem/title', 'datatitle', 'title')
+                description = field(item, 'weburlitem/desc')
+                if not description:
+                    description = field(item, 'datadesc', 'content', 'des')
+                    # Legacy content may hold an entire app-message envelope.
+                    # Keep its raw XML out without discarding explicit titles.
+                    if description.lstrip().startswith('<'):
+                        description = ''
+                body = '\n'.join(dict.fromkeys(value for value in (title, description) if value))
+                url = next((valid for tag in ('weburlitem/url', 'weburl', 'url', 'link')
+                            if (valid := _http_url(item.findtext(tag)))), '')
+            else:
+                url = field(item, 'weburl', 'url')
+            if url.lower().startswith(('http://','https://')) and url not in body:
                 body += ('\n' if body else '') + url
             if not body:
                 body = {'image':'[图片]','video':'[视频]','voice':'[语音]','file':'[文件]','sticker':'[表情]'}.get(kind,'[原消息内容不可用]')
-            if body.lstrip().startswith('<'):
+            if kind != 'link' and body.lstrip().startswith('<'):
                 body = '[原消息内容不可用]' if not children else ''
-            result.append({'sender':sender, 'sender_id':sender_id, 'body':body, 'kind':kind, 'children':children})
+            entry = {'sender':sender, 'sender_id':sender_id, 'body':body, 'kind':kind, 'children':children}
+            if kind in {'video', 'image'}:
+                # CDN tickets/keys are not public URLs. Keep only the exact
+                # content identity needed for a local, verified file lookup.
+                digest = field(item, 'fullmd5').lower()
+                def number(tag):
+                    value = field(item, tag)
+                    return int(value) if re.fullmatch(r'\d{1,12}', value) else 0
+                entry['media'] = {'md5': digest if re.fullmatch(r'[a-f0-9]{32}', digest) else '',
+                                  'size': number('datasize')}
+                extension = field(item, 'datafmt').lower().lstrip('.')
+                if kind == 'video':
+                    entry['media'].update(duration=number('duration'), extension='.mp4' if extension == 'mp4' else '')
+                else:
+                    entry['media']['extension'] = '.' + extension if extension in {'jpg','jpeg','png','gif','webp','bmp','wxgf'} else ''
+                    thumb = field(item, 'thumbfullmd5').lower()
+                    if re.fullmatch(r'[a-f0-9]{32}', thumb) and number('thumbsize'):
+                        entry['media']['thumbnail'] = {'md5':thumb, 'size':number('thumbsize')}
+            result.append(entry)
     return result
+
+
+def walk_records(items, prefix=''):
+    """Stable positional identity even when two children share the same bytes."""
+    for index, item in enumerate(items):
+        path = prefix + str(index)
+        yield path, item
+        yield from walk_records(item.get('children') or [], path + '.')

@@ -11,6 +11,12 @@ from contextlib import closing, contextmanager
 
 
 def register(sub):
+    forward = sub.add_parser('forward-resource', help='Locate one exact merged-forward image or video')
+    forward.add_argument('--talker', required=True)
+    forward.add_argument('--local-id', type=int, required=True)
+    forward.add_argument('--server-id', type=int, required=True)
+    forward.add_argument('--create-time', type=int, required=True)
+    forward.add_argument('--item-path', required=True)
     watch = sub.add_parser('watch-changes', help='Emit DB/WAL change hints without reading chat contents')
     watch.add_argument('--poll-interval', type=float, default=1)
     image = sub.add_parser('image-resource', help='Locate one exact local image attachment')
