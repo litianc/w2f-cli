@@ -7,6 +7,8 @@ shapes that agents/wechat_feishu_mirror.py and agents/manage.py expect:
 
 - sync-page   -> {"ok":true,"data":{"contract":"ordered_sync_v1",...}}
 - resolve-chat -> {"ok":true,"data":{"candidates":[...]}}
+- contacts    -> {"ok":true,"data":{"contacts":[...]}} (groups or friends, manage.py wizard/people)
+- members     -> {"ok":true,"data":{"chatroom_id":...,"members":[...]}}
 - media       -> {"ok":true,"data":{"resources":[...]}} (empty until ticket 05)
 
 Configuration via environment: WDA_BASE (default http://localhost:10392).
@@ -372,8 +374,41 @@ def cmd_media(args: argparse.Namespace) -> dict:
     return {"ok": True, "data": {"resources": []}}
 
 
+def cmd_contacts(args: argparse.Namespace) -> dict:
+    """Group or friend list for the admin wizard/people pages.
+
+    manage.py calls `contacts --groups-only|--friends-only --limit N` and reads
+    `data.contacts[].{username,display_name,remark,nick_name,alias}`. WDA serves
+    the real address book at /api/chat/contacts with include_* toggles; officials
+    are excluded in both modes so公众号 never shows up as a mirrorable party.
+    """
+    payload = api_get("/api/chat/contacts",
+                      include_groups="true" if args.groups_only else "false",
+                      include_friends="true" if args.friends_only else "false",
+                      include_officials="false")
+    rows = payload.get("contacts") or []
+    want_group = bool(args.groups_only)
+    mapped = [map_contact(row) for row in rows
+              if (str(row.get("type") or "") == "group") == want_group]
+    limit = max(0, int(args.limit))
+    return {"ok": True, "data": {"contacts": mapped[:limit]}}
+
+
+def map_contact(row: dict) -> dict:
+    """One WDA contact -> the manage.py contract row."""
+    username = str(row.get("username") or "")
+    display = next((str(row.get(key) or "").strip()
+                    for key in ("displayName", "remark", "nickname", "alias")
+                    if str(row.get(key) or "").strip()), username)
+    return {"username": username, "display_name": display,
+            "remark": str(row.get("remark") or ""), "nick_name": str(row.get("nickname") or ""),
+            "alias": str(row.get("alias") or "")}
+
+
 def cmd_members(args):
     """Fail closed unless WDA explicitly proves a complete same-group list."""
+    if getattr(args, "chatroom_id", None):
+        args.talker = args.chatroom_id
     payload=api_get('/api/chat/contacts/group_members',username=args.talker,limit=args.limit,offset=args.offset)
     members=payload.get('members')
     total=payload.get('total',payload.get('totalCount'))
@@ -387,10 +422,7 @@ def cmd_members(args):
     return {'ok':True,'data':{'chatroom_id':args.talker,'members':members,'total':total}}
 
 
-def main() -> int:
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")   # Windows 默认 GBK 会损坏中文
-        sys.stderr.reconfigure(encoding="utf-8")
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wda_reader", description="WDA -> w2f 读取器适配层")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -409,8 +441,17 @@ def main() -> int:
     resolve.add_argument("--limit", type=int, default=30)
     resolve.set_defaults(handler=cmd_resolve_chat)
 
+    contacts = sub.add_parser("contacts", help="群/好友通讯录（供管理台向导与人员页）")
+    mode = contacts.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--groups-only", action="store_true")
+    mode.add_argument("--friends-only", action="store_true")
+    contacts.add_argument("--limit", type=int, default=30)
+    contacts.set_defaults(handler=cmd_contacts)
+
     members = sub.add_parser('members',help='Complete membership snapshot or explicit unavailability')
-    members.add_argument('talker')
+    members.add_argument('talker', nargs='?', default='')
+    members.add_argument('--chatroom-id', dest='chatroom_id', default=None,
+                         help='reader.sh 风格旗标形式；与位置参数等价')
     members.add_argument('--limit',type=int,default=10000)
     members.add_argument('--offset',type=int,default=0)
     members.set_defaults(handler=cmd_members)
@@ -421,6 +462,14 @@ def main() -> int:
     media.add_argument("--server-id")
     media.add_argument("--include-local-paths", default="true")
     media.set_defaults(handler=cmd_media)
+    return parser
+
+
+def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")   # Windows 默认 GBK 会损坏中文
+        sys.stderr.reconfigure(encoding="utf-8")
+    parser = build_parser()
 
     args = parser.parse_args()
     try:
