@@ -16,8 +16,8 @@ _SPEC = importlib.util.spec_from_file_location(
 wda = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(wda)
 
-GROUP = {"username": "52038853753@chatroom", "displayName": "中文龙虾bot群", "remark": "",
-         "nickname": "龙虾群", "alias": "lxq", "type": "group"}
+GROUP = {"username": "fixtureroom01@chatroom", "displayName": "示例群", "remark": "",
+         "nickname": "示例群昵称", "alias": "lx", "type": "group"}
 FRIEND = {"username": "wxid_abc", "displayName": "张三", "remark": "三儿",
           "nickname": "小张", "alias": "zs", "type": "friend"}
 
@@ -40,15 +40,15 @@ class ContactsGroupsOnly(unittest.TestCase):
         self.assertEqual(get.call_args.kwargs.get("include_friends"), "false")
         self.assertEqual(result["ok"], True)
         self.assertEqual(result["data"]["contacts"], [
-            {"username": "52038853753@chatroom", "display_name": "中文龙虾bot群",
-             "remark": "", "nick_name": "龙虾群", "alias": "lxq"}])
+            {"username": "fixtureroom01@chatroom", "display_name": "示例群",
+             "remark": "", "nick_name": "示例群昵称", "alias": "lx"}])
 
     def test_officials_never_leak_into_groups(self):
         official = {"username": "gh_official", "displayName": "某公众号", "type": "official"}
         with patch.object(wda, "api_get", return_value=wda_contacts([GROUP, official])):
             result = cli(["contacts", "--groups-only", "--limit", "100000"])
         self.assertEqual([c["username"] for c in result["data"]["contacts"]],
-                         ["52038853753@chatroom"])
+                         ["fixtureroom01@chatroom"])
 
 
 class ContactsFriendsOnly(unittest.TestCase):
