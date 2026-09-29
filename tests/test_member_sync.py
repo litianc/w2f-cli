@@ -90,6 +90,39 @@ class MemberSyncTest(unittest.TestCase):
         self.assertEqual(self.task()['state'],'needs_review');self.assertEqual(self.writes,[])
         self.owner='ou_actor';self.bots.add('ou_target');retry_member_task(self.s,self.task()['id']);self.tick();self.assertEqual(self.writes,[])
         self.bots.remove('ou_target');self.partial=True;retry_member_task(self.s,self.task()['id']);self.tick();self.assertEqual(self.writes,[])
+    def test_bot_owned_group_omits_human_owner_field(self):
+        self.target.add('ou_target');self.source.remove('wx_target');self.put(event(11,'remove'))
+        original=self.cli
+        def cli(args,**kwargs):
+            if 'chats' in args:
+                return {'data':{'chat_mode':'group','chat_status':'normal','bot_count':'1','user_count':'2'}}
+            return original(args,**kwargs)
+        with patch('agents.member_sync.run_cli',side_effect=cli):
+            process_member_tasks({'binding_id':1},self.s)
+            process_member_tasks({'binding_id':1},self.s)
+        self.assertEqual(self.task()['state'],'applied')
+        self.assertEqual(self.writes,[('delete','ou_target')])
+        self.assertEqual(self.target,{'ou_actor'})
+        self.assertEqual(self.bots,{'cli_bot'})
+
+    def test_missing_owner_without_bot_owned_group_evidence_is_protected(self):
+        self.target.add('ou_target');self.source.remove('wx_target');self.put(event(11,'remove'))
+        original=self.cli
+        cases=[{}, {'chat_mode':'p2p','chat_status':'normal','bot_count':'1'},
+               {'chat_mode':'group','chat_status':'normal','bot_count':'0'},
+               {'chat_mode':'group','chat_status':'normal','bot_count':'2'},
+               {'chat_mode':'group','chat_status':'normal','bot_count':'1','owner_id':''},
+               {'chat_mode':'group','chat_status':'normal','bot_count':'1','owner_id':None},
+               {'chat_mode':'group','chat_status':'normal','bot_count':'1','owner_id_type':'open_id'}]
+        for info in cases:
+            with self.subTest(info=info):
+                if self.s.list_member_tasks(1):retry_member_task(self.s,self.task()['id'])
+                def cli(args,**kwargs):
+                    return {'data':info} if 'chats' in args else original(args,**kwargs)
+                with patch('agents.member_sync.run_cli',side_effect=cli):process_member_tasks({'binding_id':1},self.s)
+                self.assertEqual(self.task()['state'],'needs_review')
+                self.assertEqual(self.writes,[])
+
     def test_lost_receipt_recovers_via_readback_without_duplicate_write(self):
         self.put(event());self.lose_receipt=True;self.tick();self.assertEqual(self.task()['state'],'uncertain')
         self.lose_receipt=False;self.tick();self.assertEqual(self.task()['state'],'applied');self.assertEqual(len(self.writes),1)

@@ -28,6 +28,16 @@ def v2(data, key, xor=0x51, head=32, tail=16):
 
 
 class ImageResourceRegression(unittest.TestCase):
+    def test_wxgf_inside_v2_uses_converter_after_successful_decryption(self):
+        from agents import media_images
+        wxgf = b'wxgf' + bytes([19,0,2]) + (32).to_bytes(2,'big') * 2 + bytes(70)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'source.dat';path.write_bytes(v2(wxgf,b'0123456789abcdef'))
+            with patch.object(media_images,'decode_wxgf',return_value=picture()) as convert:
+                result = media_images.decode_dat(path,keys=[(b'0123456789abcdef',0x51)])
+            self.assertEqual(result,picture())
+            convert.assert_called_once_with(wxgf)
+
     def test_v2_decodes_original_pixels_and_exact_block_padding(self):
         from agents.media_images import decode_dat
         original = picture()

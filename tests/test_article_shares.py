@@ -1,4 +1,4 @@
-"""Article shares retain exact links and cover delivery across retries."""
+"""Article shares retain exact links without redundant cover replies."""
 import html
 import json
 import tempfile
@@ -35,6 +35,19 @@ class ArticleSharesTest(unittest.TestCase):
         self.calls.append(args)
         return {'data': {'message_id': 'om_fixture_' + str(len(self.calls))}}
 
+    def test_cli_cover_fallback_must_not_create_an_extra_link_reply(self):
+        visible = []
+        def cli_with_fallback(config, args):
+            visible.append('[image upload failed, sending link] ' + COVER
+                           if '--image' in args else args[args.index('--text') + 1])
+            return self.transport(config, args)
+        with patch.object(mirror, 'run_lark', side_effect=cli_with_fallback):
+            mirror.send_row(self.config, self.row(article_xml()), {}, self.store)
+        self.assertEqual(len(visible), 1, '文章不得额外补发封面或上传失败链接')
+        self.assertNotIn('image upload failed', visible[0])
+        with self.store.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM media_jobs').fetchone()[0], 0)
+
     def test_xml_entities_and_cdata_keep_exact_article_url_only(self):
         for url in (SHORT, LONG):
             for cdata in (False, True):
@@ -48,7 +61,7 @@ class ArticleSharesTest(unittest.TestCase):
                     self.assertNotIn('cover.jpg', body)
                     self.assertNotIn('avatar.jpg', body)
 
-    def test_short_and_long_links_send_title_link_and_explicit_cover(self):
+    def test_short_and_long_links_send_only_title_and_original_link(self):
         with patch.object(mirror, 'run_lark', side_effect=self.transport):
             for index, url in enumerate((SHORT, LONG), 1):
                 mirror.send_row(self.config, self.row(article_xml(url), index), {}, self.store)
@@ -58,14 +71,15 @@ class ArticleSharesTest(unittest.TestCase):
         for text, url in zip(texts, (SHORT, LONG)):
             self.assertIn('实名：' + TITLE, text)
             self.assertIn(url, text.splitlines())
-        self.assertEqual(covers, [COVER, COVER])
+        self.assertEqual(covers, [])
 
     def test_wda_keeps_metadata_and_persists_for_retry(self):
         row = map_row('room', {'type': (5 << 32) | 49, 'localId': 4, 'senderUsername': 'wx',
             'title': TITLE, 'url': LONG, 'thumbUrl': COVER, 'description': '摘要'}, {})
         with patch.object(mirror, 'run_lark', side_effect=self.transport):
             mirror.send_row(self.config, row, {}, self.store)
-        self.assertTrue(any('--image' in a and COVER in a for a in self.calls))
+        self.assertEqual(len(self.calls), 1)
+        self.assertNotIn('--image', self.calls[0])
         saved = json.loads(self.store.message('room:4', 1)['payload_json'])
         self.assertEqual(saved['article']['url'], LONG)
         self.assertEqual(saved['article']['cover_url'], COVER)
@@ -84,44 +98,53 @@ class ArticleSharesTest(unittest.TestCase):
         self.assertEqual(self.store.message('room:1', 1)['state'], 'sent')
         self.assertEqual(self.store.list_media_failures(), [])
 
-    def test_definite_cover_failure_allows_next_message_and_manual_retry_no_duplicate_text(self):
+    def seed_legacy_cover(self, state):
         row = self.row(article_xml())
-        def reject(config, args):
-            if '--image' in args: raise mirror.CliError('cover unavailable')
-            return self.transport(config, args)
-        with patch.object(mirror, 'run_lark', side_effect=reject):
-            mirror.send_row(self.config, row, {}, self.store)
-            mirror.send_row(self.config, self.row('next', 2), {}, self.store)
-        self.assertEqual(self.store.message('room:1', 1)['state'], 'placeholder')
-        self.assertEqual(self.store.message('room:2', 1)['state'], 'sent')
-        self.assertEqual(len(self.store.list_media_failures()), 1)
-        self.store = MirrorStore(self.store.path)
         with patch.object(mirror, 'run_lark', side_effect=self.transport):
-            saved = json.loads(self.store.message('room:1', 1)['payload_json'])
-            mirror.send_row({**self.config, '_retry_media': True}, saved, {}, self.store)
-            mirror.send_row(self.config, saved, {}, self.store)
-        self.assertEqual(len([a for a in self.calls if '--text' in a]), 2)
-        self.assertEqual(len([a for a in self.calls if '--image' in a]), 1)
-        self.assertEqual(self.store.list_media_failures(), [])
-
-    def test_uncertain_cover_receipt_is_not_reported_as_success(self):
-        def uncertain(config, args):
-            if '--image' in args: raise mirror.CliError('timeout', uncertain=True)
-            return self.transport(config, args)
-        with patch.object(mirror, 'run_lark', side_effect=uncertain):
-            mirror.send_row(self.config, self.row(article_xml()), {}, self.store)
-            mirror.send_row(self.config, self.row('next', 2), {}, self.store)
+            mirror.send_row(self.config, row, {}, self.store)
         message = self.store.message('room:1', 1)
-        self.assertEqual(message['state'], 'placeholder')
-        self.assertEqual(self.store.message('room:2', 1)['state'], 'sent')
-        self.assertEqual(self.store.delivery(message['id'], 'article-cover')['state'], 'uncertain')
+        self.store.prepare_delivery(message['id'], 'article-cover',
+            ['+messages-reply', '--message-id', message['feishu_message_id'], '--image', COVER], 'legacy-cover')
+        self.store.set_delivery(message['id'], 'article-cover', state,
+            'om_legacy_cover' if state == 'sent' else None, error=None if state == 'sent' else 'cover upload unresolved')
+        self.store.add_media_job(message['id'], 'article_cover', None, None,
+            'uploaded' if state == 'sent' else 'pending', None if state == 'sent' else 'cover upload unresolved')
+        self.store.mark_message('room:1', 'processing' if state == 'sent' else 'placeholder', binding_id=1)
+        return row, message
+
+    def test_legacy_pending_cover_retry_stops_without_duplicate_text_or_false_success(self):
+        row, message = self.seed_legacy_cover('pending')
+        self.store = MirrorStore(self.store.path)
+        with patch.object(mirror, 'run_lark', side_effect=AssertionError('no cover or duplicate text')):
+            mirror.retry_media_jobs({**self.config, 'binding_id': 1}, self.store)
+            mirror.retry_media_jobs({**self.config, 'binding_id': 1}, self.store)
+        self.assertEqual(self.store.message('room:1', 1)['state'], 'placeholder')
+        self.assertEqual(self.store.message('room:1', 1)['feishu_message_id'], message['feishu_message_id'])
         self.assertEqual(self.store.list_media_failures()[0]['state'], 'manual')
-        # Beyond Feishu's UUID window, manual retries must not blindly write.
+        self.assertEqual(self.store.delivery(message['id'], 'article-cover')['state'], 'pending')
+        with patch.object(mirror, 'run_lark', side_effect=self.transport):
+            mirror.send_row(self.config, self.row('next', 2), {}, self.store)
+        self.assertEqual(self.store.message('room:2', 1)['state'], 'sent')
+
+    def test_legacy_uncertain_cover_receipt_is_preserved_without_resending(self):
+        row, message = self.seed_legacy_cover('uncertain')
         with self.store.connect() as db:
             db.execute('UPDATE deliveries SET attempted_at=1 WHERE message_id=? AND part=?', (message['id'], 'article-cover'))
-        with patch.object(mirror, 'run_lark', side_effect=AssertionError('uncertain cover must be checked first')):
-            mirror.send_row({**self.config, '_retry_media': True}, self.row(article_xml()), {}, self.store)
+        with patch.object(mirror, 'run_lark', side_effect=AssertionError('uncertain cover must not be resent')):
+            mirror.retry_media_jobs({**self.config, 'binding_id': 1}, self.store)
+            mirror.send_row({**self.config, '_retry_media': True}, row, {}, self.store)
         self.assertEqual(self.store.delivery(message['id'], 'article-cover')['state'], 'uncertain')
+        self.assertEqual(self.store.list_media_failures()[0]['state'], 'manual')
+        self.assertEqual(self.store.message('room:1', 1)['state'], 'placeholder')
+        self.assertEqual(len(self.store.uncertain_deliveries()), 1)
+
+    def test_completed_legacy_cover_is_not_resent_on_restart(self):
+        row, message = self.seed_legacy_cover('sent')
+        self.store = MirrorStore(self.store.path)
+        with patch.object(mirror, 'run_lark', side_effect=AssertionError('completed article must not be resent')):
+            mirror.send_row(self.config, row, {}, self.store)
+        self.assertEqual(self.store.message('room:1', 1)['state'], 'sent')
+        self.assertEqual(self.store.delivery(message['id'], 'article-cover')['feishu_message_id'], 'om_legacy_cover')
 
     def test_wda_raw_xml_fallback_and_plain_web_link(self):
         row = map_row('room', {'type': (5 << 32) | 49, 'localId': 7, 'content': article_xml(cdata=True)}, {})
@@ -129,14 +152,14 @@ class ArticleSharesTest(unittest.TestCase):
         self.assertEqual(row['article']['cover_url'], COVER)
         self.assertEqual(mirror.clean_body(self.row('https://example.com/?x=1&y=2')), 'https://example.com/?x=1&y=2')
 
-    def test_completed_cover_receipt_survives_worker_restart(self):
+    def test_article_receipt_survives_worker_restart(self):
         row = self.row(article_xml())
         with patch.object(mirror, 'run_lark', side_effect=self.transport):
             mirror.send_row(self.config, row, {}, self.store)
             self.store.mark_message('room:1', 'processing', binding_id=1)
             self.store = MirrorStore(self.store.path)
             mirror.send_row(self.config, row, {}, self.store)
-        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(self.calls), 1)
         self.assertEqual(self.store.message('room:1', 1)['state'], 'sent')
 
     def test_non_http_cover_is_not_uploaded_and_query_is_not_double_decoded(self):
@@ -146,3 +169,22 @@ class ArticleSharesTest(unittest.TestCase):
             mirror.send_row(self.config, row, {}, self.store)
         self.assertEqual(len(self.calls), 1)
         self.assertIn(url, self.calls[0][self.calls[0].index('--text') + 1])
+
+    def test_native_link_repairs_literal_html_parameter_separators(self):
+        url = 'https://mp.weixin.qq.com/s?__biz=fixture&mid=123&idx=1&sn=signature&srcid=keep%26amp%3Bvalue#rd'
+        row = self.row(url.replace('&', '&amp;'))
+        with patch.object(mirror, 'run_lark', side_effect=self.transport):
+            mirror.send_row(self.config, row, {}, self.store)
+            mirror.send_row(self.config, row, {}, self.store)
+        self.assertEqual(len(self.calls), 1)
+        args = self.calls[0]
+        self.assertEqual(args[args.index('--text')+1], '实名：'+url)
+        self.assertNotIn('--content', args)
+
+    def test_native_link_does_not_change_other_urls_or_decoded_values(self):
+        from integrations.article_shares import normalize_pasted_article_url
+        for raw in [SHORT, LONG, 'https://example.com/?x=1&amp;mid=2',
+                    'https://mp.weixin.qq.com/s?__biz=x&mid=1&literal=one&amp;sn=literal',
+                    '说明 https://mp.weixin.qq.com/s?__biz=x&amp;mid=1',
+                    'https://mp.weixin.qq.com/s?__biz=x&mid=1#amp;mid=2']:
+            self.assertEqual(normalize_pasted_article_url(raw), raw)

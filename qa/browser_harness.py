@@ -49,6 +49,9 @@ def isolated_manager():
             "state_file": str(root / "state.json"), "wechat_reader": str(root / "fake-reader"),
         }), encoding="utf-8")
         calls, violations = [], []
+        wizard = SimpleNamespace(enabled=False, sources=[], targets=[], creates=[], members=None,
+                                 error=None, entered=threading.Event(), release=threading.Event())
+        wizard.release.set()
 
         def deny(*args, **kwargs):
             violations.append("An unconfigured external boundary was blocked")
@@ -59,12 +62,42 @@ def isolated_manager():
             # Every other CLI call must be added explicitly with synthetic data.
             if len(argv) > 1 and argv[1:] == ["contacts", "--groups-only", "--limit", "100000"]:
                 calls.append("reader.contacts")
-                return {"ok": True, "data": {"contacts": []}}
+                return {"ok": True, "data": {"contacts": wizard.sources if wizard.enabled else []}}
+            if wizard.enabled and argv[:1] == ['lark-cli'] and '--profile' in argv:
+                selected = argv[argv.index('--profile') + 1]
+                app = next((p for p in store.list_profiles() if p['profile_name'] == selected), None)
+                if not app or '--as' not in argv or argv[argv.index('--as') + 1] != 'bot':
+                    return deny()
+                if '+chat-list' in argv:
+                    return {'data': {'items': wizard.targets}}
+                if '+chat-create' in argv:
+                    wizard.creates.append(argv)
+                    wizard.entered.set()
+                    if not wizard.release.wait(10): raise RuntimeError('Synthetic create timed out')
+                    if wizard.error: raise wizard.error
+                    group = {'chat_id': 'oc_qa_created_' + str(len(wizard.creates)), 'name': argv[argv.index('--name') + 1]}
+                    wizard.targets.append(group)
+                    return {'data': group}
+                if '+chat-members-list' in argv:
+                    users = wizard.members
+                    if users is None:
+                        last = wizard.creates[-1] if wizard.creates else []
+                        users = last[last.index('--users') + 1].split(',') if '--users' in last else []
+                    return {'data': {'users': [{'member_id': uid} for uid in users], 'bots': [{'app_id': app['app_id']}]}}
+                if 'chats' in argv and 'get' in argv:
+                    return {'data': {'name': 'QA created group'}}
+                if 'chats' in argv and 'link' in argv:
+                    return {'data': {'share_link': 'https://example.invalid/qa-invite'}}
+            return deny()
+
+        def fake_source(config, cursor):
+            if wizard.enabled and any(r['username'] == config.get('wechat_talker') for r in wizard.sources):
+                return {'contract': 'ordered_sync_v1', 'through_local_id': 0, 'messages': [], 'has_more': False}
             return deny()
 
         stack.enter_context(patch("agents.manage.run_cli", side_effect=fake_cli))
         stack.enter_context(patch("agents.manage.run_command", side_effect=fake_cli))
-        stack.enter_context(patch("agents.wechat_feishu_mirror.source_page", side_effect=deny))
+        stack.enter_context(patch("agents.wechat_feishu_mirror.source_page", side_effect=fake_source))
         stack.enter_context(patch("agents.wechat_feishu_mirror.run_lark", side_effect=deny))
         # Prevent future product changes from accidentally bypassing the wrappers.
         import subprocess
@@ -85,7 +118,7 @@ def isolated_manager():
         try:
             yield SimpleNamespace(store=store, profile=profile, origin=origin,
                                   url=f"{origin}/#token={token}", root=root,
-                                  external_calls=calls, violations=violations)
+                                  external_calls=calls, violations=violations, wizard=wizard)
         finally:
             server.shutdown()
             server.server_close()

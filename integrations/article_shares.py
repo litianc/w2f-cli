@@ -3,6 +3,7 @@
 No page scraping, URL shortening, query rewriting, or network access.
 """
 from __future__ import annotations
+import re
 import urllib.parse
 import xml.etree.ElementTree as ET
 
@@ -58,3 +59,23 @@ def article_share(row):
 def article_body(article):
     parts = [article.get('title'), article.get('description'), article.get('url')]
     return '\n'.join(dict.fromkeys(part for part in parts if part)) or '[文章链接暂不可用]'
+
+
+def normalize_pasted_article_url(raw):
+    """Repair known HTML-escaped delimiters in a standalone WeChat URL only.
+
+    Structured XML/reader fields have already been decoded and never use this.
+    Keep percent encodings, parameter values, order and fragment unchanged.
+    """
+    value = raw.strip()
+    if not _url(value) or any(c.isspace() for c in value):
+        return raw
+    parsed = urllib.parse.urlsplit(value)
+    keys = urllib.parse.parse_qs(parsed.query)
+    if (parsed.hostname != 'mp.weixin.qq.com' or parsed.path != '/s'
+            or '__biz' not in keys or 'amp;mid' not in keys or 'mid' in keys):
+        return raw
+    prefix, _, rest = value.partition('?')
+    query, fragment_mark, fragment = rest.partition('#')
+    query = re.sub(r'&amp;(?=(?:mid|idx|sn|chksm|mpshare|scene|srcid|sharer_shareinfo(?:_first)?)=)', '&', query)
+    return raw.replace(value, prefix + '?' + query + fragment_mark + fragment, 1)

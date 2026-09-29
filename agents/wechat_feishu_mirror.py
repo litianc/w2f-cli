@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import base64
 import html
 import hashlib
 import json
@@ -267,49 +268,125 @@ def clean_body(row: dict[str, Any]) -> str:
         if pieces:
             return "\n".join(dict.fromkeys(pieces))
         return "[富文本消息]"
-    return raw or "[空消息]"
+    from integrations.article_shares import normalize_pasted_article_url
+    return normalize_pasted_article_url(raw) or "[空消息]"
 
 
-def _cdata(value: str) -> str:
-    value = html.unescape(str(value or ""))
-    value = re.sub(r"^<!\[CDATA\[(.*?)\]\]>$", r"\1", value, flags=re.S)
-    return value.strip()
+def _channel_page_from_ids(object_id: str, nonce: str) -> str:
+    """Encode the uint64 IDs, never the full nonce context, as page parameters.
+
+    Reference: wx_channels_download at 124f044235bc706fe796c043a14ff442a150ae5d,
+    BuildJumpURLFromParts / EncodeUint64ToBase64. This is not an official
+    playback contract; a correctly encoded URL may still be inaccessible.
+    """
+    parts = nonce.split('_')
+    if len(parts) not in {1, 5, 7}:
+        return ''
+    numeric = parts[:-1] if len(parts) == 7 else parts
+    if any(not re.fullmatch(r'[0-9]{1,20}', part) for part in [object_id, *numeric]):
+        return ''
+    if len(parts) == 7 and not re.fullmatch(
+        r'(?:[0-9a-fA-F]{8,64}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})', parts[-1]
+    ):
+        return ''
+    identifiers = [int(object_id), int(parts[0])]
+    if any(value >= 1 << 64 for value in identifiers):
+        return ''
+    oid, nid = [base64.urlsafe_b64encode(value.to_bytes(8, 'big')).decode('ascii').rstrip('=')
+                for value in identifiers]
+    return f'https://channels.weixin.qq.com/web/pages/feed?oid={oid}&nid={nid}'
+
+
+def _channel_share_url(value: str) -> str:
+    """Accept sharing pages, not media resources or URLs resembling their host."""
+    value = value.strip()
+    if (not value or any(c.isspace() or ord(c) < 32 or c in '\\<>"\'\x7f' for c in value)
+            or re.search(r'%(?![0-9a-fA-F]{2})', value)):
+        return ''
+    try:
+        page = urllib.parse.urlsplit(value)
+        if (page.scheme not in {'http', 'https'} or page.username is not None
+                or page.password is not None or page.port not in {None, 443 if page.scheme == 'https' else 80}):
+            return ''
+        query = urllib.parse.parse_qs(page.query, keep_blank_values=True)
+        private_keys = {'encfilekey', 'token', 'urltoken', 'aeskey', 'authkey', 'auth_key',
+                        'access_token', 'refresh_token', 'signature'}
+        private_parameter = r'(?:^|[?&#;=/])(?:' + '|'.join(sorted(private_keys)) + r')='
+        for component in (page.query, page.fragment):
+            # Inspect encoded/nested values as well as top-level keys. Only use
+            # decoded copies for screening; the accepted URL stays byte-for-byte
+            # unchanged. Reject embedded resource URLs and excessive nesting.
+            for _ in range(4):
+                if (re.search(private_parameter, component, re.I)
+                        or re.search(r'(?:https?:)?[/\\]{2}', component, re.I)):
+                    return ''
+                decoded = urllib.parse.unquote(component)
+                if decoded == component:
+                    break
+                component = decoded
+            else:
+                return ''
+        if page.hostname == 'weixin.qq.com' and re.fullmatch(r'/sph/[A-Za-z0-9_-]+/?', page.path):
+            return value
+        if page.hostname != 'channels.weixin.qq.com':
+            return ''
+        if page.path == '/finder-preview/pages/sph':
+            ids = query.get('id', [])
+            return value if len(ids) == 1 and re.fullmatch(r'[A-Za-z0-9_-]+', ids[0]) else ''
+        if page.path == '/web/pages/feed':
+            if 'oid' not in query and 'nid' not in query:
+                # Native shares can already carry an opaque encrypted ID.
+                ids = query.get('eid', [])
+                return value if len(ids) == 1 and re.fullmatch(r'[A-Za-z0-9_=-]+', ids[0]) else ''
+            for key in ('oid', 'nid'):
+                ids = query.get(key, [])
+                if len(ids) != 1 or not re.fullmatch(r'[A-Za-z0-9_-]{11}', ids[0]):
+                    return ''
+                binary = base64.urlsafe_b64decode(ids[0] + '=')
+                if base64.urlsafe_b64encode(binary).decode('ascii').rstrip('=') != ids[0]:
+                    return ''
+            return value
+    except ValueError:
+        pass
+    return ''
 
 
 def channel_video_body(raw: str) -> str:
-    """Render a WeChat Channels share as a stable page link.
+    """Render a Channels share, preferring the original sharing page.
 
     Type-51 XML contains several signed CDN URLs (video, thumbnail, avatar),
     often mixed with an upgrade/help URL. Those URLs expire and must not be
-    forwarded. ``objectId`` + ``objectNonceId`` gives a stable page address;
-    a short ``weixin.qq.com/sph/`` share URL is the fallback when available.
+    forwarded. Internal IDs must be encoded before use as page parameters.
+    URL syntax and encoding alone do not establish whether a video can play.
     """
     try:
         root = ET.fromstring(raw)
     except ET.ParseError:
         root = None
-    def values(tag: str) -> list[str]:
-        if root is None:
-            return []
-        return [_cdata(node.text or "") for node in root.findall(f".//{tag}") if _cdata(node.text or "")]
-    object_id = next(iter(values("objectId")), "")
-    nonce = next(iter(values("objectNonceId")), "")
-    share = next((u for u in re.findall(r"https?://[^\s<>\"']+", raw) if re.search(r"(?:weixin\.qq\.com/sph/|channels\.weixin\.qq\.com/)", u)), "")
-    if object_id and nonce:
-        url = "https://channels.weixin.qq.com/web/pages/feed?oid=" + urllib.parse.quote(object_id, safe="") + "&nid=" + urllib.parse.quote(nonce, safe="")
-    elif share:
-        url = html.unescape(share)
-    else:
-        url = ""
-    desc = next(iter(values("desc")), "")
-    title = next(iter(values("title")), "")
+    # XML already unwraps CDATA and decodes entities. Do not scan raw XML or
+    # decode URL values a second time, which changes query parameter semantics.
+    app = root if root is None or root.tag == 'appmsg' else root.find('appmsg')
+    if app is None:
+        app = root
+    feed = None if app is None else app if app.tag == 'finderFeed' else app.find('finderFeed')
+    def text(node, tag):
+        return (node.findtext(tag) or '').strip() if node is not None else ''
+
+    share = ''
+    for node, tag in ((app, 'url'), (feed, 'url'), (feed, 'shareUrl')):
+        share = _channel_share_url(text(node, tag))
+        if share:
+            break
+    url = share or _channel_page_from_ids(text(feed, 'objectId'), text(feed, 'objectNonceId'))
+    desc = text(feed, 'desc')
+    title = text(app, 'title')
     # Old clients use an upgrade notice as title while the real description is
     # still present in finderFeed.
     if not desc or "升级" in desc or "版本不支持" in desc:
         desc = ""
     if not desc and title and "升级" not in title and "版本不支持" not in title:
         desc = title
-    creator = next(iter(values("nickname")), "")
+    creator = text(feed, 'nickname')
     lines = ["视频号" + (f"：{desc}" if desc else "")]
     if creator:
         lines.append(f"作者：{creator}")
@@ -478,8 +555,27 @@ def reader_media_result(row: dict[str, Any], *, preview_only: bool = False) -> t
         payload = json.loads(proc.stdout)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return [], False
+    resources = list(payload.get('data', payload).get('resources', []))
+    available = [r for r in resources if any(Path(p).expanduser().is_file() for p in
+                 [*(r.get('local_paths') or []), *([r['local_path']] if r.get('local_path') else [])])]
+    if (row.get('kind_name') == 'image' and row.get('create_time') and
+        (not available or (preview_only and not any(r.get('thumbnail_only') for r in available)))):
+        command = [str(WECHAT_READER), 'image-resource', '--talker', talker,
+                   '--local-id', local_id, '--server-id', str(row.get('server_id') or 0),
+                   '--create-time', str(row['create_time'])]
+        try:
+            result = subprocess.run(command, cwd=ROOT, text=True, encoding='utf-8', capture_output=True, timeout=45)
+            if result.returncode == 0:
+                extra = json.loads(result.stdout).get('data', {})
+                if (extra.get('contract') == 'image_resource_v1' and extra.get('talker') == talker
+                    and int(extra.get('local_id', -1)) == int(local_id)
+                    and int(extra.get('server_id', -1)) == int(row.get('server_id') or 0)
+                    and int(extra.get('create_time', -1)) == int(row['create_time'])):
+                    resources.extend(extra.get('resources', []))
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
     originals, previews = [], []
-    for resource in payload.get('data', payload).get('resources', []):
+    for resource in resources:
         candidates = previews if resource.get('thumbnail_only') else originals
         paths = list(resource.get('local_paths') or [])
         if resource.get('local_path'):
@@ -889,7 +985,7 @@ def split_text(text, byte_limit=12000):
     return parts or ['']
 
 
-def forward_body(row, config, store):
+def forward_record_texts(row, config, store):
     items = row.get('forward_items') or forward_items(str(row.get('text') or row.get('content') or ''))
     def render(records, prefix=''):
         lines=[]
@@ -904,26 +1000,24 @@ def forward_body(row, config, store):
             if item.get('children'):
                 lines.extend('  '+line for line in render(item['children'], prefix+str(i)+'.'))
         return lines
-    return '\n'.join(render(items)) if items else '[转发聊天记录内容暂不可用]'
+    return render(items) if items else ['[转发聊天记录内容暂不可用]']
 
 
-def send_article_cover(store, message, plan, text_result, send):
-    article = plan.get('article') or {}
-    cover = article.get('cover_url')
-    if not cover or not article.get('url'):
-        return False
-    try:
-        # Use the existing CLI upload and persisted delivery receipts. Keeping
-        # the cover attached to its article also makes manual repair unambiguous.
-        send('article-cover', ['+messages-reply', '--message-id', text_result['data']['message_id'], '--image', cover])
-        store.add_media_job(message['id'], 'article_cover', None, None, 'uploaded')
-        return False
-    except (CliError, DeliveryUncertain) as exc:
-        # The article text already has a receipt. Optional cover uncertainty
-        # stays visible for reconciliation without blocking subsequent messages.
-        uncertain = isinstance(exc, DeliveryUncertain) or exc.uncertain
-        store.add_media_job(message['id'], 'article_cover', None, None, 'manual' if uncertain else 'placeholder', safe_error(exc))
-        return True
+def forward_body(row, config, store):
+    return '\n'.join(forward_record_texts(row, config, store))
+
+
+def retain_legacy_article_cover_failure(store, message):
+    # Article previews belong to Feishu's original-link rendering. CLI image
+    # URLs can silently fall back to text, so never send a separate cover,
+    # including from plans or retry jobs saved by older workers.
+    # Keep unresolved historical deliveries visible; skipping the old upload
+    # must not turn an uncertain receipt into a reported success.
+    with store.connect() as db:
+        jobs = db.execute("SELECT id FROM media_jobs WHERE message_id=? AND media_type='article_cover' AND state!='uploaded'", (message['id'],)).fetchall()
+        for job in jobs:
+            db.execute("UPDATE media_jobs SET state='manual',error=COALESCE(error,'文章独立封面补发已停用；历史发送结果保留待核对'),updated_at=? WHERE id=?", (time.time(), job['id']))
+    return bool(jobs)
 
 
 def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any], store: MirrorStore) -> None:
@@ -1005,7 +1099,8 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
             plan_key=f'render:{message["id"]}'
             plan=store.setting(plan_key)
             if not plan:
-                body = group_event_body(row,config,store) if is_group_event(row) else (forward_body(row,config,store) if is_forward_row(row) else clean_body(row))
+                records = forward_record_texts(row,config,store) if is_forward_row(row) else None
+                body = group_event_body(row,config,store) if is_group_event(row) else ('\n'.join(records) if records else clean_body(row))
                 quote=quote_info(row)
                 parent=store.find_message_by_server_id(bid,quote['server_id']) if quote and quote.get('server_id') else None
                 if quote and parent and parent.get('feishu_message_id'):
@@ -1018,19 +1113,32 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
                         if sender_id.endswith('@chatroom'): sender_id=''
                     except (ET.ParseError,AttributeError): sender_id=''
                     quoted_name,_=resolve_name(store,config,sender_id,quote['sender'],key+':quote')
-                    body += f"\n> {quoted_name}：{quote['content']}"
-                raw_parts=split_text(body)
-                total=len(raw_parts)
-                parts=[f'{name}转发聊天记录（第 {i}/{total} 段）\n{part}' for i,part in enumerate(raw_parts,1)] if is_forward_row(row) else [f'{name}：{part}' for part in raw_parts]
+                    suffix = f"\n> {quoted_name}：{quote['content']}"
+                    body += suffix
+                    if records:
+                        records[-1] += suffix
+                if records:
+                    from integrations.forward_layout import split_forward_records
+                    parts, record_parts = split_forward_records(records, name, with_record_parts=True)
+                else:
+                    parts = [f'{name}：{part}' for part in split_text(body)]
                 plan={'target':target,'parts':parts,'placeholder':is_forward_row(row) and body=='[转发聊天记录内容暂不可用]'}
+                if records:
+                    from agents.forward_media import video_plan, image_plan
+                    plan['videos'] = video_plan(row, records, record_parts)
+                    plan['images'] = image_plan(row, records, record_parts)
                 from integrations.article_shares import article_share
                 if not is_forward_row(row) and not is_group_event(row) and not quote:
                     plan['article'] = article_share(row)
                 store.save_setting(plan_key,plan)
             for index,part in enumerate(plan['parts']):
                 result=send(f'text-{index}',plan['target']+['--text',part])
-            cover_missing=send_article_cover(store,message,plan,result,send)
-            placeholder=plan['placeholder'] or cover_missing
+                if plan.get('videos') or plan.get('images'):
+                    from agents.forward_media import deliver_media
+                    deliver_media(sys.modules[__name__],config,store,message,row,plan,index)
+            cover_missing=retain_legacy_article_cover_failure(store,message)
+            from agents.forward_media import has_media_failures
+            placeholder=plan['placeholder'] or cover_missing or has_media_failures(store,message['id'])
         store.mark_message(key,'placeholder' if placeholder else 'sent',binding_id=bid,feishu_message_id=message['feishu_message_id'] if config.get('_retry_media') else str(result['data']['message_id']))
     except Exception as exc:
         store.mark_message(key,'failed',binding_id=bid,error=safe_error(exc))
@@ -1132,7 +1240,7 @@ def retry_media_jobs(config,store):
             continue
         with store.connect() as db:db.execute("UPDATE media_jobs SET state='processing' WHERE id=?",(job['id'],))
         try:
-            send_row({**config,'_retry_media':True},json.loads(job['payload_json']),{},store)
+            send_row({**config,'_retry_media':True,'_retry_media_job_id':job['id']},json.loads(job['payload_json']),{},store)
             with store.connect() as db:
                 current=db.execute('SELECT state,attempts FROM media_jobs WHERE id=?',(job['id'],)).fetchone()
                 if current['state']=='placeholder':
