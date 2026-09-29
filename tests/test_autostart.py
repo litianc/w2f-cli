@@ -1,5 +1,6 @@
 """开机自启：恢复 running 绑定 + 管理台/watchdog 拉起 + 计划任务注册。"""
 import json
+import os
 import subprocess
 import sys
 import time
@@ -12,6 +13,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agents import autostart, manage
 from agents.storage import MirrorStore
+
+# ScheduledTasks 是 Windows-only 产品行为；非 Windows 上这些测试按
+# not_applicable 记录（登记见 qa/worker.py PLATFORM_EXCLUSIONS）。
+WINDOWS_ONLY = unittest.skipIf(os.name != 'nt', 'ScheduledTasks 任务命令仅 Windows 实现')
 
 
 def make_config(root, talker="room"):
@@ -148,6 +153,7 @@ class BootTest(unittest.TestCase):
 
 
 class TaskCommandTest(unittest.TestCase):
+    @WINDOWS_ONLY
     def test_boot_command_uses_windowless_python_and_autostart(self):
         cmd = autostart.boot_command(Path("C:/cfg.json"), Path("C:/data/state.db"))
         self.assertTrue(cmd["execute"].endswith("pythonw.exe") or cmd["execute"].endswith("python.exe"))
@@ -156,6 +162,7 @@ class TaskCommandTest(unittest.TestCase):
         self.assertIn("--db", cmd["argument"])
         self.assertEqual(cmd["working_directory"], str(autostart.ROOT))
 
+    @WINDOWS_ONLY
     def test_task_register_builds_logon_task(self):
         calls = []
 
@@ -175,6 +182,7 @@ class TaskCommandTest(unittest.TestCase):
         self.assertIn("WorkingDirectory", script)
         self.assertIn("whoami", script)
 
+    @WINDOWS_ONLY
     def test_task_unregister_is_idempotent(self):
         calls = []
 
@@ -189,12 +197,14 @@ class TaskCommandTest(unittest.TestCase):
         self.assertIn("Unregister-ScheduledTask", calls[0][-1])
         self.assertFalse(result["registered"])
 
+    @WINDOWS_ONLY
     def test_task_unregister_failure_is_not_swallowed(self):
         with patch.object(autostart, "subprocess") as fake:
             fake.run.return_value = subprocess.CompletedProcess([], 1, stdout="", stderr="Access is denied")
             with self.assertRaises(RuntimeError):
                 autostart.task_unregister()
 
+    @WINDOWS_ONLY
     def test_unregister_and_status_scripts_surface_service_failure(self):
         calls = []
 
@@ -218,11 +228,13 @@ class TaskCommandTest(unittest.TestCase):
             store = type("S", (), {"path": root / "state.db"})()
             self.assertEqual(autostart.console_session(store)["url"], "http://127.0.0.1:59792/#token=t")
 
+    @WINDOWS_ONLY
     def test_task_unregister_reports_leftover_task(self):
         with patch.object(autostart, "subprocess") as fake:
             fake.run.return_value = subprocess.CompletedProcess([], 0, stdout='{"registered": true}', stderr="")
             self.assertTrue(autostart.task_unregister()["registered"])
 
+    @WINDOWS_ONLY
     def test_task_status_parses_query(self):
         with patch.object(autostart, "subprocess") as fake:
             fake.run.return_value = subprocess.CompletedProcess([], 0, stdout='{"registered": true, "state": "Ready"}', stderr="")
