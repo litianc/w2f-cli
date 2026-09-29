@@ -64,7 +64,8 @@ def stage_video(mirror, config, row, video):
                 directory.mkdir(parents=True, exist_ok=True)
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0), 0o600)
                 with os.fdopen(fd, 'wb') as target, source.open('rb') as origin:
-                    os.fchmod(target.fileno(), 0o600)
+                    if hasattr(os, 'fchmod'):  # POSIX-only; Windows already enforces the mode via os.open.
+                        os.fchmod(target.fileno(), 0o600)
                     remaining = int(media['size']) + 1
                     while remaining:
                         chunk = origin.read(min(1024 * 1024, remaining))

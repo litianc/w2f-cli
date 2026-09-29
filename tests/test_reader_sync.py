@@ -7,13 +7,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from integrations.reader_sync import read_page
 from integrations.forward_records import parse_record
+from contextlib import closing
 
 
 class ReaderPagingAcceptance(unittest.TestCase):
     def test_T51_sql_pagination_exceeds_old_5000_scan_window(self):
         with tempfile.TemporaryDirectory() as directory:
             db_path=Path(directory)/'source.db';table='Msg_fixture'
-            with sqlite3.connect(db_path) as db:
+            with closing(sqlite3.connect(db_path, isolation_level=None)) as db:
                 db.execute('CREATE TABLE Name2Id(user_name TEXT)');db.execute("INSERT INTO Name2Id VALUES('wx')")
                 db.execute(f'CREATE TABLE {table}(local_id INTEGER PRIMARY KEY,server_id INTEGER,real_sender_id INTEGER,create_time INTEGER,local_type INTEGER,message_content TEXT)')
                 db.executemany(f'INSERT INTO {table} VALUES(?,?,1,?,1,?)',[(i,90000+i,1000+i//3,f'第{i}句 😀') for i in range(1,5504)])
@@ -44,7 +45,7 @@ class ReaderPagingAcceptance(unittest.TestCase):
         from unittest.mock import Mock
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'source.db'
-            with sqlite3.connect(path) as conn:
+            with closing(sqlite3.connect(path, isolation_level=None)) as conn:
                 conn.execute('CREATE TABLE Msg_fixture(local_id INTEGER,server_id INTEGER,real_sender_id INTEGER,create_time INTEGER,local_type INTEGER,message_content TEXT)')
                 conn.execute("INSERT INTO Msg_fixture VALUES(1,11,1,100,1,'hello')")
                 conn.execute('CREATE TABLE Name2Id(user_name TEXT)')
