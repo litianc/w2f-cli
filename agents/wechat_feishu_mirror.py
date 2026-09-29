@@ -462,6 +462,10 @@ def sticker_metadata(row: dict[str, Any]) -> dict[str, str]:
                 return {k.lower(): v for k, v in node.attrib.items()}
         except ET.ParseError:
             continue
+    # WDA 适配层把摘要放在结构化字段里（content 只是 "[表情]" 占位文本）。
+    digest = str(row.get('emoji_md5') or '').strip().lower()
+    if re.fullmatch(r'[0-9a-f]{32}', digest):
+        return {'md5': digest}
     return {}
 
 
