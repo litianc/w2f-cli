@@ -421,6 +421,22 @@ def cmd_media(args: argparse.Namespace) -> dict:
         target = root / f"{cache_key}{CONTENT_TYPES.get(content_type, '.bin')}"
         target.write_bytes(payload)
         return _media_result(target, thumbnail_only)
+
+    if base == 47 and re.fullmatch(r"[0-9a-f]{32}", str(message.get("emojiMd5") or "")) and os.name == "nt":
+        # 本地微信库直读层（issue #35）：跨会话找带 cdnurl 的副本，按 XML
+        # 声明的 md5/len 严格校验后落缓存。失败则维持既有占位路径。
+        try:
+            try:
+                from win_store import emoji_download
+            except ImportError:
+                from .win_store import emoji_download
+            data = emoji_download(None, str(message["emojiMd5"]).lower())
+        except Exception:
+            return {"ok": True, "data": {"resources": []}}
+        suffix = ".gif" if data[:3] == b"GIF" else ".png" if data[:4] == b"\x89PNG" else ".bin"
+        target = root / f"{message['emojiMd5']}{suffix}"
+        target.write_bytes(data)
+        return _media_result(target, False)
     return {"ok": True, "data": {"resources": []}}
 
 
