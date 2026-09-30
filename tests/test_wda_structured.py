@@ -129,6 +129,17 @@ class ForwardParseLogging(unittest.TestCase):
 
 
 class StickerMetadataFallback(unittest.TestCase):
+    def test_upserted_emoji_row_keeps_emoji_md5_in_payload(self):
+        from agents.storage import MirrorStore
+        with tempfile.TemporaryDirectory() as td:
+            store = MirrorStore(Path(td) / 'state.db')
+            store.initialize({'wechat_talker': 'room', 'feishu_chat_id': 'chat'})
+            row = {'talker': 'room', 'local_id': 5, 'sender_wxid': 'wx', 'sender': '昵称',
+                   'kind_name': 'emoji', 'text': '[表情]', 'emoji_md5': 'a' * 32}
+            store.upsert_message('room:5', row, 'emoji', binding_id=1, source_account='one')
+            saved = store.message('room:5', 1)
+            self.assertIn('emoji_md5', saved['payload_json'])
+
     def test_emoji_md5_field_used_when_no_xml(self):
         row = {"content": "[表情]", "emoji_md5": "a4427dc9b3e9a872538b57706f3be117"}
         self.assertEqual(mirror.sticker_metadata(row), {"md5": "a4427dc9b3e9a872538b57706f3be117"})
