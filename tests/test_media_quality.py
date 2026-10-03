@@ -11,6 +11,52 @@ from agents.storage import MirrorStore
 
 
 class MediaQualityTest(unittest.TestCase):
+    def test_broken_primary_original_does_not_hide_attachment_original(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            broken, original, preview = root / 'broken.dat', root / 'original.png', root / 'preview.png'
+            broken.write_bytes(b'broken-image')
+            Image.new('RGB', (320, 160), 'blue').save(original)
+            Image.new('RGB', (16, 8), 'blue').save(preview)
+            row = {'talker': 'fixture-room', 'local_id': 8, 'server_id': 456,
+                   'create_time': 1234, 'kind_name': 'image', 'media_dir': str(root / 'stage')}
+            def reader(cmd, **kwargs):
+                data = {'resources': [{'local_path': str(broken), 'thumbnail_only': False},
+                                      {'local_path': str(preview), 'thumbnail_only': True}]}
+                if 'image-resource' in cmd:
+                    data = {'contract': 'image_resource_v1', 'talker': 'fixture-room',
+                            'local_id': 8, 'server_id': 456, 'create_time': 1234,
+                            'resources': [{'local_path': str(original), 'thumbnail_only': False}]}
+                return SimpleNamespace(returncode=0, stderr='', stdout=json.dumps({'data': data}))
+            with patch.object(mirror.subprocess, 'run', side_effect=reader):
+                path, degraded = mirror.stage_media(row, 'image')
+            with Image.open(path) as image:
+                self.assertEqual(image.size, (320, 160))
+            self.assertFalse(degraded)
+
+    def test_preview_index_does_not_hide_exact_original(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original, preview = root / 'original.png', root / 'preview.png'
+            Image.new('RGB', (320, 160), 'blue').save(original)
+            Image.new('RGB', (16, 8), 'blue').save(preview)
+            row = {'talker': 'fixture-room', 'local_id': 8, 'server_id': 456,
+                   'create_time': 1234, 'kind_name': 'image', 'media_dir': str(root / 'stage')}
+            def reader(cmd, **kwargs):
+                data = {'resources': [{'local_path': str(preview), 'thumbnail_only': True}]}
+                if 'image-resource' in cmd:
+                    data = {'contract': 'image_resource_v1', 'talker': 'fixture-room',
+                            'local_id': 8, 'server_id': 456, 'create_time': 1234,
+                            'resources': [{'local_path': str(original), 'thumbnail_only': False}]}
+                return SimpleNamespace(returncode=0, stderr='', stdout=json.dumps({'data': data}))
+            with patch.object(mirror.subprocess, 'run', side_effect=reader):
+                path, degraded = mirror.stage_media(row, 'image')
+            with Image.open(path) as image:
+                self.assertEqual(image.size, (320, 160))
+            self.assertFalse(degraded)
+
     def test_explicit_original_beats_larger_preview_without_degradation_label(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -29,6 +75,28 @@ class MediaQualityTest(unittest.TestCase):
             self.assertFalse(degraded)
             mirror.cleanup_staged(staged)
 
+    def test_preview_lookup_rejects_original_from_a_different_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            preview, original = root / 'preview.jpg', root / 'original.jpg'
+            preview.write_bytes(b'preview'); original.write_bytes(b'wrong-original')
+            row = {'talker': 'fixture-room', 'local_id': 8, 'server_id': 456,
+                   'create_time': 1234, 'kind_name': 'image', 'media_dir': str(root / 'stage')}
+            for changed in ({'talker': 'another-room'}, {'local_id': 9}, {'server_id': 457},
+                            {'create_time': 1235}, {'contract': 'other-contract'}):
+                with self.subTest(changed=changed):
+                    def reader(cmd, **kwargs):
+                        data = {'resources': [{'local_path': str(preview), 'thumbnail_only': True}]}
+                        if 'image-resource' in cmd:
+                            data = {'contract': 'image_resource_v1', 'talker': 'fixture-room',
+                                    'local_id': 8, 'server_id': 456, 'create_time': 1234, **changed,
+                                    'resources': [{'local_path': str(original), 'thumbnail_only': False}]}
+                        return SimpleNamespace(returncode=0, stderr='', stdout=json.dumps({'data': data}))
+                    with patch.object(mirror.subprocess, 'run', side_effect=reader):
+                        path, degraded = mirror.stage_media(row, 'image')
+                    self.assertEqual(Path(path).read_bytes(), b'preview')
+                    self.assertTrue(degraded)
+
 
     def test_missing_original_sends_preview_with_sender_and_explicit_notice(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -37,6 +105,7 @@ class MediaQualityTest(unittest.TestCase):
             preview.write_bytes(b'preview-only')
             store = MirrorStore(root / 'state.db')
             config = {'wechat_talker': 'room', 'feishu_chat_id': 'chat', 'lark_profile': 'fixture',
+                      'image_original_wait_seconds': 0, 'image_original_auto_retry': False,
                       'sender_map': {'sender': 'Confirmed name'}, 'media_dir': str(root / 'media')}
             store.initialize(config)
             resources = [

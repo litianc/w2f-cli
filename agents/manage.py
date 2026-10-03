@@ -30,7 +30,7 @@ def read_config(path):
 def write_runtime_config(value,path):
     # All values accepted from the browser are allowlisted separately. Runtime
     # paths are supplied only by local config/CLI, never arbitrary HTTP bodies.
-    value={k:v for k,v in value.items() if k in SETUP_FIELDS|{'sqlite_file','data_dir','media_dir','log_dir','state_file','wechat_reader','realtime_wakeup','realtime_stream_url','sender_map','macos_image_key_derivation'}}
+    value={k:v for k,v in value.items() if k in SETUP_FIELDS|{'sqlite_file','data_dir','media_dir','log_dir','state_file','wechat_reader','realtime_wakeup','realtime_stream_url','sender_map','macos_image_key_derivation','image_original_wait_seconds','image_original_auto_retry'}}
     path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
     tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(value,ensure_ascii=False,indent=2)+'\n',encoding='utf-8');tmp.chmod(0o600);tmp.replace(path)
 
@@ -355,7 +355,10 @@ class Manager:
         if resource=='bindings':return s.list_bindings()
         if resource=='people':return {'people':s.list_people(query.get('status','active')),'archived':s.list_people('archived'),'wechat':s.list_wechat_identities(),'feishu':s.list_feishu_identities(),'actions':s.actions(),'quarantined':s.list_quarantined_identities()}
         if resource=='confirmations':return s.list_confirmations()
-        if resource=='media-failures':return [{k:v for k,v in r.items() if k not in {'source_ref','staging_path'}} for r in s.list_media_failures()]
+        if resource=='media-failures':
+            from agents.image_original import retry_status
+            return [{**{k:v for k,v in r.items() if k not in {'source_ref','staging_path'}},
+                     **(retry_status(s,r) if r['media_type']=='image_original' else {})} for r in s.list_media_failures()]
         if resource=='uncertain':return s.uncertain_deliveries()
         if resource=='setup':return setup_status(self.config_path,s.path)
         if resource=='search/wechat':return search_wechat(query.get('q',''))
@@ -524,11 +527,19 @@ class Manager:
             binding=s.get_binding(message['binding_id'])
             config={**read_config(self.config_path),**binding,'binding_id':binding['id']}
             result=queue_media_repair(mirror,s,config,int(data['id']),'image' if op=='forward-images' else 'video')
+        elif resource=='media-failures' and op=='original-image':
+            from agents.image_original import register_historical
+            result=register_historical(s,int(data['id']))
+        elif resource=='media-failures' and op=='file-attachment':
+            from agents.file_messages import register_historical
+            result=register_historical(s,int(data['id']))
         elif resource=='media-failures' and op=='retry':
             with s.connect() as db:
                 row=db.execute('SELECT * FROM media_jobs WHERE id=?',(int(data['id']),)).fetchone()
                 if not row or row['state']=='uploaded':raise ValueError('失败项不存在或已成功')
                 if row['state'] not in {'pending','processing'}:
+                    if row['media_type']=='image_original':
+                        db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(f"image-original-auto:{row['id']}",json.dumps({'active':False,'next_attempt_at':None})))
                     db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(f"media_retry_base:{row['id']}",json.dumps(row['attempts'])))
                     db.execute("UPDATE media_jobs SET state='pending',updated_at=0 WHERE id=?",(row['id'],))
             result={'queued':True,'message':'已排队；绑定运行时处理，停止时保留待办'}

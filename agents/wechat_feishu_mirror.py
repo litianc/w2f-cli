@@ -240,6 +240,10 @@ def is_group_event(row: dict[str, Any]) -> bool:
 def clean_body(row: dict[str, Any]) -> str:
     kind = str(row.get("kind_name") or "text")
     raw = str(row.get("text") or row.get("content") or "")
+    from integrations.file_messages import file_share
+    file = file_share(row)
+    if file:
+        return '[文件] ' + (file['name'] or '未命名文件')
     if is_forward_row(row):
         items = forward_items(raw)
         if items:
@@ -518,7 +522,7 @@ def media_url(row: dict[str, Any]) -> str | None:
     return None
 
 
-def reader_media_result(row: dict[str, Any], *, preview_only: bool = False) -> tuple[list[Path], bool]:
+def reader_media_result(row: dict[str, Any], *, preview_only: bool = False, force_image_lookup: bool = False) -> tuple[list[Path], bool]:
     """Ask the read-only reader for local resources belonging to one message.
 
     Returns (paths, thumbnail_only); the optional contract field
@@ -535,14 +539,19 @@ def reader_media_result(row: dict[str, Any], *, preview_only: bool = False) -> t
     server_id = str(row.get("server_id") or "")
     if server_id:
         cmd.extend(["--server-id", server_id])
+    def lookup_timeout(command):
+        remaining = row.get('_image_lookup_deadline', float('inf')) - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(command, 0)
+        return min(45, remaining)
     try:
-        proc = subprocess.run(cmd, cwd=ROOT, text=True, encoding="utf-8", capture_output=True, timeout=45)
+        proc = subprocess.run(cmd, cwd=ROOT, text=True, encoding="utf-8", capture_output=True, timeout=lookup_timeout(cmd))
         if proc.returncode == 2 and "--include-local-paths" in proc.stderr and "expected one argument" in proc.stderr:
             # Older WDA adapters require the explicit value. Keep deployed
             # Windows readers working until they are updated.
             legacy = list(cmd)
             legacy.insert(legacy.index("--include-local-paths") + 1, "true")
-            proc = subprocess.run(legacy, cwd=ROOT, text=True, encoding="utf-8", capture_output=True, timeout=45)
+            proc = subprocess.run(legacy, cwd=ROOT, text=True, encoding="utf-8", capture_output=True, timeout=lookup_timeout(legacy))
         if proc.returncode:
             return [], False
         payload = json.loads(proc.stdout)
@@ -552,12 +561,13 @@ def reader_media_result(row: dict[str, Any], *, preview_only: bool = False) -> t
     available = [r for r in resources if any(Path(p).expanduser().is_file() for p in
                  [*(r.get('local_paths') or []), *([r['local_path']] if r.get('local_path') else [])])]
     if (row.get('kind_name') == 'image' and row.get('create_time') and
-        (not available or (preview_only and not any(r.get('thumbnail_only') for r in available)))):
+        (force_image_lookup or not any(not r.get('thumbnail_only') for r in available)
+         or (preview_only and not any(r.get('thumbnail_only') for r in available)))):
         command = [str(WECHAT_READER), 'image-resource', '--talker', talker,
                    '--local-id', local_id, '--server-id', str(row.get('server_id') or 0),
                    '--create-time', str(row['create_time'])]
         try:
-            result = subprocess.run(command, cwd=ROOT, text=True, encoding='utf-8', capture_output=True, timeout=45)
+            result = subprocess.run(command, cwd=ROOT, text=True, encoding='utf-8', capture_output=True, timeout=lookup_timeout(command))
             if result.returncode == 0:
                 extra = json.loads(result.stdout).get('data', {})
                 if (extra.get('contract') == 'image_resource_v1' and extra.get('talker') == talker
@@ -685,7 +695,18 @@ def stage_media(row: dict[str, Any], kind: str) -> tuple[str | None, bool]:
     queried again on staging failure so normal delivery needs one reader call.
     Upload/permission failures do not silently downgrade the selected image.
     """
+    if kind == 'file':
+        from integrations.file_messages import file_share
+        if file_share(row):
+            from agents.file_messages import stage_file
+            return stage_file(sys.modules[__name__], row)
+    original_deadline = row.get('_image_lookup_deadline') if kind == 'image' else None
     local_candidates, thumbnail_only = reader_media_result(row)
+    # Grace checks already have a validated preview. Only consider explicit
+    # originals here; a fresh cache scan or URL download extends that wait.
+    if original_deadline is not None and (time.monotonic() >= original_deadline
+                                          or thumbnail_only or not local_candidates):
+        return None, True
     if not local_candidates:
         local_candidates = wechat_cache_paths(row)
     media_dir = Path(os.environ.get("W2F_MEDIA_DIR", os.environ.get("CHZ_MEDIA_DIR", str(row.get("media_dir") or MEDIA_DIR)))).expanduser()
@@ -697,12 +718,17 @@ def stage_media(row: dict[str, Any], kind: str) -> tuple[str | None, bool]:
             return voice,False
     last_error = None
     try_previews = bool(local_candidates) and not thumbnail_only and kind == 'image'
+    try_attachment_original = try_previews
+    attempted_paths = set()
     while local_candidates:
         try:
             local_candidates = sorted(local_candidates, key=lambda item: item.stat().st_size, reverse=True)
         except OSError:
             pass
         for source_path in local_candidates:
+            if original_deadline is not None and time.monotonic() >= original_deadline:
+                return None, True
+            attempted_paths.add(source_path)
             try:
                 if source_path.stat().st_size == 0:
                     raise CliError('decode_failed: 本机媒体资源为空')
@@ -715,16 +741,27 @@ def stage_media(row: dict[str, Any], kind: str) -> tuple[str | None, bool]:
                     path = next((media_dir / f"{namespace}-{local_id}{ext}" for ext in (".png",".jpg",".gif",".webp") if (media_dir / f"{namespace}-{local_id}{ext}").is_file()), path)
                 else:
                     shutil.copy2(source_path, path)
+                if thumbnail_only:
+                    row['_image_quality_reason'] = str(last_error).split(':', 1)[0] if last_error else 'original_unavailable'
                 return str(path), thumbnail_only
             except CliError as exc:
                 last_error = exc
             except OSError as exc:
                 last_error = CliError('resource_missing: 本地媒体暂存失败 ' + type(exc).__name__)
-        if try_previews:
+        if try_attachment_original:
+            try_attachment_original = False
+            expanded, preview = reader_media_result(row, force_image_lookup=True)
+            remaining = [p for p in expanded if p not in attempted_paths] if not preview else []
+            if remaining:
+                local_candidates = remaining
+                continue
+        if try_previews and original_deadline is None:
             local_candidates, thumbnail_only = reader_media_result(row, preview_only=True)
             try_previews = False
         else:
             break
+    if original_deadline is not None:
+        return None, True
     url = media_url(row)
     if not url or not url.startswith(("http://", "https://")):
         if last_error:
@@ -1016,6 +1053,11 @@ def retain_legacy_article_cover_failure(store, message):
 def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any], store: MirrorStore) -> None:
     key = message_key(row); bid = int(config.get('binding_id',1))
     kind = str(row.get('kind_name') or 'text')
+    from integrations.file_messages import file_share
+    previous = store.message(key, bid)
+    if kind in {'app','file','type_49'} and file_share(row) and (not previous or not store.setting(f'render:{previous["id"]}')):
+        row = {**row, 'kind_name': 'file'}
+        kind = 'file'
     store.upsert_message(key,row,kind,binding_id=bid,source_account=str(config.get('source_account','default')))
     message = store.message(key,bid)
     if message['state'] in {'sent','placeholder'} and not config.get('_retry_media'):
@@ -1060,6 +1102,12 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
                 try:
                     if kind in {'sticker','emoji'}:
                         media_input,thumbnail_only = stage_sticker(enriched),False
+                    elif kind == 'image':
+                        from agents.image_original import stage_initial
+                        media_input,thumbnail_only = stage_initial(sys.modules[__name__],store,message,enriched,config=config)
+                    elif kind == 'file' and file_share(enriched):
+                        from agents.file_messages import stage_initial
+                        media_input,thumbnail_only = stage_initial(sys.modules[__name__],store,message,enriched)
                     else:
                         media_input,thumbnail_only = stage_media(enriched,kind)
                     if not media_input:
@@ -1067,6 +1115,9 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
                     if not config.get('_retry_media'):
                         note='（原图未同步，已发送缩略图）' if thumbnail_only else ''
                         send('name',target+['--text',f'{name}：{note}'])
+                    if kind == 'image':
+                        from agents.image_original import send_quality_notice
+                        send_quality_notice(store,message['id'],thumbnail_only,target,send)
                     flag='--image' if kind in {'image','sticker','emoji'} else '--file'
                     media_args = [flag,media_input]
                     converted_voice=None
@@ -1085,9 +1136,18 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
                     if kind=='video' and cover: cleanup_staged(str(cover))
                 except CliError as exc:
                     if exc.uncertain: raise
-                    result=send('fallback',target+['--text',f'{name}：[{label}资源不可用，待人工排查]'])
-                    store.add_media_job(message['id'],kind,None,media_input,'placeholder',safe_error(exc))
+                    file_info = file_share(enriched, with_type=True) if kind == 'file' else None
+                    pending_file = bool(file_info and file_info['app_type'] == 74 and str(exc).startswith('resource_missing:'))
+                    body = f'{name}：[文件尚未就绪，等待补发] {file_info["name"]}' if pending_file else f'{name}：[{label}资源不可用，待人工排查]'
+                    result=send('fallback',target+['--text',body])
+                    queued_file = bool(file_info and file_info['app_type'] == 74 and (pending_file or config.get('_retry_media')))
+                    # Persist queued state with the failed attempt. A crash
+                    # before the outer retry loop resumes must not lose it.
+                    store.add_media_job(message['id'],kind,None,media_input,'pending' if queued_file else 'placeholder',safe_error(exc))
                     placeholder=True
+            if kind == 'image' and not placeholder:
+                from agents.image_original import register_preview
+                register_preview(store,message['id'],automatic=config.get('image_original_auto_retry',True) is True)
         else:
             plan_key=f'render:{message["id"]}'
             plan=store.setting(plan_key)
@@ -1216,12 +1276,26 @@ def recover_once(config,store,reader=source_page):
 
 def retry_media_jobs(config,store):
     with store.connect() as db:
-        jobs=[dict(r) for r in db.execute("SELECT m.id,m.message_id,m.attempts,x.payload_json FROM media_jobs m JOIN messages x ON x.id=m.message_id WHERE x.binding_id=? AND m.state IN ('pending','processing') ORDER BY m.id",(config['binding_id'],))]
+        jobs=[dict(r) for r in db.execute("SELECT m.*,x.payload_json FROM media_jobs m JOIN messages x ON x.id=m.message_id WHERE x.binding_id=? AND m.state IN ('pending','processing') ORDER BY m.id",(config['binding_id'],))]
     for job in jobs:
+        auto_original = store.setting(f"image-original-auto:{job['id']}",{}) if job['media_type']=='image_original' else {}
+        if auto_original.get('active'):
+            if config.get('image_original_auto_retry',True) is not True:
+                with store.connect() as db:
+                    db.execute("UPDATE media_jobs SET state='manual',error='自动补原图已关闭，可人工补发',updated_at=? WHERE id=?",(time.time(),job['id']))
+                from agents.image_original import finish_auto_attempt
+                finish_auto_attempt(store,job['id'])
+                continue
+            from agents.image_original import retry_status
+            if time.time() < retry_status(store,job)['next_attempt_at']:
+                continue
         baseline=int(store.setting(f"media_retry_base:{job['id']}",0))
         attempts_this_round=max(0,job['attempts']-baseline)
         if attempts_this_round >= 3:
             with store.connect() as db: db.execute("UPDATE media_jobs SET state='manual',error=COALESCE(error,'自动重试已达到 3 次'),updated_at=? WHERE id=?",(time.time(),job['id']))
+            if auto_original.get('active'):
+                from agents.image_original import finish_auto_attempt
+                finish_auto_attempt(store,job['id'])
             continue
         check_control(config,store)
         # Back off automatically: attempts 1/2 wait 30s/120s; tests and
@@ -1229,20 +1303,33 @@ def retry_media_jobs(config,store):
         delay=(30,120)[min(attempts_this_round,2)-1] if attempts_this_round else 0
         with store.connect() as db:
             updated=db.execute('SELECT updated_at FROM media_jobs WHERE id=?',(job['id'],)).fetchone()[0]
-        if delay and time.time()-updated < delay:
+        if not auto_original.get('active') and delay and time.time()-updated < delay:
             continue
         with store.connect() as db:db.execute("UPDATE media_jobs SET state='processing' WHERE id=?",(job['id'],))
         try:
-            send_row({**config,'_retry_media':True,'_retry_media_job_id':job['id']},json.loads(job['payload_json']),{},store)
+            if job['media_type'] == 'image_original':
+                from agents.image_original import recover
+                recover(sys.modules[__name__],config,store,job)
+            elif job['source_ref'] == 'file-attachment':
+                from agents.file_messages import recover
+                recover(sys.modules[__name__],config,store,job)
+            else:
+                send_row({**config,'_retry_media':True,'_retry_media_job_id':job['id']},json.loads(job['payload_json']),{},store)
             with store.connect() as db:
                 current=db.execute('SELECT state,attempts FROM media_jobs WHERE id=?',(job['id'],)).fetchone()
                 if current['state']=='placeholder':
                     db.execute('UPDATE media_jobs SET state=? WHERE id=?',('manual' if current['attempts']-baseline>=3 else 'pending',job['id']))
+        except ControlChanged:
+            with store.connect() as db:db.execute("UPDATE media_jobs SET state='pending' WHERE id=?",(job['id'],))
+            raise
         except Exception as exc:
             with store.connect() as db:
                 attempts=max(job['attempts']+1,db.execute('SELECT attempts FROM media_jobs WHERE id=?',(job['id'],)).fetchone()[0])
                 state='manual' if isinstance(exc,DeliveryUncertain) or attempts-baseline >= 3 else 'pending'
                 db.execute("UPDATE media_jobs SET state=?,attempts=?,error=?,updated_at=? WHERE id=?",(state,attempts,safe_error(exc),time.time(),job['id']))
+        if auto_original.get('active'):
+            from agents.image_original import finish_auto_attempt
+            finish_auto_attempt(store,job['id'])
 
 
 def expire_failed_media(config,store):
@@ -1353,7 +1440,8 @@ def stream(config, state=None):
                 delivered = recover_once(config,store)
                 retry_media_jobs(config,store)
                 expire_failed_media(config,store)
-                wait_until=time.monotonic()+(0 if delivered else float(config.get('poll_interval',600)))
+                from agents.image_original import next_retry_delay
+                wait_until=time.monotonic()+next_retry_delay(store,bid,0 if delivered else float(config.get('poll_interval',600)))
             except ControlChanged:
                 wait_until=0
             except Exception as exc:

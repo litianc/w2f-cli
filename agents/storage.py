@@ -576,7 +576,7 @@ class MirrorStore:
                 query += " WHERE x.binding_id=?"
                 args = (binding_id,)
             query += " AND" if " WHERE " in query else " WHERE "
-            query += " m.state IN ('failed','manual','placeholder') ORDER BY m.updated_at DESC"
+            query += " (m.state IN ('failed','manual','placeholder') OR (m.media_type IN ('image_original','file') AND m.state IN ('pending','processing'))) ORDER BY m.updated_at DESC"
             return [dict(row) for row in db.execute(query, args).fetchall()]
 
     def create_binding(self, data: dict[str, Any]) -> dict[str, Any]:

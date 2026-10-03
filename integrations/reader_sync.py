@@ -11,6 +11,12 @@ from contextlib import closing, contextmanager
 
 
 def register(sub):
+    file = sub.add_parser('file-resource', help='Locate one exact ordinary file attachment')
+    file.add_argument('--talker', required=True)
+    file.add_argument('--local-id', type=int, required=True)
+    file.add_argument('--server-id', type=int, required=True)
+    file.add_argument('--create-time', type=int, required=True)
+    file.add_argument('--pending-file-metadata', help='Prior type-74 filename, size, digest and sender for completion validation')
     forward = sub.add_parser('forward-resource', help='Locate one exact merged-forward image or video')
     forward.add_argument('--talker', required=True)
     forward.add_argument('--local-id', type=int, required=True)

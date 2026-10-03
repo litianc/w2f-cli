@@ -185,7 +185,61 @@ def _binding_maintenance_controls(page, fixture):
 
 from . import wizard_checks
 
+
+def _original_image_recovery(page, fixture):
+    store = fixture.store
+    binding = store.create_binding({'wechat_chat_name': 'QA 微信群', 'wechat_talker': 'qa-room',
+                                    'feishu_chat_name': 'QA 飞书群', 'feishu_chat_id': 'oc_qa_room',
+                                    'lark_profile': fixture.profile['profile_name']})
+    row = {'talker': 'qa-room', 'local_id': 1, 'kind_name': 'image'}
+    store.upsert_message('qa-room:1', row, 'image', binding_id=binding['id'])
+    message = store.message('qa-room:1', binding['id'])
+    store.add_media_job(message['id'], 'image_original', 'original:v1', None, 'manual', 'QA 原图待下载')
+    page.get_by_role('button', name='失败与补发', exact=True).click()
+    _online(page)
+    page.get_by_role('button', name='补原图', exact=True).click()
+    page.get_by_text(re.compile('只补发该消息的原图')).wait_for()
+    with page.expect_response(lambda r: r.url.endswith('/api/media-failures') and r.request.method == 'POST') as response:
+        page.locator('#submit').click()
+    _require(response.value.status == 200, 'Original-image retry returned a failed HTTP response')
+    page.locator('#dialog').wait_for(state='hidden')
+    _online(page)
+    with store.connect() as db:
+        jobs = db.execute("SELECT state FROM media_jobs WHERE media_type='image_original'").fetchall()
+    _require(len(jobs) == 1 and jobs[0]['state'] == 'pending', 'Explicit retry was not queued once')
+    _require(store.get_control(binding['id'])['status'] == 'stopped', 'Retry unexpectedly started a worker')
+    _require(not fixture.violations, 'Retry attempted an external operation')
+    return ['Preview-only item showed 补原图 with a clear confirmation',
+            'Real HTTP action queued the existing item once; no worker or external send started']
+
+
+def _automatic_original_status(page, fixture):
+    from agents.image_original import register_preview
+    binding = fixture.store.create_binding({'wechat_chat_name': 'QA 微信群', 'wechat_talker': 'qa-room',
+                        'feishu_chat_name': 'QA 飞书群', 'feishu_chat_id': 'oc_qa_room',
+                        'lark_profile': fixture.profile['profile_name']})
+    row = {'talker': 'qa-room', 'local_id': 1, 'kind_name': 'image'}
+    fixture.store.upsert_message('qa-room:1', row, 'image', binding_id=binding['id'])
+    message = fixture.store.message('qa-room:1', binding['id'])
+    fixture.store.prepare_delivery(message['id'], 'media', ['--image', 'synthetic.png'], 'qa-image-key')
+    fixture.store.set_delivery(message['id'], 'media', 'sent', 'om_qa_image')
+    fixture.store.save_setting(f'image-selection:{message["id"]}', {'thumbnail_only': True})
+    register_preview(fixture.store, message['id'], automatic=True)
+    page.get_by_role('button', name='失败与补发', exact=True).click()
+    _online(page)
+    page.get_by_text(re.compile('已尝试 0/3 次')).wait_for()
+    button = page.get_by_role('button', name='等待自动补原图', exact=True)
+    _require(button.is_disabled(), 'Automatic task allowed redundant manual submission')
+    _require('下次检查' in page.locator('#content').inner_text(), 'Next original-check time was not displayed')
+    _require(fixture.store.get_control(binding['id'])['status'] == 'stopped', 'Viewing automatic work started a worker')
+    _require(not fixture.violations, 'Viewing the queue attempted an external operation')
+    return ['Automatic original queue displayed attempt count and next check time',
+            'Retry button was disabled while queued; stopped worker remained stopped']
+
+
 CHECKS = (
+    ('browser.automatic_original_status', '自动补原图进度可见', 'Scheduled checks show progress without starting a worker or sending', _automatic_original_status),
+    ('browser.original_image_recovery', '缩略图的补原图入口', 'Explicit confirmation queues one repair without starting a worker', _original_image_recovery),
     ('browser.wizard_name', '向导一键使用微信群名', 'Literal name fill, editing, limits and responsive layout', wizard_checks.name_fill),
     ('browser.wizard_members', '向导初始成员多选', 'Zero/single/multiple members stay scoped to the selected profile', wizard_checks.member_selection),
     ('browser.wizard_creation_results', '建群失败与部分结果', 'Created groups survive member failures; uncertain requests are not replayed', wizard_checks.creation_results),
