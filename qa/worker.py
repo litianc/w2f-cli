@@ -19,6 +19,16 @@ ROOT = Path(__file__).resolve().parents[1]
 # An explicit supported-platform contract, never a blanket waiver for skips.
 PLATFORM_EXCLUSIONS = {
     'test_realtime_wakeup.ReaderWakeupTest.test_rion_watch_wakes_worker_on_new_row': {'win32'},
+    # ScheduledTasks autostart is a Windows-only product surface (agents/autostart.py
+    # guards task_register/task_unregister with os.name checks); the commands
+    # legitimately report not-applicable on POSIX runners.
+    'test_autostart.TaskCommandTest.test_boot_command_uses_windowless_python_and_autostart': {'linux', 'darwin'},
+    'test_autostart.TaskCommandTest.test_task_register_builds_logon_task': {'linux', 'darwin'},
+    'test_autostart.TaskCommandTest.test_task_status_parses_query': {'linux', 'darwin'},
+    'test_autostart.TaskCommandTest.test_task_unregister_failure_is_not_swallowed': {'linux', 'darwin'},
+    'test_autostart.TaskCommandTest.test_task_unregister_is_idempotent': {'linux', 'darwin'},
+    'test_autostart.TaskCommandTest.test_task_unregister_reports_leftover_task': {'linux', 'darwin'},
+    'test_autostart.TaskCommandTest.test_unregister_and_status_scripts_surface_service_failure': {'linux', 'darwin'},
 }
 
 

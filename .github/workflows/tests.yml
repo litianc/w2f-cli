@@ -16,7 +16,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 20 || 15 }}
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 25 || 18 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,9 +44,10 @@ jobs:
       - name: Run isolated checks and confirm failures
         id: qa
         continue-on-error: true
-        # Windows filesystem/process startup is slower; retain a bounded timeout
-        # and the same strict gate (no accepted blocked/flaky results).
-        run: python -m qa.run --timeout ${{ runner.os == 'Windows' && 480 || 240 }} --output .qa-results/ci
+        # Per-group worker timeout. The merged suite (~400 unit tests with real
+        # codec work) needs headroom on slow hosted runners; a genuine hang
+        # still surfaces here and is rejected by qa.gate.
+        run: python -m qa.run --timeout ${{ runner.os == 'Windows' && 900 || 420 }} --output .qa-results/ci
       - name: Upload structured evidence
         if: always()
         uses: actions/upload-artifact@v4

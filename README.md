@@ -53,7 +53,7 @@ flowchart LR
 
 首次启动一条新绑定时，从当前最新消息开始。后续启动、恢复或重连使用保存的进度，先完整读取离线区间，再按源时间与消息序号依次发送。姓名和群配置由数据库统一提供。
 
-Codex 负责服务控制和维护，Worker 负责持续读取与发送。项目不安装开机任务或进程异常自动重启服务；Worker 异常退出后，由用户通知 Codex 重新启动。
+Codex 负责服务控制和维护，Worker 负责持续读取与发送。按产品 Spec 的最小守护集：`python3 -m agents.manage watchdog` 自动拉起异常退出的 Worker（连续重启失败会停机并留痕，等待人工排查）；Windows 上可注册登录计划任务，开机后自动恢复管理台、watchdog 与运行中的绑定（见下文「开机自启」），不引入系统服务或其他更重的进程管家。
 
 ## 快速开始
 
@@ -67,6 +67,8 @@ Codex 负责服务控制和维护，Worker 负责持续读取与发送。项目�
 | 近实时唤醒 | 常规轮询 | 可选 `realtime_wakeup`（SSE 事件） |
 | 媒体管线 | 读取器本地路径 | WDA 解密接口 + 本地暂存缓存 |
 | Worker / 管理台 / CLI / 飞书发送 | ✅ 同一套 | ✅ 同一套 |
+
+Windows 端的机器级前置工作（WDA 与桌面微信的启动要求、开机自启的注册与重启验收）集中在 [`docs/Windows前置工作.md`](docs/Windows前置工作.md)。
 
 两个平台共同需要：
 
@@ -272,11 +274,26 @@ console_url，协助在开放平台开通、发布。需要组织审批时告诉
 | 按实名查飞书候选人 | `python3 -m agents.manage people search-feishu --profile-name wechat-mirror --name 王小明` |
 | 查看待确认事项 | `python3 -m agents.manage confirmations list` |
 | 启动 / 异常退出后重启 | `python3 -m agents.manage bindings start --id 1` |
+| 守护运行（自动拉起异常退出的 Worker） | `python3 -m agents.manage watchdog` |
+| 注册 / 注销开机自启（Windows） | `python3 -m agents.manage autostart --register` / `--unregister` |
+| 验收指标（时延分位数 / 媒体成功率 / 连续性） | `python3 -m agents.manage metrics --days 7` |
 | 暂停 | `python3 -m agents.manage bindings pause --id 1` |
 | 恢复暂停中的 Worker | `python3 -m agents.manage bindings resume --id 1` |
 | 停止 | `python3 -m agents.manage bindings stop --id 1` |
 
 暂停和停止都保留进度。`resume` 只恢复仍在运行的暂停 Worker；停止或进程异常退出后使用 `start`。
+
+### 开机自启（Windows）
+
+在管理台「运行概览」一键启用，或使用 CLI 注册：
+
+```bash
+python3 -m agents.manage autostart --register
+```
+
+注册的是当前用户的登录计划任务：登录后自动运行一次开机恢复——拉起管理台和 watchdog，并把重启前处于运行状态的绑定全部拉起。已停止、暂停或归档的绑定不会被拉起；重复运行是安全的（管理台按活动会话跳过，watchdog 有单例锁，绑定启动本身幂等）。`--unregister` 注销后重启不再自启。注册动作会保存当前解释器与配置路径，移动仓库或换 Python 后需重新注册。
+
+WDA 与桌面微信不在此自启范围内，属每次开机后的手动项——详见 [`docs/Windows前置工作.md`](docs/Windows前置工作.md)（含重启验收流程）。
 
 在管理台「人员与实名」中，优先从待确认发言人选用稳定微信 ID；需要提前关联时可按微信群成员或本机联系人搜索。昵称、备注与拼音仅用于查候选，选择后仍须人工核对真人。普通关联不会覆盖其他人员的 ID；核实后可在人员详情中用「更正归属」并填写原因。更正只影响后续镜像，历史消息姓名保留原样。缺少稳定 ID 的消息不能按昵称关联。
 

@@ -8,6 +8,21 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from agents import wechat_feishu_mirror as mirror
+from contextlib import closing
+
+
+def _symlink_privilege():
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'probe-target'; target.write_bytes(b'x')
+            link = Path(directory) / 'probe-link'
+            link.symlink_to(target)
+            return True
+    except (OSError, NotImplementedError):
+        return False
+
+
+SYMLINK_OK = _symlink_privilege()
 
 
 class ReaderImagesTest(unittest.TestCase):
@@ -18,7 +33,7 @@ class ReaderImagesTest(unittest.TestCase):
         self.digest = 'b' * 32
         self.path = self.root / 'message.db'
         self.table = 'Msg_' + self.group
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path, isolation_level=None)) as db:
             db.execute(f'CREATE TABLE "{self.table}" (local_id INTEGER,server_id INTEGER,create_time INTEGER,local_type INTEGER,packed_info_data BLOB)')
             db.execute(f'INSERT INTO "{self.table}" VALUES (54,456,1234,3,?)', (b'\x08\x02\x1a\x22\x22\x20' + self.digest.encode(),))
         db.close()
@@ -44,7 +59,7 @@ class ReaderImagesTest(unittest.TestCase):
                 db.execute(f'UPDATE "{self.table}" SET {field}=?',(value,))
             db.close()
             with self.assertRaisesRegex(RuntimeError,'image_identity_mismatch'):self.read()
-            with sqlite3.connect(self.path) as db:
+            with closing(sqlite3.connect(self.path, isolation_level=None)) as db:
                 db.execute(f'UPDATE "{self.table}" SET server_id=456,create_time=1234,local_type=3')
             db.close()
     def test_other_group_and_similar_names_are_never_used(self):
@@ -52,12 +67,13 @@ class ReaderImagesTest(unittest.TestCase):
         (other/(self.digest+'.dat')).write_bytes(b'other room')
         (self.directory/(self.digest+'-other.dat')).write_bytes(b'wrong file')
         self.assertEqual(self.read()['resources'],[])
+    @unittest.skipIf(not SYMLINK_OK, 'Windows 需管理员/开发者模式才能创建符号链接')
     def test_symlink_outside_group_is_not_a_resource(self):
         outside=self.root/'private.dat';outside.write_bytes(b'other image')
         (self.directory/(self.digest+'.dat')).symlink_to(outside)
         self.assertEqual(self.read()['resources'],[])
     def test_truncated_packed_metadata_does_not_guess_from_text(self):
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path, isolation_level=None)) as db:
             db.execute(f'UPDATE "{self.table}" SET packed_info_data=?',(b'\x1a\xff'+self.digest.encode(),))
         db.close()
         with self.assertRaisesRegex(RuntimeError,'image_metadata_invalid'):self.read()
