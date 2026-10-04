@@ -1,0 +1,5 @@
+**
+!requirements-cloud.txt
+!cloud/
+!cloud/*.py
+!cloud/constraints.txt

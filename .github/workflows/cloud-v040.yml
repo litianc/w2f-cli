@@ -1,0 +1,95 @@
+name: v0.4.0 cloud
+
+on:
+  push:
+    branches: [codex/v0.4.0]
+  pull_request:
+    paths: ["cloud/**", "deploy/v040/**", "scripts/test_v040_stack.py", "requirements-cloud.txt", ".dockerignore", ".github/workflows/cloud-v040.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v040-cloud-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/w2f-v040-browsers
+      PLAYWRIGHT_SKIP_BROWSER_GC: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements-qa.txt -r cloud/requirements-test.txt
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: python -m playwright install --with-deps chromium
+      - name: Isolated legacy regression
+        run: python -m qa.run --timeout 600 --output .qa-results/v040
+      - run: python -m qa.gate .qa-results/v040/report.json
+      - name: Cloud boundary tests
+        run: python -m unittest discover -s cloud/tests -v
+      - name: TLS, authentication, persistent volumes and rollback
+        env:
+          RELEASE: ${{ github.sha }}
+        run: python scripts/test_v040_stack.py --revision "$RELEASE"
+      - run: python scripts/check_public_tree.py
+      - name: Save the tested image
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/codex/v0.4.0'
+        env:
+          RELEASE: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker image save "w2f-v040-cloud:$RELEASE" | gzip > v040-image.tar.gz
+      - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/codex/v0.4.0'
+        with:
+          name: v040-image
+          path: v040-image.tar.gz
+          compression-level: 0
+          retention-days: 2
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v040-test-report
+          path: .qa-results/v040/
+          retention-days: 7
+
+  deploy:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/codex/v0.4.0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: v040-image
+      - name: Deploy only the tested image through a restricted key
+        env:
+          DEPLOY_KEY: ${{ secrets.V040_DEPLOY_KEY }}
+          KNOWN_HOSTS: ${{ secrets.V040_SSH_KNOWN_HOSTS }}
+          DEPLOY_HOST: ${{ secrets.V040_DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.V040_DEPLOY_PORT }}
+          RELEASE: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_KEY" && test -n "$KNOWN_HOSTS" && test -n "$DEPLOY_HOST" && test -n "$DEPLOY_PORT"
+          umask 077
+          mkdir -p "$RUNNER_TEMP/v040-ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$RUNNER_TEMP/v040-ssh/key"
+          printf '%s\n' "$KNOWN_HOSTS" > "$RUNNER_TEMP/v040-ssh/known_hosts"
+          trap 'rm -f "$RUNNER_TEMP/v040-ssh/key" "$RUNNER_TEMP/v040-ssh/known_hosts"' EXIT
+          ssh -T -i "$RUNNER_TEMP/v040-ssh/key" -p "$DEPLOY_PORT" \
+            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o BatchMode=yes \
+            -o UserKnownHostsFile="$RUNNER_TEMP/v040-ssh/known_hosts" \
+            -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
+            "w2f-v040-deploy@$DEPLOY_HOST" "deploy $RELEASE" < v040-image.tar.gz

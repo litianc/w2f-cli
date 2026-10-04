@@ -1,0 +1,12 @@
+{
+    admin off
+    auto_https off
+}
+
+https://:3040 {
+    tls /etc/w2f/tls/server.crt /etc/w2f/tls/server.key
+    request_body {
+        max_size 16MB
+    }
+    reverse_proxy app:8080
+}

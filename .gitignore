@@ -18,6 +18,8 @@ staging/
 __pycache__/
 *.py[cod]
 .venv/
+.venv-cloud/
+.v040-local/
 .qa-results/
 venv/
 env/

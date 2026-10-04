@@ -1,0 +1,5 @@
+-r ../requirements-cloud.txt
+-c constraints.txt
+httpx>=0.27,<1
+PyYAML>=6,<7
+cryptography>=44,<47
