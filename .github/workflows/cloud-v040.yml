@@ -19,7 +19,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
-      PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/w2f-v040-browsers
       PLAYWRIGHT_SKIP_BROWSER_GC: '1'
     steps:
       - uses: actions/checkout@v4
@@ -28,6 +27,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Isolate browser test resources
+        run: printf 'PLAYWRIGHT_BROWSERS_PATH=%s/w2f-v040-browsers\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - run: python -m pip install -r requirements-qa.txt -r cloud/requirements-test.txt
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: python -m playwright install --with-deps chromium

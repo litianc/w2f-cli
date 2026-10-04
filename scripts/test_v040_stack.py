@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import os
 from pathlib import Path
 import shutil
 import socket
@@ -14,6 +15,7 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -46,6 +48,8 @@ def main():
         manager = ReleaseManager(root, wait_seconds=30)
         bad_revision = "b" * 40 if args.revision != "b" * 40 else "c" * 40
         bad_image = "w2f-v040-cloud:" + bad_revision
+        next_revision = "d" * 40 if args.revision != "d" * 40 else "e" * 40
+        next_image = "w2f-v040-cloud:" + next_revision
         try:
             print("Starting isolated TLS stack", flush=True)
             manager.activate(image)
@@ -81,6 +85,45 @@ def main():
             manager.compose("exec", "-T", "app", "python", "-c",
                             "from pathlib import Path; assert Path('/var/lib/w2f/deployment-probe').read_text() == 'persisted'")
             print("TLS/authentication/isolation/persistence passed; testing failed release", flush=True)
+            original = manager.describe_image(image)
+            # Rebuilding the same source SHA must never overwrite a known image.
+            duplicate = f'FROM {image}\nLABEL w2f.test.variant=duplicate\n'
+            command("docker", "build", "--platform", "linux/amd64", "-t", next_image, "-", input=duplicate.encode())
+            command("docker", "tag", next_image, image)
+            try:
+                duplicate_archive = command("docker", "image", "save", image, capture_output=True).stdout
+            finally:
+                command("docker", "tag", original["id"], image)
+            duplicate_path = root / "duplicate.tar.gz"
+            with gzip.open(duplicate_path, "wb") as stream:
+                stream.write(duplicate_archive)
+            try:
+                with duplicate_path.open("rb") as stream:
+                    manager.deploy(args.revision, stream)
+                raise AssertionError("An existing commit was overwritten")
+            except ValueError as exc:
+                assert "different image content" in str(exc)
+            manager.verify(args.revision, original["id"])
+            assert manager.describe_image(image)["id"] == original["id"]
+            # A persistence failure after healthy startup must also roll back.
+            healthy_next = f'FROM {image}\nENV W2F_RELEASE={next_revision}\nLABEL org.opencontainers.image.revision={next_revision}\n'
+            command("docker", "build", "--platform", "linux/amd64", "-t", next_image, "-", input=healthy_next.encode())
+            real_replace = os.replace
+            history_failures = []
+            def fail_history(source, target):
+                if Path(target).name == "releases.json":
+                    history_failures.append(str(target))
+                    raise OSError("Injected metadata persistence failure")
+                return real_replace(source, target)
+            try:
+                with patch("deploy.v040.release.os.replace", side_effect=fail_history):
+                    manager.activate(next_image)
+                raise AssertionError("Metadata persistence failure was accepted")
+            except RuntimeError as exc:
+                assert "restored" in str(exc)
+            assert len(history_failures) == 1, "Candidate never reached the history write"
+            manager.verify(args.revision, original["id"])
+            assert json.loads((root / "state/releases.json").read_text())["current"]["id"] == original["id"]
             dockerfile = f'FROM {image}\nENV W2F_RELEASE={bad_revision}\nLABEL org.opencontainers.image.revision={bad_revision}\nCMD ["python", "-c", "raise SystemExit(1)"]\n'
             command("docker", "build", "--platform", "linux/amd64", "-t", bad_image, "-", input=dockerfile.encode())
             saved = command("docker", "image", "save", bad_image, capture_output=True).stdout
@@ -95,7 +138,7 @@ def main():
                 assert "restored" in str(exc)
             manager.verify(args.revision)
             history = json.loads((root / "state/releases.json").read_text())
-            assert history["current"] == image
+            assert history["current"]["id"] == original["id"]
             assert list((root / "state/backups").glob("*.dump"))
             assert manager.compose("exec", "-T", "db", "psql", "-U", "w2f", "-d", "w2f", "-Atc",
                                    "SELECT value FROM deployment_probe").stdout.strip() == b"persisted"
@@ -110,6 +153,7 @@ def main():
         finally:
             manager.compose("down", "--volumes", "--remove-orphans")
             subprocess.run(["docker", "image", "rm", bad_image], capture_output=True)
+            subprocess.run(["docker", "image", "rm", next_image], capture_output=True)
 
 
 if __name__ == "__main__":

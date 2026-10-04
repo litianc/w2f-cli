@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -20,23 +21,26 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+import urllib.error
 
 SERVER_ROOT = Path("/opt/w2f-v040")
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 
 
 def atomic_write(path: Path, text: str) -> None:
-    temporary = path.with_suffix(".tmp")
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(name)
     try:
         with os.fdopen(fd, "w") as stream:
             stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
 
 
-def validate_archive(path: Path, image: str) -> None:
+def validate_archive(path: Path, image: str) -> str:
     with tarfile.open(path, "r:gz") as archive:
         total = 0
         count = 0
@@ -57,6 +61,16 @@ def validate_archive(path: Path, image: str) -> None:
         manifest = json.load(archive.extractfile(member))
         if len(manifest) != 1 or manifest[0].get("RepoTags") != [image]:
             raise ValueError("Only the requested v0.4.0 image may be loaded")
+        config = archive.getmember(manifest[0]["Config"])
+        if not config.isfile() or config.size > 1024 * 1024:
+            raise ValueError("Invalid image configuration")
+        data = archive.extractfile(config).read()
+        metadata = json.loads(data)
+        if (metadata.get("os") != "linux" or metadata.get("architecture") != "amd64"
+                or metadata.get("config", {}).get("Labels", {}).get("org.opencontainers.image.revision")
+                != image.rsplit(":", 1)[1]):
+            raise ValueError("Image platform or release identity does not match")
+        return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
 class ReleaseManager:
@@ -81,7 +95,7 @@ class ReleaseManager:
         values["W2F_IMAGE"] = image
         atomic_write(self.env_file, "".join(f"{key}={value}\n" for key, value in values.items()))
 
-    def verify(self, revision: str):
+    def verify(self, revision: str, image_id: str | None = None):
         port = self.config()["W2F_PORT"]
         password = (self.state / "secrets/admin_password").read_text().strip()
         auth = base64.b64encode(f"admin:{password}".encode()).decode()
@@ -90,10 +104,32 @@ class ReleaseManager:
                                              urllib.request.HTTPSHandler(context=context))
         request = urllib.request.Request(f"https://127.0.0.1:{port}/api/status",
                                          headers={"Authorization": "Basic " + auth})
-        with opener.open(request, timeout=12) as response:
-            result = json.load(response)
+        for attempt in range(10):
+            try:
+                with opener.open(request, timeout=12) as response:
+                    result = json.load(response)
+                break
+            except urllib.error.URLError as exc:
+                if isinstance(exc.reason, ssl.SSLCertVerificationError) or attempt == 9:
+                    raise
+                if isinstance(exc, urllib.error.HTTPError) and exc.code != 503:
+                    raise
+                time.sleep(1)
         if result.get("status") != "ok" or result.get("release") != revision:
             raise RuntimeError("Deployed release identity/readiness does not match")
+        if image_id:
+            container = self.compose("ps", "-q", "app").stdout.decode().strip()
+            actual = self.run(["docker", "inspect", "--format", "{{.Image}}", container]).stdout.decode().strip()
+            if actual != image_id:
+                raise RuntimeError("Running container does not match the verified image ID")
+
+    def describe_image(self, image: str):
+        metadata = json.loads(self.run(["docker", "image", "inspect", image]).stdout)[0]
+        revision = metadata["Config"].get("Labels", {}).get("org.opencontainers.image.revision", "")
+        if (metadata.get("Os") != "linux" or metadata.get("Architecture") != "amd64"
+                or not re.fullmatch(r"[0-9a-f]{40}", revision)):
+            raise ValueError("Image platform or release identity does not match")
+        return {"tag": "w2f-v040-cloud:" + revision, "id": metadata["Id"], "revision": revision}
 
     def backup_database(self):
         running = self.compose("ps", "--status", "running", "-q", "db").stdout.strip()
@@ -111,28 +147,29 @@ class ReleaseManager:
         self.compose("up", "-d", "--wait", "--wait-timeout", str(self.wait_seconds))
 
     def activate(self, image: str):
+        candidate = self.describe_image(image)
         history_file = self.state / "releases.json"
         history = json.loads(history_file.read_text()) if history_file.exists() else {}
         previous = history.get("current")
-        if previous == image:
-            self.verify(image.rsplit(":", 1)[1])
+        if previous and previous["id"] == candidate["id"]:
+            self.verify(candidate["revision"], candidate["id"])
             return
         if previous:
             self.backup_database()
-        self.select_image(image)
+        self.select_image(candidate["id"])
         try:
             self.up()
-            self.verify(image.rsplit(":", 1)[1])
+            self.verify(candidate["revision"], candidate["id"])
+            atomic_write(history_file, json.dumps({"current": candidate, "previous": previous}) + "\n")
         except Exception:
             if previous:
-                self.select_image(previous)
+                self.select_image(previous["id"])
                 self.up()
-                self.verify(previous.rsplit(":", 1)[1])
+                self.verify(previous["revision"], previous["id"])
             else:
                 # Keep volumes and database for diagnosis; a failed first release is never live.
                 self.compose("stop", "gateway", "app")
             raise RuntimeError("Release failed; restored the last healthy release when available") from None
-        atomic_write(history_file, json.dumps({"current": image, "previous": previous}) + "\n")
 
     def deploy(self, revision: str, source):
         if not re.fullmatch(r"[0-9a-f]{40}", revision):
@@ -149,12 +186,17 @@ class ReleaseManager:
                     if total > MAX_ARCHIVE_BYTES:
                         raise ValueError("Image archive exceeds release limit")
                     output.write(chunk)
-            validate_archive(archive, image)
-            self.run(["docker", "load", "-i", str(archive)])
-        metadata = json.loads(self.run(["docker", "image", "inspect", image]).stdout)[0]
-        if (metadata.get("Os") != "linux" or metadata.get("Architecture") != "amd64"
-                or metadata["Config"].get("Labels", {}).get("org.opencontainers.image.revision") != revision):
-            raise ValueError("Image platform or release identity does not match")
+            image_id = validate_archive(archive, image)
+            try:
+                existing = json.loads(self.run(["docker", "image", "inspect", image]).stdout)[0]["Id"]
+            except subprocess.CalledProcessError:
+                existing = None
+            if existing and existing != image_id:
+                raise ValueError("Refusing to replace an existing commit with different image content")
+            if not existing:
+                self.run(["docker", "load", "-i", str(archive)])
+        if self.describe_image(image)["id"] != image_id:
+            raise ValueError("Loaded image ID does not match archive")
         self.activate(image)
 
     def rollback(self):
@@ -162,7 +204,7 @@ class ReleaseManager:
         previous = history.get("previous")
         if not previous:
             raise ValueError("There is no previous successful release")
-        self.activate(previous)
+        self.activate(previous["id"])
 
 
 def main():
@@ -185,7 +227,7 @@ def main():
                 manager.rollback()
             else:
                 current = json.loads((manager.state / "releases.json").read_text())["current"]
-                manager.verify(current.rsplit(":", 1)[1])
+                manager.verify(current["revision"], current["id"])
             print("v0.4.0 release operation completed")
         except Exception as exc:
             # Do not export subprocess output or configuration secrets to the SSH client.

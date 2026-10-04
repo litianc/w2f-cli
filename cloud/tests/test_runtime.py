@@ -5,7 +5,7 @@ from pathlib import Path
 from cryptography import x509
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
-from cloud.runtime import initialize
+from cloud.runtime import certificate_files, initialize
 
 
 class RuntimeIsolationTests(unittest.TestCase):
@@ -39,6 +39,19 @@ class RuntimeIsolationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             initialize(state, "v040-local", "w2f-v040-other", "127.0.0.1", "127.0.0.1", 13040,
                        "w2f-v040-cloud:local")
+
+    def test_certificate_renewal_and_reinitialization_preserve_release_configuration(self):
+        state = self.initialize()
+        env = state / "compose.env"
+        contents = env.read_text().replace("w2f-v040-cloud:test", "sha256:" + "a" * 64)
+        env.write_text(contents)
+        previous_ca = (state / "pki/ca.crt").read_bytes()
+        previous_cert = (state / "tls/server.crt").read_bytes()
+        certificate_files(state, "192.0.2.40")
+        self.initialize()
+        self.assertEqual(env.read_text(), contents)
+        self.assertEqual((state / "pki/ca.crt").read_bytes(), previous_ca)
+        self.assertNotEqual((state / "tls/server.crt").read_bytes(), previous_cert)
 
     def test_existing_unrelated_state_and_reserved_port_are_rejected(self):
         state = self.root / "existing"

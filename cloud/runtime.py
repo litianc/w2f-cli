@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import secrets
 import subprocess
+import tempfile
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -20,11 +21,14 @@ COMPOSE = ROOT / "deploy/v040/compose.yaml"
 
 
 def write_private(path: Path, data: bytes, mode: int = 0o600) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(name)
     try:
+        os.fchmod(descriptor, mode)
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -96,6 +100,9 @@ def initialize(state: Path, environment: str, project: str, public_ip: str,
     identity = f"{environment}\n{project}\n"
     if marker.exists() and marker.read_text() != identity:
         raise ValueError("Refusing to reuse another environment's state")
+    env_file = state / "compose.env"
+    if marker.exists() and env_file.exists():
+        return env_file
     if not marker.exists():
         if any(state.iterdir()):
             raise ValueError("Initial state directory must be empty")
@@ -112,14 +119,13 @@ def initialize(state: Path, environment: str, project: str, public_ip: str,
         "W2F_PROJECT": project, "W2F_STATE": str(state), "W2F_ENVIRONMENT": environment,
         "W2F_BIND_IP": bind_ip, "W2F_PORT": str(port), "W2F_IMAGE": image,
     }
-    env_file = state / "compose.env"
     write_private(env_file, "".join(f"{key}={value}\n" for key, value in values.items()).encode())
     return env_file
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["init", "up", "stop", "status"])
+    parser.add_argument("command", choices=["init", "renew", "up", "stop", "status"])
     parser.add_argument("--state", type=Path, default=ROOT / ".v040-local")
     parser.add_argument("--environment", default="v040-local")
     parser.add_argument("--project", default="w2f-v040-local")
@@ -138,6 +144,12 @@ def main() -> None:
         return
     if not env_file.is_file():
         parser.error("Initialize this dedicated environment first")
+    if args.command == "renew":
+        if not (args.state / "pki/ca.key").is_file() or not (args.state / "pki/ca.crt").is_file():
+            parser.error("Restore the existing CA before renewing certificates")
+        certificate_files(args.state.resolve(), args.public_ip)
+        print("Renewed server certificate; explicitly recreate gateway to activate it")
+        return
     command = ["docker", "compose", "--env-file", str(env_file), "-f", str(COMPOSE)]
     if args.command == "up":
         subprocess.run(["docker", "build", "-f", str(ROOT / "cloud/Dockerfile"),
