@@ -15,7 +15,7 @@ from pathlib import Path
 args=sys.argv
 def arg(name, default=None):
     return args[args.index(name)+1] if name in args else default
-rows=json.loads(Path(os.environ['CLIENT_TEST_SOURCE']).read_text())
+rows=json.loads(Path(os.environ['CLIENT_TEST_SOURCE']).read_text(encoding='utf-8'))
 base=int(arg('--after-local-id', '0'))
 high=int(arg('--through-local-id', str(max([r['local_id'] for r in rows], default=0))))
 after=int(arg('--page-after-local-id', str(base)))
@@ -37,22 +37,22 @@ class ClientCollection(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.state = self.root / 'client-state'
         self.source = self.root / 'source.json'
-        self.source.write_text('[]')
+        self.source.write_text('[]', encoding='utf-8')
         self.env = {**os.environ, 'CLIENT_TEST_SOURCE': str(self.source)}
         reader = self.root / 'reader'
         if os.name == 'nt':
             script = reader.with_suffix('.py')
-            script.write_text(READER)
+            script.write_text(READER, encoding='utf-8')
             reader = reader.with_suffix('.cmd')
-            reader.write_text(f'@"{sys.executable}" "{script}" %*\r\n')
+            reader.write_text(f'@"{sys.executable}" "{script}" %*\r\n', encoding='utf-8')
         else:
-            reader.write_text(f'#!{sys.executable}\n' + READER)
+            reader.write_text(f'#!{sys.executable}\n' + READER, encoding='utf-8')
             reader.chmod(0o700)
         self.reader = reader
 
     def command(self, *args, ok=True):
         result = subprocess.run([sys.executable, '-m', 'client', '--state-dir', str(self.state), *args],
-                                cwd=ROOT, env=self.env, capture_output=True, text=True, timeout=15)
+                                cwd=ROOT, env=self.env, capture_output=True, text=True, encoding='utf-8', timeout=15)
         self.assertEqual(result.returncode == 0, ok, result.stdout + result.stderr)
         return json.loads(result.stdout)
 
@@ -60,7 +60,7 @@ class ClientCollection(unittest.TestCase):
         rows = [dict(talker='synthetic-room', local_id=i, server_id=str(100+i),
                      sender_wxid='synthetic-sender', sender='测试者', create_time=1000+i,
                      local_type=1, kind_name='text', text=f'测试消息 {i} 😀') for i in range(1, count+1)]
-        self.source.write_text(json.dumps(rows, ensure_ascii=False))
+        self.source.write_text(json.dumps(rows, ensure_ascii=False), encoding='utf-8')
         return rows
 
     def initialize(self, **limits):
@@ -103,7 +103,7 @@ class ClientCollection(unittest.TestCase):
         self.command('enable', '--talker', 'synthetic-room')
         rows = self.rows(2)
         rows[1]['talker'] = 'wrong-room'
-        self.source.write_text(json.dumps(rows))
+        self.source.write_text(json.dumps(rows), encoding='utf-8')
         bad = self.command('collect', ok=False)
         self.assertEqual(bad['streams'][0]['error_code'], 'reader_contract')
         self.assertEqual(bad['pending_count'], 0)
@@ -148,7 +148,7 @@ class ClientCollection(unittest.TestCase):
         self.assertEqual(reset['streams'][0]['read_cursor'], 2)
         rows = self.rows(3)
         rows[-1]['kind_name'] = 'image'
-        self.source.write_text(json.dumps(rows))
+        self.source.write_text(json.dumps(rows), encoding='utf-8')
         media = self.command('collect', ok=False)
         self.assertEqual(media['streams'][0]['error_code'], 'unsupported_message')
         self.assertEqual(media['streams'][0]['read_cursor'], 2)

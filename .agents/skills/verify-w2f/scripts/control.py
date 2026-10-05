@@ -35,8 +35,9 @@ def output(*args):
 
 
 def fingerprint():
-    names = ("cloud/app.py", "cloud/__init__.py", "cloud/Dockerfile",
-             "cloud/constraints.txt", "requirements-cloud.txt")
+    names = ("cloud/app.py", "cloud/__init__.py", "cloud/Dockerfile", "cloud/runtime.py",
+             "cloud/constraints.txt", "requirements-cloud.txt", "deploy/v040/compose.yaml",
+             "deploy/v040/Caddyfile", ".agents/skills/verify-w2f/scripts/control.py")
     return {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in names}
 
 
@@ -97,6 +98,7 @@ def launch():
         (runtime / "compose.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
         shutil.copyfile(ROOT / "deploy/v040/Caddyfile", runtime / "Caddyfile")
         data["compose_sha256"] = hashlib.sha256((runtime / "compose.yaml").read_bytes()).hexdigest()
+        data["caddy_sha256"] = hashlib.sha256((runtime / "Caddyfile").read_bytes()).hexdigest()
         save(run / "run.json", data)
         with (run / "evidence/build.log").open("w") as log:
             command = ["docker", "build", "--build-arg", "RELEASE=" + data["release"],
@@ -143,7 +145,10 @@ def request(run, data, route, mode="anonymous"):
 def doctor(path):
     run, data = owned(path)
     if fingerprint() != data["source"]:
-        raise ValueError("App source changed since launch; create a fresh run")
+        raise ValueError("App or deployment source changed since launch; create a fresh run")
+    for relative, expected in (("compose.yaml", data["compose_sha256"]), ("Caddyfile", data.get("caddy_sha256"))):
+        if hashlib.sha256((run / "runtime" / relative).read_bytes()).hexdigest() != expected:
+            raise ValueError("Fixture deployment configuration changed; create a fresh run")
     ids = output("docker", "ps", "-q", "--filter", "label=com.docker.compose.project=" + data["project"]).split()
     assert len(ids) == 3, "Expected three running containers owned by this run"
     items = json.loads(output("docker", "inspect", *ids))

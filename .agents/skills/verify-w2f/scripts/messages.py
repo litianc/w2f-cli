@@ -92,24 +92,24 @@ def environment(run):
     return {**os.environ, **overrides}
 
 
-def product(run, env, operation):
-    command = [sys.executable, '-m', 'agents.wechat_feishu_mirror', operation,
-               '--config', str(run / 'runtime/config.json')]
+def execute(run, env, command, timeout):
     result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True,
-                            text=True, encoding='utf-8', timeout=15)
+                            text=True, encoding='utf-8', timeout=timeout)
     append(run / 'evidence/commands.jsonl', dict(command=command, returncode=result.returncode,
                                                 stdout=result.stdout, stderr=result.stderr))
     result.check_returncode()
     return result
 
 
+def product(run, env, operation):
+    command = [sys.executable, '-m', 'agents.wechat_feishu_mirror', operation,
+               '--config', str(run / 'runtime/config.json')]
+    return execute(run, env, command, timeout=15)
+
+
 def client(run, env, *arguments):
     command = [sys.executable, '-m', 'client', '--state-dir', str(run / 'runtime/client'), *arguments]
-    result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True,
-                            text=True, encoding='utf-8', timeout=30)
-    append(run / 'evidence/commands.jsonl', dict(command=command, returncode=result.returncode,
-                                                stdout=result.stdout, stderr=result.stderr))
-    result.check_returncode()
+    result = execute(run, env, command, timeout=30)
     return json.loads(result.stdout)
 
 
