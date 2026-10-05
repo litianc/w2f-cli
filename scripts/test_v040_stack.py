@@ -17,6 +17,8 @@ import urllib.error
 import urllib.request
 from unittest.mock import patch
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from cloud.runtime import initialize
@@ -45,6 +47,15 @@ def main():
         initialize(root / "state", "v040-ci", project, "127.0.0.1", "127.0.0.1", port, image)
         for name in ("compose.yaml", "Caddyfile"):
             shutil.copyfile(ROOT / "deploy/v040" / name, root / name)
+        # CI fixtures belong to the runner, not root. With DAC capabilities dropped,
+        # the gateway must use their owner; keep production configuration unchanged.
+        compose = yaml.safe_load((root / "compose.yaml").read_text())
+        compose["services"]["gateway"]["user"] = f"{os.getuid()}:{os.getgid()}"
+        (root / "compose.yaml").write_text(yaml.safe_dump(compose, sort_keys=False))
+        for name in ("pki", "tls"):
+            assert (root / "state" / name).stat().st_mode & 0o777 == 0o700
+        for name in ("pki/ca.key", "tls/server.key"):
+            assert (root / "state" / name).stat().st_mode & 0o777 == 0o600
         manager = ReleaseManager(root, wait_seconds=30)
         bad_revision = "b" * 40 if args.revision != "b" * 40 else "c" * 40
         bad_image = "w2f-v040-cloud:" + bad_revision
