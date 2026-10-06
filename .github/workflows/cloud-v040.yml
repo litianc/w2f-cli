@@ -76,7 +76,9 @@ jobs:
     needs: test
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/codex/v0.4.0'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The prototype uplink transfers the tested image at roughly 80–120 KB/s.
+    # Leave time for that bounded transfer plus service health verification.
+    timeout-minutes: 20
     steps:
       - uses: actions/download-artifact@v4
         with:
