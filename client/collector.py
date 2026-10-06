@@ -20,6 +20,11 @@ def integer(value):
     return type(value) is int and 0 <= value <= 9223372036854775807
 
 
+def outbox_event(row):
+    return dict(sequence=row['sequence'], event_id=row['event_id'], stream_id=row['stream_id'],
+                message=json.loads(row['payload']))
+
+
 class Collector:
     def __init__(self, state_dir):
         self.root = Path(state_dir).expanduser()
@@ -36,9 +41,20 @@ class Collector:
         db.row_factory = sqlite3.Row
         try:
             marker = db.execute("SELECT value FROM metadata WHERE key='format'").fetchone()
-            if not marker or marker[0] != 'w2f-client-v040-1':
+            if not marker or marker[0] not in {'w2f-client-v040-1', 'w2f-client-v040-2'}:
                 raise CollectionError('state_format', '这不是受支持的采集客户端状态库')
             db.execute('PRAGMA synchronous=FULL')
+            # Serialize the additive migration; old executables reject the new marker.
+            if marker[0] == 'w2f-client-v040-1':
+                with db:
+                    db.execute('BEGIN IMMEDIATE')
+                    marker = db.execute("SELECT value FROM metadata WHERE key='format'").fetchone()[0]
+                    if marker == 'w2f-client-v040-1':
+                        db.execute('ALTER TABLE outbox ADD COLUMN acknowledged_at REAL')
+                        db.execute('ALTER TABLE outbox ADD COLUMN receipt TEXT')
+                        db.execute('ALTER TABLE outbox ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0')
+                        db.execute('ALTER TABLE streams ADD COLUMN upload_error TEXT')
+                        db.execute("UPDATE metadata SET value='w2f-client-v040-2' WHERE key='format'")
             with db:
                 yield db
         finally:
@@ -123,6 +139,8 @@ class Collector:
             if old:
                 return dict(old)
             config = dict(db.execute('SELECT key,value FROM metadata'))
+            if config.get('recovery_required'):
+                raise CollectionError('recovery_required', '云端恢复代次变化；保留全部本地副本，等待管理员核对')
             page = self._page(config, talker, 0)
             stream_id = str(uuid.uuid4())
             db.execute('INSERT INTO streams(id,talker,read_cursor) VALUES(?,?,?)',
@@ -135,6 +153,8 @@ class Collector:
             db.execute('BEGIN IMMEDIATE')
             stream = dict(db.execute('SELECT * FROM streams WHERE id=?', (stream_id,)).fetchone())
             config = dict(db.execute('SELECT key,value FROM metadata'))
+            if config.get('recovery_required'):
+                raise CollectionError('recovery_required', '云端恢复代次变化；保留全部本地副本，等待管理员核对')
             base = stream['scan_base'] if stream['snapshot_high'] is not None else stream['read_cursor']
             anchor = (dict(time=stream['page_time'], local_id=stream['page_id'])
                       if stream['page_id'] is not None else None)
@@ -146,7 +166,7 @@ class Collector:
                     raise CollectionError('unsupported_message', '当前采集内核仅支持普通文本；保留该页等待后续支持')
                 payload = json.dumps(row, ensure_ascii=False, separators=(',', ':'))
                 staged.append((str(uuid.uuid4()), stream_id, row['local_id'], payload, len(payload.encode('utf-8'))))
-            used = db.execute('SELECT COALESCE(SUM(payload_bytes),0) FROM outbox').fetchone()[0]
+            used = db.execute('SELECT COALESCE(SUM(payload_bytes),0) FROM outbox WHERE acknowledged_at IS NULL').fetchone()[0]
             if used + sum(row[4] for row in staged) > int(config['max_pending_bytes']):
                 raise CollectionError('queue_full', '本地待上传队列已达到容量上限；该页未入队，采集位置保留')
             db.executemany('INSERT INTO outbox(event_id,stream_id,local_id,payload,payload_bytes) VALUES(?,?,?,?,?)', staged)
@@ -175,17 +195,20 @@ class Collector:
     def status(self):
         with self.database() as db:
             config = dict(db.execute('SELECT key,value FROM metadata'))
-            count, size = db.execute('SELECT COUNT(*),COALESCE(SUM(payload_bytes),0) FROM outbox').fetchone()
+            count, size = db.execute('SELECT COUNT(*),COALESCE(SUM(payload_bytes),0) FROM outbox WHERE acknowledged_at IS NULL AND quarantined=0').fetchone()
+            retained, retained_bytes = db.execute('SELECT COUNT(*),COALESCE(SUM(payload_bytes),0) FROM outbox WHERE acknowledged_at IS NOT NULL AND quarantined=0').fetchone()
+            quarantined = db.execute('SELECT COUNT(*) FROM outbox WHERE quarantined=1').fetchone()[0]
             streams = [dict(row) for row in db.execute('SELECT * FROM streams ORDER BY rowid')]
         return dict(device_id=config['device_id'], source_account=config['source_account'],
                     pending_count=count, pending_bytes=size, max_pending_bytes=int(config['max_pending_bytes']),
-                    streams=streams, upload_implemented=False, delivery_implemented=False)
+                    retained_count=retained, retained_bytes=retained_bytes, quarantined_count=quarantined,
+                    recovery_required=bool(config.get('recovery_required')),
+                    streams=streams, upload_implemented=True, delivery_implemented=False)
 
     def pending(self, after=0, limit=100):
         if after < 0 or not 1 <= limit <= 1000:
             raise CollectionError('configuration', '待上传分页参数无效')
         with self.database() as db:
-            rows = db.execute('SELECT o.*,s.talker FROM outbox o JOIN streams s ON s.id=o.stream_id WHERE sequence>? ORDER BY sequence LIMIT ?', (after, limit)).fetchall()
-        events = [dict(sequence=row['sequence'], event_id=row['event_id'], stream_id=row['stream_id'],
-                       message=json.loads(row['payload'])) for row in rows]
+            rows = db.execute('SELECT o.*,s.talker FROM outbox o JOIN streams s ON s.id=o.stream_id WHERE sequence>? AND acknowledged_at IS NULL AND quarantined=0 ORDER BY sequence LIMIT ?', (after, limit)).fetchall()
+        events = [outbox_event(row) for row in rows]
         return dict(events=events, next_after=events[-1]['sequence'] if events else after)

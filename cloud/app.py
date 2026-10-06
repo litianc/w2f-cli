@@ -8,10 +8,16 @@ from pathlib import Path
 import secrets
 import tempfile
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import psycopg
+import json
+
+from cloud.store import Store, StoreError
+from w2f_protocol.ingest import MAX_BODY, ProtocolError
 
 
 @dataclass(frozen=True)
@@ -48,7 +54,7 @@ def check_dependencies(settings: Settings) -> None:
     with psycopg.connect(host=settings.database_host, port=settings.database_port,
                         dbname="w2f", user="w2f", password=settings.database_password,
                         connect_timeout=3, options="-c statement_timeout=3000") as connection:
-        connection.execute("SELECT 1").fetchone()
+        connection.execute("SELECT version FROM w2f_schema WHERE version=1").fetchone()
     # Test the actual writable mount, not just the existence of its directory.
     with tempfile.TemporaryFile(dir=settings.data_dir) as probe:
         probe.write(b"w2f-ready")
@@ -59,6 +65,46 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     app = FastAPI(title="W2F cloud", docs_url=None, redoc_url=None, openapi_url=None)
     basic = HTTPBasic()
+    store = Store(settings)
+
+    def device_token(request: Request):
+        authorization = request.headers.get('authorization', '')
+        if not authorization.startswith('Bearer '):
+            raise HTTPException(401, 'Device authentication required')
+        return authorization[7:]
+
+    @app.exception_handler(StoreError)
+    async def store_error(request, error):
+        return JSONResponse({'error': error.code}, status_code=error.status)
+
+    @app.exception_handler(ProtocolError)
+    async def protocol_error(request, error):
+        return JSONResponse({'error': 'invalid_request'}, status_code=422)
+
+    @app.exception_handler(psycopg.Error)
+    async def database_error(request, error):
+        return JSONResponse({'error': 'storage_unavailable'}, status_code=503)
+
+    @app.get('/api/v1/session')
+    def session(token=Depends(device_token)):
+        return store.session(token)
+
+    @app.post('/api/v1/events')
+    async def ingest(request: Request, token=Depends(device_token)):
+        raw = bytearray()
+        async for chunk in request.stream():
+            raw.extend(chunk)
+            if len(raw) > MAX_BODY:
+                return JSONResponse({'error': 'request_too_large'}, status_code=413)
+        try:
+            body = json.loads(raw)
+        except (ValueError, UnicodeError, RecursionError):
+            raise ProtocolError('Invalid JSON') from None
+        return await run_in_threadpool(store.ingest, token, body)
+
+    @app.get('/api/v1/messages/{event_id}')
+    def message(event_id: str, token=Depends(device_token)):
+        return jsonable_encoder(store.message(event_id, token))
 
     def authenticate(credentials: HTTPBasicCredentials = Depends(basic)) -> None:
         user_ok = secrets.compare_digest(credentials.username.encode(), settings.admin_user.encode())
@@ -108,7 +154,7 @@ small{{color:#536571}}h1{{margin:0}}.badge{{color:#216449}}</style><main>
 <small>W2F · v0.4.0 云端原型</small><h1>云端管理</h1><section>
 <h2 class="badge">{status_text}</h2><p>环境：{html.escape(settings.environment)}</p>
 <p>版本：{html.escape(settings.release[:12])}</p></section><section>
-<h2>等待接入采集客户端</h2><p>云端部署入口已建立。采集接入、用户管理与消息存档功能将随后交付。</p>
+<h2>文本采集接入已开放</h2><p>设备可上传文本并查询云端保存状态。用户、设备和绑定通过受限管理命令配置；飞书投递尚未启用。</p>
 </section></main></html>""", status_code=200 if healthy else 503)
 
     return app

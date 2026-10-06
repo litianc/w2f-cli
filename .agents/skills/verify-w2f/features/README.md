@@ -23,10 +23,11 @@ Report feature ID, actual commands, source identity, result and retained evidenc
 
 ## Features
 
+- [Text cloud intake](text-cloud-e2e.md): actual client, verified HTTPS and Postgres; lost acknowledgments, restart, tenant authorization, ordered atomic writes and seven-day retention. No Feishu sending.
 - [Cloud login](cloud-login.md): anonymous challenge, wrong password, correct credentials at both protected routes.
 - [Cloud management status](cloud-status.md): real browser page, environment/build, health and capability notice.
 - [Isolated runtime lifecycle](runtime-lifecycle.md): independent instances, ownership checks and scoped teardown.
 - [Legacy binding confirmation controls](legacy-binding-controls.md): existing browser/SQLite confirmation and cancellation regression; not cloud functionality.
 - [Synthetic source messages](synthetic-messages.md): inject text through an executable `ordered_sync_v1` reader; verify the new client's durable queue or the legacy Worker's polling, paging, rendering/receipts and restart without duplicate sends.
 
-Future cloud collector onboarding, trial-user management and archive browsing are unmapped until user-reachable implementations exist. Add entries when those routes land; the current placeholder notice is not proof of those features.
+Device provisioning and archive queries are currently command/API operations covered by text cloud intake. Add UI entries when management forms and archive browsing land.

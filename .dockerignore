@@ -3,3 +3,5 @@
 !cloud/
 !cloud/*.py
 !cloud/constraints.txt
+!w2f_protocol/
+!w2f_protocol/*.py

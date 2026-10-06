@@ -5,13 +5,14 @@ import sqlite3
 import sys
 
 from .collector import CollectionError, Collector
+from .upload import Uploader
 
 
 def main():
     for pipe in (sys.stdout, sys.stderr):
         if hasattr(pipe, 'reconfigure'):
             pipe.reconfigure(encoding='utf-8')
-    parser = argparse.ArgumentParser(description='v0.4.0 本地采集内核（尚未实现云端上传）')
+    parser = argparse.ArgumentParser(description='v0.4.0 文本采集与端云上传')
     parser.add_argument('--state-dir', required=True)
     sub = parser.add_subparsers(dest='command', required=True)
     init = sub.add_parser('init')
@@ -26,6 +27,13 @@ def main():
     pending = sub.add_parser('pending')
     pending.add_argument('--after', type=int, default=0)
     pending.add_argument('--limit', type=int, default=100)
+    connect = sub.add_parser('connect')
+    connect.add_argument('--credentials-file', required=True)
+    connect.add_argument('--url', required=True)
+    connect.add_argument('--ca-file', required=True)
+    sub.add_parser('upload', help='每群最多上传一批文本，确认后保留恢复副本')
+    sub.add_parser('retained')
+    sub.add_parser('prune', help='核对云端代次后清理满七天的已确认副本')
     a = parser.parse_args()
     try:
         collector = Collector(a.state_dir)
@@ -35,10 +43,15 @@ def main():
             result = collector.enable(a.talker)
         elif a.command == 'pending':
             result = collector.pending(a.after, a.limit)
+        elif a.command == 'connect':
+            result = Uploader(collector).connect(a.credentials_file, a.url, a.ca_file)
+        elif a.command in {'upload', 'retained', 'prune'}:
+            result = getattr(Uploader(collector), a.command)()
         else:
             result = getattr(collector, a.command)()
         print(json.dumps(result, ensure_ascii=False))
-        return int(a.command == 'collect' and any(row['error_code'] for row in result['streams']))
+        return int((a.command == 'collect' and any(row['error_code'] for row in result['streams']))
+                   or (a.command == 'upload' and bool(result['errors'])))
     except (CollectionError, OSError, sqlite3.Error) as exc:
         code = exc.code if isinstance(exc, CollectionError) else 'local_state_error'
         # Reader stdout/stderr may contain private content; only emit our own errors.

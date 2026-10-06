@@ -83,7 +83,7 @@ class ClientCollection(unittest.TestCase):
         status = self.command('status')
         self.assertEqual(status['streams'][0]['read_cursor'], 5)
         self.assertEqual(status['pending_count'], 3)
-        self.assertFalse(status['upload_implemented'])
+        self.assertTrue(status['upload_implemented'])
 
     def test_full_queue_keeps_unstored_page_and_cursor_for_retry(self):
         self.initialize(page_size=1, max_pending_bytes=350)

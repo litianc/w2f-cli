@@ -4,7 +4,7 @@ on:
   push:
     branches: [codex/v0.4.0]
   pull_request:
-    paths: ["cloud/**", "deploy/v040/**", "scripts/test_v040_stack.py", "requirements-cloud.txt", ".dockerignore", ".github/workflows/cloud-v040.yml"]
+    paths: ["cloud/**", "client/**", "w2f_protocol/**", "tests/test_client*.py", ".agents/skills/verify-w2f/**", "deploy/v040/**", "scripts/test_v040_stack.py", "requirements-cloud.txt", ".dockerignore", ".github/workflows/cloud-v040.yml"]
   workflow_dispatch:
 
 permissions:
@@ -37,6 +37,8 @@ jobs:
       - run: python -m qa.gate .qa-results/v040/report.json
       - name: Cloud boundary tests
         run: python -m unittest discover -s cloud/tests -v
+      - name: Client HTTPS intake, durable receipts and recovery
+        run: python .agents/skills/verify-w2f/scripts/e2e.py
       - name: TLS, authentication, persistent volumes and rollback
         env:
           RELEASE: ${{ github.sha }}
@@ -61,7 +63,10 @@ jobs:
         if: always()
         with:
           name: v040-test-report
-          path: .qa-results/v040/
+          path: |
+            .qa-results/v040/
+            .qa-results/verify-w2f/run-*/evidence/
+            .qa-results/verify-w2f/run-*/run.json
           retention-days: 7
 
   deploy:

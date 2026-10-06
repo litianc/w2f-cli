@@ -39,7 +39,7 @@ def require(condition, message):
 
 
 def fingerprint():
-    paths = [p for directory in ('agents', 'integrations', 'client') for p in (ROOT / directory).glob('*.py')]
+    paths = [p for directory in ('agents', 'integrations', 'client', 'w2f_protocol') for p in (ROOT / directory).glob('*.py')]
     paths += [ROOT / 'qa/isolation.py', Path(__file__), Path(fixture.__file__)]
     return {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(paths)}
 
@@ -287,7 +287,7 @@ def doctor(run, meta):
             or observed['through_local_id'] != len(rows) or observed['has_more'] != (len(rows) > 2)):
         raise AssertionError('Reader did not expose the injected source')
     data = dict(result='passed', source_count=len(rows), contract=observed['contract'],
-                worker_alive=False, network='disabled', sink='synthetic-local', cloud='not_implemented')
+                worker_alive=False, network='disabled', sink='synthetic-local', cloud='not_exercised')
     save(run / 'evidence/doctor.json', data)
     return data
 
@@ -297,7 +297,7 @@ def drive(run, meta, live_text=None):
     if not source(run) and live_text is None:
         raise ValueError('Inject at least one message or use drive --text')
     number = len(list((run / 'evidence').glob('drive-*.json'))) + 1
-    report = dict(result='failed', feature='synthetic-text', cloud='not_implemented',
+    report = dict(result='failed', feature='synthetic-text', cloud='not_exercised',
                   real_wechat='not_tested', real_feishu='not_tested')
     try:
         cycle(run, live_text)
@@ -336,7 +336,7 @@ def collect(run, meta):
     expected = source(run)
     if not expected:
         raise ValueError('Inject a message before testing the client queue')
-    report = dict(result='failed', feature='client-queue', cloud='not_implemented', feishu='not_exercised')
+    report = dict(result='failed', feature='client-queue', cloud='not_exercised', feishu='not_exercised')
     number = len(list((run / 'evidence').glob('client-queue-*.json'))) + 1
     try:
         env = environment(run)

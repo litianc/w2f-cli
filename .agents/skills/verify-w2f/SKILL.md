@@ -1,17 +1,18 @@
 ---
 name: verify-w2f
-description: Verify W2F cloud management, HTTPS authentication, and runtime isolation, or inject synthetic WeChat text at the reader boundary to test downstream Worker processing, persistence, and replay. Use after cloud entry changes or when message tests need a controllable source.
+description: Verify W2F cloud management, HTTPS authentication, and runtime isolation, or inject synthetic WeChat text at the reader boundary to test downstream Worker processing, persistence, and replay. Verify client HTTPS uploads and durable cloud receipts with a disposable Postgres stack. Use after cloud/client changes or when message tests need a controllable source.
 ---
 
 # Verify W2F
 
 Run from the **v0.4.0 development checkout**, never main. Read [features/README.md](features/README.md), then choose the relevant path:
 
+- Client upload, tenant isolation, cloud archive and receipt recovery: follow [Text cloud intake](features/text-cloud-e2e.md). This runs the actual client and Postgres with a synthetic reader; it does not send Feishu messages.
 - Cloud management at `/` and `/api/status`: follow the container/browser recipe below.
 - Mock a WeChat message, test collection processing or replay: follow [Synthetic source messages](features/synthetic-messages.md). Its `messages.py collect` drives the new client's local queue; `drive` exercises the legacy Worker with a synthetic Feishu CLI. Both need no Docker, browser or real account.
 - Legacy `agents.manage` UI controls: use the separate browser harness in the feature map.
 
-The cloud currently exposes deployment status and Basic authentication. Collection, user management and archive browsing are still announced as future work in the page. Neither deployment proof nor synthetic message proof establishes real WeChat → cloud → Feishu delivery. The new client currently saves a local text queue; its upload and the cloud business pipeline remain unimplemented. The synthetic reader drives this queue and the existing single-machine Worker in separate verification modes.
+The cloud exposes deployment status, administrator Basic authentication, device-authenticated text intake and message queries. Restricted operator commands provision and disable users/devices/bindings. The client persists receipts and retains confirmed copies for seven days. Full management UI and cloud Feishu delivery are pending; the legacy Worker proof remains a separate path.
 
 ## Launch
 

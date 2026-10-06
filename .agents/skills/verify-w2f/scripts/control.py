@@ -38,6 +38,7 @@ def fingerprint():
     names = ("cloud/app.py", "cloud/__init__.py", "cloud/Dockerfile", "cloud/runtime.py",
              "cloud/constraints.txt", "requirements-cloud.txt", "deploy/v040/compose.yaml",
              "deploy/v040/Caddyfile", ".agents/skills/verify-w2f/scripts/control.py")
+    names = sorted(set(names) | {str(p.relative_to(ROOT)) for folder in ('cloud', 'client', 'w2f_protocol') for p in (ROOT / folder).glob('*.py')} | {'.dockerignore', 'qa/isolation.py', '.agents/skills/verify-w2f/scripts/e2e.py', '.agents/skills/verify-w2f/scripts/message_fixture.py'})
     return {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in names}
 
 
@@ -223,7 +224,7 @@ def drive(path, feature):
                     page.get_by_role("heading", name="服务已就绪", exact=True).wait_for()
                     text = page.locator("main").inner_text()
                     assert "环境：v040-ci" in text and data["release"][:12] in text
-                    assert "等待接入采集客户端" in text
+                    assert "文本采集接入已开放" in text
                     assert not unexpected, "Unexpected browser network destination"
                     for name in ("admin_password", "database_password"):
                         assert (state / "secrets" / name).read_text().strip() not in text
@@ -244,10 +245,29 @@ def drive(path, feature):
     return {"result": "passed", "feature": feature, "evidence": str(run / "evidence")}
 
 
+def live_processes(run):
+    import psutil
+    live = []
+    for path in (run / 'runtime/.processes').glob('*.json'):
+        record = json.loads(path.read_text())
+        try:
+            process = psutil.Process(record['pid'])
+            if process.create_time() == record['created'] and process.is_running():
+                live.append(record)
+        except psutil.NoSuchProcess:
+            pass
+    return live
+
+
 def cleanup(path):
     run, data = owned(path)
     runtime = run / "runtime"
     if runtime.exists():
+        from qa.isolation import ProcessTree
+        # The tracker excludes its own PID; seed ownership only from registered
+        # (PID, creation time) pairs, never re-adopt a possibly reused numeric PID.
+        ProcessTree(os.getpid(), runtime).cleanup()
+        assert not live_processes(run), 'Owned processes remain; preserve runtime'
         if "compose_sha256" in data:
             compose(run, data, "down", "--volumes", "--remove-orphans")
         for resource in ("ps", "volume"):
@@ -261,7 +281,7 @@ def cleanup(path):
         shutil.rmtree(runtime)
     evidence = sorted(p.name for p in (run / "evidence").iterdir())
     result = {"result": "cleaned", "project": data["project"], "runtime_removed": not runtime.exists(),
-              "retained_evidence": evidence}
+              "retained_evidence": evidence, "live_processes": live_processes(run)}
     save(run / "evidence/cleanup.json", result)
     return result
 
