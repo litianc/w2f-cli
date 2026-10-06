@@ -17,6 +17,7 @@ from pathlib import Path
 from .storage import MirrorStore
 from .chat_creation import CliRequestError, CreateValidationError, create_target
 from .paths import DATA_DIR, DEFAULT_CONFIG, ROOT, runtime_paths
+from . import autostart
 
 DEFAULT_DB=DATA_DIR/'wechat_feishu_mirror.sqlite3'
 READER=Path(os.environ.get('WECHAT_READER',str(Path(os.environ.get('CODEX_HOME',Path.home()/'.codex'))/'skills/wechat-cli/scripts/reader.sh')))
@@ -336,15 +337,84 @@ def setup_init(config_path,db_path,payload=None):
     return setup_status(config_path,db_path)
 
 
-def binding_action(store,config_path,binding_id,action):
+def binding_action(store,config_path,binding_id,action,start_reason=None):
     if action=='archive':
         binding_action(store,config_path,binding_id,'stop');store.archive_binding(binding_id);return store.get_binding(binding_id)
     args=[sys.executable,'-m','agents.wechat_feishu_mirror',action,'--config',str(config_path),'--db',str(store.path),'--binding-id',str(binding_id)]
+    if action=='start' and start_reason:args+=['--start-reason',start_reason]
     return run_cli(args)
 
 
+def binding_restorable(store,binding):
+    """已启用、控制状态 running 且 Worker 死亡——watchdog 与开机恢复共用的判定。"""
+    if not binding.get('enabled'):return False
+    state=store.status(int(binding['id']))
+    return state['control'].get('status')=='running' and not state['worker']['alive']
+
+
+class Watchdog:
+    """Restart dead workers of running bindings (Spec 最小守护集）。
+
+    Only control-state 'running' bindings are touched: a clean stop or pause
+    flips the control state first, so user-stopped bindings are never
+    resurrected. Restart attempts back off per binding; after max_fails
+    consecutive failures the binding is parked as stopped with a visible
+    reason instead of flapping forever. The mirror-side start path is
+    idempotent under its launch/lifetime locks, so a racing restart is safe.
+    """
+    def __init__(self,store,config_path,restart=None,min_gap=60.0,max_fails=5):
+        self.store=store;self.config_path=Path(config_path)
+        self.restart=restart or (lambda bid:binding_action(store,self.config_path,bid,'start'))
+        self.min_gap=min_gap;self.max_fails=max_fails;self.last={};self.fails={}
+    def once(self,now=None):
+        now=time.time() if now is None else now;restarted=[]
+        for binding in self.store.list_bindings(False):
+            bid=binding['id']
+            if not binding_restorable(self.store,binding):
+                self.fails.pop(bid,None);self.last.pop(bid,None);continue
+            if now-self.last.get(bid,0.0)<self.min_gap:continue
+            self.last[bid]=now
+            try:self.restart(bid)
+            except Exception as exc:
+                self.fails[bid]=self.fails.get(bid,0)+1
+                print(f"watchdog: 绑定 {bid} 第 {self.fails[bid]} 次重启失败: {exc}",file=sys.stderr,flush=True)
+                if self.fails[bid]>=self.max_fails:
+                    self.store.set_control(bid,'stopped',reason='watchdog 放弃：连续重启失败，请人工排查')
+                    self.store.audit('watchdog.give_up',after={'binding_id':bid},actor='watchdog',binding_id=bid)
+                    self.fails.pop(bid,None);self.last.pop(bid,None)
+                continue
+            # A user stop may land while the restart is in flight; the worker
+            # honours the control state on its own, only annotate when running.
+            if self.store.status(bid)['control'].get('status')=='running':
+                self.store.set_control(bid,'running',reason='watchdog restart')
+            self.store.audit('watchdog.restart',after={'binding_id':bid},actor='watchdog',binding_id=bid)
+            self.fails.pop(bid,None);restarted.append(bid)
+        return restarted
+    def loop(self,interval=15.0,stop=None):
+        stop=stop or threading.Event()
+        print(json.dumps({'watchdog':'started','interval':interval}),flush=True)
+        while not stop.wait(interval):self.once()
+
+
 class Manager:
-    def __init__(self,store,config_path):self.store=store;self.config_path=Path(config_path);self.started=time.time()
+    def __init__(self,store,config_path):self.store=store;self.config_path=Path(config_path);self.started=time.time();self._autostart_cache=None;self._autostart_refresh=threading.Lock()
+    def autostart_status(self,ttl=60.0):
+        # task_status spawns PowerShell; the overview polls every 10s, so the
+        # query is cached and refreshed by one thread at a time — overlapping
+        # polls get the stale value instead of each paying a PowerShell start.
+        cached=self._autostart_cache
+        if cached and time.time()-cached[0]<ttl:return cached[1]
+        if self._autostart_refresh.acquire(blocking=False):
+            try:
+                cached=self._autostart_cache
+                if cached and time.time()-cached[0]<ttl:return cached[1]
+                value={'task':autostart.TASK_NAME,**autostart.task_status()}
+                self._autostart_cache=(time.time(),value)
+                return value
+            finally:self._autostart_refresh.release()
+        # Contended path: another thread is refreshing; serve the stale value
+        # (the dict, not the (timestamp, value) cache tuple).
+        return cached[1] if cached else {'task':autostart.TASK_NAME,'registered':False,'supported':autostart.supported()}
     def get(self,resource,query=None):
         query=query or {};s=self.store
         if resource=='profiles':return s.list_profiles()
@@ -362,6 +432,14 @@ class Manager:
                      **(retry_status(s,r) if r['media_type']=='image_original' else {})} for r in s.list_media_failures()]
         if resource=='uncertain':return s.uncertain_deliveries()
         if resource=='setup':return setup_status(self.config_path,s.path)
+        if resource=='autostart':return self.autostart_status()
+        if resource=='metrics':
+            from .metrics import build_report
+            raw=query.get('days')
+            days=float(raw) if raw is not None and raw!='' else 7.0
+            if not days>0:raise ValueError('days 必须为正数')
+            bid=int(query['binding_id']) if query.get('binding_id') else None
+            return build_report(s.metric_rows(time.time()-days*86400,binding_id=bid),window_days=days)
         if resource=='search/wechat':return search_wechat(query.get('q',''))
         if resource=='search/feishu':return search_feishu(query.get('profile',''),query.get('q',''))
         if resource=='wizard/wechat':return search_wechat(query.get('q',''),200)
@@ -559,10 +637,20 @@ class Manager:
             args=json.loads(row['payload_json'])
             if '--text' in args and found.get('content')!=args[args.index('--text')+1]:raise ValueError('回执正文不一致，请核对原消息和表情转换')
             s.set_delivery(int(data['message_id']),data['part'],'sent',data['remote_id']);result={'confirmed':True}
+        elif resource=='autostart':
+            if op=='register':result={'task':autostart.TASK_NAME,**autostart.task_register(self.config_path,s.path)}
+            elif op=='unregister':result={'task':autostart.TASK_NAME,**autostart.task_unregister()}
+            else:raise ValueError('不支持的开机自启操作')
+            # Same lock as the poll path: an in-flight status snapshot must
+            # not overwrite the fresh register/unregister truth.
+            with self._autostart_refresh:self._autostart_cache=(time.time(),result)
         else:raise ValueError('不支持的管理操作')
         # Audit never captures Secret or arbitrary full request bodies.
         safe={k:v for k,v in data.items() if k in {'op','id','name','profile_name','person_id','message_id','part','new_name','remote_id'}}
-        s.audit(resource+'.'+str(op),after=safe,actor=actor)
+        # Bindings ops carry the binding id on the audit row itself — the
+        # metrics guard reads it as manual-intervention evidence.
+        binding_id=int(data['id']) if resource=='bindings' and str(data.get('id','')).isdigit() else None
+        s.audit(resource+'.'+str(op),after=safe,actor=actor,binding_id=binding_id)
         return result
 
 
@@ -635,6 +723,9 @@ def main():
     for name in ('profiles','bindings','people','confirmations','media-failures','uncertain','setup'):
         child=sub.add_parser(name);child.add_argument('action',nargs='?',default='list');child.add_argument('--op');child.add_argument('--id',type=int);child.add_argument('--data');child.add_argument('--name');child.add_argument('--profile-name');child.add_argument('--app-id');child.add_argument('--new-name');child.add_argument('--health',action='store_true');child.add_argument('--app-secret-stdin',action='store_true');child.add_argument('--query');child.add_argument('--binding-id',type=int);child.add_argument('--source-account')
     sub.add_parser('status');sv=sub.add_parser('serve');sv.add_argument('--port',type=int,default=0);sv.add_argument('--host',default='127.0.0.1')
+    wd=sub.add_parser('watchdog');wd.add_argument('--interval',type=float,default=15.0);wd.add_argument('--once',action='store_true')
+    au=sub.add_parser('autostart');au.add_argument('--register',action='store_true');au.add_argument('--unregister',action='store_true')
+    mt=sub.add_parser('metrics');mt.add_argument('--days',type=float,default=7.0);mt.add_argument('--binding-id',type=int)
     for child in sub.choices.values():
         child.add_argument('--config',default=argparse.SUPPRESS,type=Path);child.add_argument('--db',default=argparse.SUPPRESS,type=Path)
     args=p.parse_args();config=read_config(args.config)
@@ -646,8 +737,38 @@ def main():
         os.environ['WECHAT_READER'] = reader_override
         READER = Path(reader_override)
     db=args.db or Path(config['sqlite_file']);store=MirrorStore(db);store.initialize(config);manager=Manager(store,args.config)
-    if args.command=='serve':serve(store,args.config,args.host,args.port);return 0
+    if args.command=='serve':
+        # Console singleton: a racing boot pass or manual serve must not end
+        # with two consoles on different ports; the loser exits here — but
+        # still surfaces the running console's link (README documents that
+        # `serve` is how you get the URL).
+        handle=autostart.singleton_lock(store.path.parent/'locks'/'console.lock')
+        if handle is None:
+            session=autostart.console_session(store) or {}
+            print(json.dumps({'console':'already-running','url':session.get('url'),'port':session.get('port')},ensure_ascii=False));return 0
+        try:serve(store,args.config,args.host,args.port)
+        finally:handle.close()
+        return 0
+    if args.command=='watchdog':
+        dog=Watchdog(store,args.config)
+        if args.once:print(json.dumps({'restarted':dog.once()},ensure_ascii=False))
+        else:
+            # Singleton lock: the boot task spawns a watchdog, and a manual
+            # second copy must not double-restart the same bindings.
+            handle=autostart.singleton_lock(store.path.parent/'locks'/'watchdog.lock')
+            if handle is None:print(json.dumps({'watchdog':'already-running'}),flush=True);return 0
+            try:dog.loop(args.interval)
+            finally:handle.close()
+        return 0
+    if args.command=='autostart':
+        if args.register or args.unregister:
+            result=autostart.task_register(args.config,store.path) if args.register else autostart.task_unregister()
+            store.audit('autostart.register' if args.register else 'autostart.unregister',after={'task':autostart.TASK_NAME})
+        else:
+            result=autostart.run_boot(store,args.config,store.path)
+        print(json.dumps(result,ensure_ascii=False,indent=2));return 0
     if args.command=='status':result=manager.get('status')
+    elif args.command=='metrics':result=manager.get('metrics',{'days':args.days,'binding_id':args.binding_id})
     else:
         op=args.op or args.action
         if args.health:op='health'

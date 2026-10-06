@@ -3,6 +3,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,7 +23,7 @@ class ReaderFilesTest(unittest.TestCase):
         self.raw = ('<msg><appmsg><type>74</type><title><![CDATA[example.pdf]]></title>'
                     '<appattach><totallen>12</totallen></appattach>'
                     f'<md5><![CDATA[{self.digest}]]></md5></appmsg></msg>')
-        with sqlite3.connect(self.source) as db:
+        with closing(sqlite3.connect(self.source)) as db, db:
             db.execute('CREATE TABLE Msg_fixture(local_id INTEGER,server_id INTEGER,create_time INTEGER,local_type INTEGER,message_content TEXT)')
             db.execute('INSERT INTO Msg_fixture VALUES(1,100,200,?,?)', ((74 << 32) | 49, self.raw))
             db.execute('ALTER TABLE Msg_fixture ADD COLUMN real_sender_id INTEGER DEFAULT 1')
@@ -65,7 +66,7 @@ class ReaderFilesTest(unittest.TestCase):
             self.assertEqual(read_file(self.reader, self.db, self.args)['resources'], [])
 
     def test_missing_digest_does_not_search_by_filename(self):
-        with sqlite3.connect(self.source) as db:
+        with closing(sqlite3.connect(self.source)) as db, db:
             db.execute('UPDATE Msg_fixture SET message_content=?', (self.raw.replace(self.digest, ''),))
         self.assertEqual(read_file(self.reader, self.db, self.args)['resources'], [])
         self.assertEqual(self.lookups, [])
@@ -79,7 +80,7 @@ class ReaderFilesTest(unittest.TestCase):
         self.assertEqual(read_file(self.reader, self.db, self.args)['resources'], [])
 
     def completed_source(self):
-        with sqlite3.connect(self.source) as db:
+        with closing(sqlite3.connect(self.source)) as db, db:
             db.execute('UPDATE Msg_fixture SET server_id=101,local_type=?,message_content=?', ((6 << 32) | 49, self.raw.replace('<type>74</type>', '<type>6</type>')))
         self.args.pending_file_metadata = json.dumps({'name': 'example.pdf', 'size': 12, 'md5': self.digest, 'sender_wxid': 'wx_sender'})
 
@@ -101,7 +102,7 @@ class ReaderFilesTest(unittest.TestCase):
 
     def test_group_sender_prefix_before_xml_declaration_is_removed(self):
         self.completed_source()
-        with sqlite3.connect(self.source) as db:
+        with closing(sqlite3.connect(self.source)) as db, db:
             db.execute('UPDATE Msg_fixture SET message_content=?', ('wx_sender:\n<?xml version="1.0"?>\n' + self.raw.replace('<type>74</type>', '<type>6</type>'),))
         self.assertEqual(len(read_file(self.reader, self.db, self.args)['resources']), 1)
 

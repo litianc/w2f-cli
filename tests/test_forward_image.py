@@ -14,7 +14,20 @@ from agents import wechat_feishu_mirror as mirror
 from agents.storage import MirrorStore
 from integrations.forward_records import parse_record
 from tests.test_forward_links import forward_xml
+def _symlink_privilege():
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'probe-target'; target.write_bytes(b'x')
+            link = Path(directory) / 'probe-link'
+            link.symlink_to(target)
+            return True
+    except (OSError, NotImplementedError):
+        return False
+
+
+SYMLINK_OK = _symlink_privilege()
 from tests.test_recovery import History,Sink
+from contextlib import closing
 
 buffer=BytesIO();Image.new('RGB',(80,60),'blue').save(buffer,format='PNG')
 IMAGE=buffer.getvalue();DIGEST=hashlib.md5(IMAGE).hexdigest()
@@ -177,6 +190,7 @@ class ForwardImageTest(unittest.TestCase):
             self.send(row(image_item()+video_item()+image_item()))
         self.assertEqual([next(f for f in ('--image','--file') if f in a) for _,a in self.sink.sent if '--image' in a or '--file' in a],['--image','--file','--image'])
 
+    @unittest.skipIf(not SYMLINK_OK, 'Windows 需管理员/开发者模式才能创建符号链接')
     def test_wrong_outer_resource_identity_and_source_symlink_never_uploaded(self):
         foreign=self.root/'foreign';foreign.write_bytes(IMAGE);self.image.unlink();self.image.symlink_to(foreign)
         self.send();self.assertFalse(any('--image' in a for _,a in self.sink.sent))
@@ -299,12 +313,13 @@ class ForwardImageTest(unittest.TestCase):
 
 
 class ForwardImageReaderTest(unittest.TestCase):
+    @unittest.skipIf(not SYMLINK_OK, 'Windows 需管理员/开发者模式才能创建符号链接')
     def test_encrypted_rec_candidates_are_scoped_and_verified_after_decode(self):
         from integrations.reader_forward import read_forward
         from tests.test_image_resources import v2
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);source=root/'messages.db'
-            with sqlite3.connect(source) as db:
+            with closing(sqlite3.connect(source, isolation_level=None)) as db:
                 db.execute('CREATE TABLE Msg_room(local_id,server_id,create_time,text)')
                 db.execute('INSERT INTO Msg_room VALUES(11,911,1011,?)',(row()['text'],))
             def connect(path):

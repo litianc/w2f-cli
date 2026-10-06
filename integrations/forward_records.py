@@ -27,6 +27,18 @@ def _http_url(value):
     return value
 
 
+_BARE_AMPERSAND = re.compile(r'&(?!(?:[a-zA-Z][a-zA-Z0-9]{1,9}|#\d{1,5}|#x[0-9a-fA-F]{1,6});)')
+
+
+def _rescue_bare_ampersands(text):
+    """WeChat occasionally emits recordinfo whose article URLs carry raw '&'.
+
+    ElementTree rejects the whole document for one bare ampersand. Escape only
+    those (never real entities), so the URL text survives byte-for-byte.
+    """
+    return _BARE_AMPERSAND.sub('&amp;', text)
+
+
 def parse_record(raw, depth=0):
     if depth > 4:
         return [{'sender': '未知发言人', 'sender_id': '', 'kind': 'placeholder', 'body': '[嵌套转发层级过深]'}]
@@ -36,7 +48,10 @@ def parse_record(raw, depth=0):
         try:
             root = ET.fromstring(html.unescape(raw))
         except (ET.ParseError, TypeError):
-            return []
+            try:
+                root = ET.fromstring(_rescue_bare_ampersands(html.unescape(raw)))
+            except (ET.ParseError, TypeError):
+                return []
     def field(node, *tags):
         for tag in tags:
             value = node.findtext(tag)
