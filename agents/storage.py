@@ -512,21 +512,33 @@ class MirrorStore:
         with self.connect() as db:
             return bool(db.execute("SELECT 1 FROM bindings WHERE lark_profile=? AND archived=0 LIMIT 1", (profile_name,)).fetchone())
 
-    def list_bindings(self, include_archived: bool = True) -> list[dict[str, Any]]:
+    def _binding_rows(self, binding_id: int | None = None, include_archived: bool = True):
+        where, parameters = [], []
+        if binding_id is not None:
+            where.append('b.id=?')
+            parameters.append(binding_id)
+        if not include_archived:
+            where.append('b.archived=0')
+        clause = 'WHERE ' + ' AND '.join(where) if where else ''
         with self.connect() as db:
-            where = "" if include_archived else "WHERE b.archived=0"
-            rows = db.execute(f"SELECT b.*,c.status control_status,s.cursor,w.pid,w.heartbeat_at,w.stopped_at FROM bindings b LEFT JOIN runtime_control c ON c.binding_id=b.id LEFT JOIN runtime_state s ON s.binding_id=b.id LEFT JOIN worker_leases w ON w.binding_id=b.id {where} ORDER BY b.id").fetchall()
+            return db.execute(f"SELECT b.*,c.status control_status,s.cursor,w.pid,w.heartbeat_at,w.stopped_at FROM bindings b LEFT JOIN runtime_control c ON c.binding_id=b.id LEFT JOIN runtime_state s ON s.binding_id=b.id LEFT JOIN worker_leases w ON w.binding_id=b.id {clause} ORDER BY b.id", parameters).fetchall()
+
+    def list_bindings(self, include_archived: bool = True) -> list[dict[str, Any]]:
+        rows = self._binding_rows(include_archived=include_archived)
         result = []
         for row in rows:
-            item = dict(row)
-            item["recovery"] = self.recovery(int(item["id"]))
-            item["member_sync_enabled"] = bool(self.setting(f'member_sync:{item["id"]}',{}).get("enabled"))
-            item["member_tasks"] = self.list_member_tasks(int(item["id"]))
-            item["name_sync_enabled"] = bool(self.setting(f'name_sync_enabled:{item["id"]}',False))
-            item["name_sync"] = self.setting(f'name_sync:{item["id"]}',{})
-            item["worker_alive"] = bool(item.get("stopped_at") is None and item.get("heartbeat_at") and now() - float(item["heartbeat_at"]) < 20)
-            result.append(item)
+            result.append(self._binding_details(row))
         return result
+
+    def _binding_details(self, row):
+        item = dict(row)
+        item["recovery"] = self.recovery(int(item["id"]))
+        item["member_sync_enabled"] = bool(self.setting(f'member_sync:{item["id"]}',{}).get("enabled"))
+        item["member_tasks"] = self.list_member_tasks(int(item["id"]))
+        item["name_sync_enabled"] = bool(self.setting(f'name_sync_enabled:{item["id"]}',False))
+        item["name_sync"] = self.setting(f'name_sync:{item["id"]}',{})
+        item["worker_alive"] = bool(item.get("stopped_at") is None and item.get("heartbeat_at") and now() - float(item["heartbeat_at"]) < 20)
+        return item
 
     def list_member_tasks(self, binding_id):
         with self.connect() as db:
@@ -535,7 +547,18 @@ class MirrorStore:
             return [dict(row) for row in db.execute("SELECT * FROM member_tasks WHERE binding_id=? ORDER BY id DESC LIMIT 30",(binding_id,))]
 
     def get_binding(self, binding_id: int) -> dict[str, Any] | None:
-        return next((x for x in self.list_bindings() if int(x["id"]) == int(binding_id)), None)
+        rows = self._binding_rows(binding_id=int(binding_id))
+        return self._binding_details(rows[0]) if rows else None
+
+    def get_worker_state(self, binding_id: int) -> dict[str, Any] | None:
+        """Read fresh control and application state without management details."""
+        with self.connect() as db:
+            row = db.execute('''SELECT b.*,COALESCE(c.status,'stopped') control_status,
+                p.enabled profile_enabled,p.profile_name current_profile_name
+                FROM bindings b LEFT JOIN runtime_control c ON c.binding_id=b.id
+                LEFT JOIN profiles p ON p.app_id=b.lark_app_id WHERE b.id=?''',
+                (binding_id,)).fetchone()
+        return dict(row) if row else None
 
     def rename_binding(self, binding_id: int, *, wechat_chat_name: str | None = None, feishu_chat_name: str | None = None, actor: str = "codex") -> dict[str, Any]:
         current = self.get_binding(binding_id)

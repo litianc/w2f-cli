@@ -954,12 +954,11 @@ def check_control(config, store):
     if not config.get('_guard'):
         return
     bid = int(config['binding_id'])
-    binding = store.get_binding(bid)
-    profile = next((p for p in store.list_profiles() if p['app_id'] == binding['lark_app_id']), None) if binding else None
-    if not binding or binding['archived'] or not binding['enabled'] or not profile or not profile['enabled'] or store.get_control(bid)['status'] != 'running':
+    binding = store.get_worker_state(bid)
+    if not binding or binding['archived'] or not binding['enabled'] or not binding['profile_enabled'] or binding['control_status'] != 'running':
         raise ControlChanged('绑定已暂停、停止或应用不可用')
     config.update(binding)
-    config['lark_profile'] = profile['profile_name']
+    config['lark_profile'] = binding['current_profile_name']
 
 
 def send_part(config, store, message, part, arguments):
@@ -1427,8 +1426,9 @@ def stream(config, state=None):
         media_due=0
         was_paused=False
         while True:
-            binding=store.get_binding(bid)
-            control=store.get_control(bid)['status']
+            binding=store.get_worker_state(bid)
+            if not binding:return
+            control=binding['control_status']
             if control=='stopped' or binding['archived'] or not binding['enabled']: return
             if control=='paused':
                 if not was_paused:store.update_recovery(bid,phase='paused')

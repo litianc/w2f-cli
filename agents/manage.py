@@ -82,20 +82,21 @@ def profile_list(store):
         for p in local:
             if p['profile_name'] in by_name and by_name[p['profile_name']]!=p['app_id']:
                 db.execute("UPDATE profiles SET profile_name=?,enabled=0,bot_status='replaced',last_error=? WHERE id=?",(f"missing-{p['id']}-{int(time.time())}",'同名 Profile 被替换为另一应用',p['id']))
-                db.execute('UPDATE bindings SET enabled=0 WHERE lark_app_id=?',(p['app_id'],))
-                db.execute("UPDATE runtime_control SET status='stopped',reason='Profile App ID changed',updated_at=? WHERE binding_id IN (SELECT id FROM bindings WHERE lark_app_id=?)",(time.time(),p['app_id']))
+                db.execute('UPDATE bindings SET enabled=0 WHERE lark_app_id=? AND enabled!=0',(p['app_id'],))
+                db.execute("UPDATE runtime_control SET status='stopped',reason='Profile App ID changed',updated_at=? WHERE binding_id IN (SELECT id FROM bindings WHERE lark_app_id=?) AND (status!='stopped' OR reason IS NOT 'Profile App ID changed')",(time.time(),p['app_id']))
         for item in remote:
             p=db.execute('SELECT * FROM profiles WHERE app_id=?',(item['app_id'],)).fetchone()
             if p:
-                db.execute('UPDATE profiles SET profile_name=?,updated_at=? WHERE id=?',(item['name'],time.time(),p['id']))
-                db.execute('UPDATE bindings SET lark_profile=? WHERE lark_app_id=?',(item['name'],item['app_id']))
+                if p['profile_name']!=item['name']:
+                    db.execute('UPDATE profiles SET profile_name=?,updated_at=? WHERE id=?',(item['name'],time.time(),p['id']))
+                db.execute('UPDATE bindings SET lark_profile=? WHERE lark_app_id=? AND lark_profile IS NOT ?',(item['name'],item['app_id'],item['name']))
             else:
                 db.execute('INSERT INTO profiles(profile_name,app_id,protected,created_at,updated_at) VALUES(?,?,?,?,?)',(item['name'],item['app_id'],int(item['name']=='feishu-mcp'),time.time(),time.time()))
         apps={p['app_id'] for p in remote}
         for p in local:
             if p['app_id'] not in apps:
-                db.execute("UPDATE profiles SET bot_status='missing',last_error='Profile 在 CLI 中缺失' WHERE app_id=?",(p['app_id'],))
-                db.execute("UPDATE runtime_control SET status='stopped',reason='Profile missing' WHERE binding_id IN (SELECT id FROM bindings WHERE lark_app_id=?)",(p['app_id'],))
+                db.execute("UPDATE profiles SET bot_status='missing',last_error='Profile 在 CLI 中缺失' WHERE app_id=? AND (bot_status IS NOT 'missing' OR last_error IS NOT 'Profile 在 CLI 中缺失')",(p['app_id'],))
+                db.execute("UPDATE runtime_control SET status='stopped',reason='Profile missing',updated_at=? WHERE binding_id IN (SELECT id FROM bindings WHERE lark_app_id=?) AND (status!='stopped' OR reason IS NOT 'Profile missing')",(time.time(),p['app_id']))
     return store.list_profiles()
 
 
@@ -371,7 +372,7 @@ class Manager:
             return {'ok':result.get('contract')=='ordered_sync_v1'}
         if resource=='wizard/check-target':return check_target(query.get('profile',''),query.get('chat_id',''),s)
         if resource=='status':
-            return {'version':'0.3.2','started_at':self.started,'bindings':[{**b,**s.status(b['id'])} for b in s.list_bindings()], 'confirmations':len(s.list_confirmations()),'media_failures':len(s.list_media_failures()),'actions':s.actions()[:20]}
+            return {'version':'0.3.3','started_at':self.started,'bindings':[{**b,**s.status(b['id'])} for b in s.list_bindings()], 'confirmations':len(s.list_confirmations()),'media_failures':len(s.list_media_failures()),'actions':s.actions()[:20]}
         raise ValueError('接口不存在')
     def post(self,resource,data,actor='codex'):
         s=self.store;op=data.get('op');result=None
