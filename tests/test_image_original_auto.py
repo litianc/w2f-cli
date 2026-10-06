@@ -83,8 +83,10 @@ class AutomaticOriginalTest(OriginalRecoveryFixture, unittest.TestCase):
         self.store.initialize_cursor(1, 0)
         self.store.set_control(1, 'running')
         completed = threading.Event()
+        source_scans = []
         def reader(cmd, **kwargs):
             if 'sync-page' in cmd:
+                source_scans.append(cmd)
                 data = {'contract': 'ordered_sync_v1', 'through_local_id': 0, 'messages': [], 'has_more': False}
                 return SimpleNamespace(returncode=0, stdout=json.dumps({'data': data}), stderr='')
             return self.reader(cmd, **kwargs)
@@ -110,6 +112,7 @@ class AutomaticOriginalTest(OriginalRecoveryFixture, unittest.TestCase):
                 self.store.set_control(1, 'stopped')
                 worker.join(3)
             self.assertFalse(worker.is_alive())
+            self.assertEqual(len(source_scans), 1, 'An original-image retry must not rescan the source group')
 
     def test_pause_during_short_wait_sends_nothing_and_resume_does_not_wait_again(self):
         self.config['_guard'] = True

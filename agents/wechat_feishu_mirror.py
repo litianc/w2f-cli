@@ -1407,6 +1407,9 @@ def realtime_wakeup_loop(config: dict[str, Any], wakeup: threading.Event, stoppe
 
 
 def stream(config, state=None):
+    from agents.scan_schedule import ScanSchedule
+    from agents.image_original import next_retry_delay
+    schedule=ScanSchedule(config.get('source_min_interval',10),config.get('poll_interval',600))
     store=MirrorStore(config['sqlite_file']); store.initialize()
     bid=int(config['binding_id']); token=store.acquire_lease(bid)
     stopped=threading.Event()
@@ -1421,34 +1424,51 @@ def stream(config, state=None):
     if str(config.get('reader_wakeup', '')).lower() in {'true', '1', 'yes'}:
         threading.Thread(target=reader_wakeup_loop,args=(config,wakeup,stopped),daemon=True).start()
     try:
-        wait_until=0
+        media_due=0
+        was_paused=False
         while True:
             binding=store.get_binding(bid)
             control=store.get_control(bid)['status']
             if control=='stopped' or binding['archived'] or not binding['enabled']: return
             if control=='paused':
-                store.update_recovery(bid,phase='paused');stopped.wait(0.5);wait_until=0;continue
-            if time.monotonic()<wait_until:
-                stopped.wait(0.1)
-                if wakeup.is_set(): wakeup.clear();wait_until=0
-                continue
-            try:
-                # Reconcile CLI profile names/App IDs before each source pass.
-                from agents.manage import profile_list
-                profile_list(store)
-                check_control(config,store)
-                delivered = recover_once(config,store)
-                retry_media_jobs(config,store)
-                expire_failed_media(config,store)
-                from agents.image_original import next_retry_delay
-                wait_until=time.monotonic()+next_retry_delay(store,bid,0 if delivered else float(config.get('poll_interval',600)))
-            except ControlChanged:
-                wait_until=0
-            except Exception as exc:
-                phase='needs_review' if isinstance(exc,DeliveryUncertain) else 'disconnected'
-                store.update_recovery(bid,phase=phase,error=safe_error(exc),failed_at=time.time())
-                print(f'同步暂缓 binding={bid}: {safe_error(exc)}',file=sys.stderr,flush=True)
-                wait_until=time.monotonic()+min(60,float(config.get('poll_interval',600)))
+                if not was_paused:store.update_recovery(bid,phase='paused')
+                was_paused=True;stopped.wait(0.5);continue
+            if was_paused:
+                schedule.request(time.monotonic());media_due=0;was_paused=False
+            if wakeup.is_set():
+                # Clear before the scan; notifications arriving during it must
+                # remain pending. Repeated requests never postpone a deadline.
+                wakeup.clear();schedule.request(time.monotonic())
+            if schedule.ready(time.monotonic()):
+                try:
+                    from agents.manage import profile_list
+                    profile_list(store)
+                    check_control(config,store)
+                    schedule.begin(time.monotonic())
+                    delivered=recover_once(config,store)
+                    schedule.finish(time.monotonic(),delivered)
+                except ControlChanged:
+                    schedule.request(time.monotonic());stopped.wait(0.5);continue
+                except Exception as exc:
+                    phase='needs_review' if isinstance(exc,DeliveryUncertain) else 'disconnected'
+                    store.update_recovery(bid,phase=phase,error=safe_error(exc),failed_at=time.time())
+                    print(f'同步暂缓 binding={bid}: {safe_error(exc)}',file=sys.stderr,flush=True)
+                    schedule.fail(time.monotonic());stopped.wait(0.5);continue
+            if time.monotonic()>=media_due:
+                try:
+                    check_control(config,store)
+                    retry_media_jobs(config,store)
+                    expire_failed_media(config,store)
+                    # SQLite-only checks discover manually queued jobs within
+                    # five seconds; media retries never force a source scan.
+                    media_due=time.monotonic()+next_retry_delay(store,bid,5)
+                except ControlChanged:
+                    stopped.wait(0.5);continue
+                except Exception as exc:
+                    print(f'媒体处理暂缓 binding={bid}: {safe_error(exc)}',file=sys.stderr,flush=True)
+                    media_due=time.monotonic()+min(60,schedule.poll_interval)
+            now=time.monotonic()
+            stopped.wait(max(0,min(0.5,schedule.due_at-now,media_due-now)))
     finally:
         stopped.set();thread.join(timeout=1);store.release_lease(token,bid)
 

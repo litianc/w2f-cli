@@ -30,7 +30,7 @@ def read_config(path):
 def write_runtime_config(value,path):
     # All values accepted from the browser are allowlisted separately. Runtime
     # paths are supplied only by local config/CLI, never arbitrary HTTP bodies.
-    value={k:v for k,v in value.items() if k in SETUP_FIELDS|{'sqlite_file','data_dir','media_dir','log_dir','state_file','wechat_reader','realtime_wakeup','realtime_stream_url','sender_map','macos_image_key_derivation','image_original_wait_seconds','image_original_auto_retry'}}
+    value={k:v for k,v in value.items() if k in SETUP_FIELDS|{'sqlite_file','data_dir','media_dir','log_dir','state_file','wechat_reader','realtime_wakeup','realtime_stream_url','sender_map','macos_image_key_derivation','image_original_wait_seconds','image_original_auto_retry','source_min_interval'}}
     path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
     tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(value,ensure_ascii=False,indent=2)+'\n',encoding='utf-8');tmp.chmod(0o600);tmp.replace(path)
 
@@ -371,7 +371,7 @@ class Manager:
             return {'ok':result.get('contract')=='ordered_sync_v1'}
         if resource=='wizard/check-target':return check_target(query.get('profile',''),query.get('chat_id',''),s)
         if resource=='status':
-            return {'version':'0.3','started_at':self.started,'bindings':[{**b,**s.status(b['id'])} for b in s.list_bindings()], 'confirmations':len(s.list_confirmations()),'media_failures':len(s.list_media_failures()),'actions':s.actions()[:20]}
+            return {'version':'0.3.2','started_at':self.started,'bindings':[{**b,**s.status(b['id'])} for b in s.list_bindings()], 'confirmations':len(s.list_confirmations()),'media_failures':len(s.list_media_failures()),'actions':s.actions()[:20]}
         raise ValueError('接口不存在')
     def post(self,resource,data,actor='codex'):
         s=self.store;op=data.get('op');result=None
