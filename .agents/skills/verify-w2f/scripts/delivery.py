@@ -298,6 +298,19 @@ def drive(run,data):
     assert [json.loads(json.loads(r['request'])['content'])['text'] for r in result['attempts']]==['测试发送者：M2 有序文本 1 😀','测试发送者：M2 有序文本 2']
     status=manage(run,data,'status',binding)
     assert [j['state'] for j in status['jobs']]==['sent','sent']
+    readback=json.loads(e2e.command(run,data,'run','--rm','--no-deps','-T','sender','python','-m','cloud.verify',
+        '--binding',binding,'--event',events[0]['event_id']))
+    assert readback['verified'] and len(readback['parts'])==1
+    mode(run,a['chat'],'wrong_readback_target')
+    try:
+        e2e.command(run,data,'run','--rm','--no-deps','-T','sender','python','-m','cloud.verify',
+                    '--binding',binding,'--event',events[0]['event_id'])
+        raise AssertionError('Readback accepted a different target')
+    except RuntimeError:
+        pass
+    mode(run,a['chat'],'success')
+    assert json.loads(e2e.command(run,data,'run','--rm','--no-deps','-T','sender','python','-m','cloud.verify',
+        '--binding',binding,'--event',events[0]['event_id']))['verified']
     for event in events:
         assert e2e.http(run,data,'/api/v1/events',a['credentials'],e2e.batch(a,[event]))[0]==200
     once(run,data)

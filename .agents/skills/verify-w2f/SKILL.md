@@ -7,6 +7,7 @@ description: Verify W2F cloud management, HTTPS authentication, and runtime isol
 
 Run from the **v0.4.0 development checkout**, never main. Read [features/README.md](features/README.md), then choose the relevant path:
 
+- Explicitly authorized real server/Feishu or Mac input: follow [Live text verification](features/live-text.md); its private evidence and human confirmation are separate from CI.
 - Cloud sending, persisted parts and failure recovery: follow [Cloud delivery](features/cloud-delivery.md), with a private simulated Feishu endpoint.
 - Client upload, tenant isolation, cloud archive and receipt recovery: follow [Text cloud intake](features/text-cloud-e2e.md). This runs the actual client and Postgres with a synthetic reader; it does not send Feishu messages.
 - Cloud management at `/` and `/api/status`: follow the container/browser recipe below.

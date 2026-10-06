@@ -61,7 +61,7 @@ class Feishu:
         if token:
             headers['Authorization']='Bearer '+token
         request=urllib.request.Request(self.base_url+path,
-            data=json.dumps(payload,ensure_ascii=False,separators=(',',':')).encode(),headers=headers)
+            data=None if payload is None else json.dumps(payload,ensure_ascii=False,separators=(',',':')).encode(),headers=headers)
         try:
             try:
                 response=self.opener.open(request,timeout=10)
@@ -99,3 +99,27 @@ class Feishu:
             raise DeliveryError('send_response_unknown','unknown')
         # A structured API rejection establishes only this attempt was rejected.
         raise DeliveryError('send_rejected','failed')
+
+    def verify_text(self, message_id, app_id, user_id, payload):
+        """Read back a persisted receipt, checking the actual sender, target and text."""
+        if not re.fullmatch(r'om_[A-Za-z0-9_-]{1,128}',message_id):
+            raise DeliveryError('invalid_receipt','failed')
+        status,body,_=self._request('/open-apis/im/v1/messages/'+message_id,None,
+                                   self.token(app_id,user_id),send=False)
+        try:
+            if status != 200 or type(body['code']) is not int or body['code'] != 0:
+                raise ValueError()
+            items=body['data']['items']
+            if not isinstance(items,list) or len(items)!=1:
+                raise ValueError()
+            row=items[0]
+            expected=json.loads(payload['content'])
+            observed=json.loads(row['body']['content'])
+            if (row['message_id']!=message_id or row['chat_id']!=payload['receive_id']
+                    or row['msg_type']!='text' or row['deleted'] is not False
+                    or row['sender']['id_type']!='app_id' or row['sender']['sender_type']!='app'
+                    or row['sender']['id']!=app_id or observed!=expected):
+                raise ValueError()
+        except (KeyError,ValueError,TypeError):
+            raise DeliveryError('readback_mismatch_or_unavailable','failed') from None
+        return dict(message_id=message_id,verified=True)

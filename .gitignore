@@ -33,3 +33,6 @@ promo/.cache/
 
 # Windows reader adapter shim (machine-specific venv path)
 integrations/wda_reader.cmd
+
+# Private real v0.4.0 client/cloud verification state
+.v040-live/

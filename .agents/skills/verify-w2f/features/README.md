@@ -23,6 +23,8 @@ Report feature ID, actual commands, source identity, result and retained evidenc
 
 ## Features
 
+- [Live text verification](live-text.md): M3 real cloud/Feishu and M4 Mac input; explicit private configuration, bounded sending/readback, human receipt confirmation.
+
 - [Cloud delivery](cloud-delivery.md): actual cloud sender and private Feishu HTTP fixture; ordered persisted parts, retry/unknown outcomes, ownership and recovery.
 
 - [Text cloud intake](text-cloud-e2e.md): actual client, verified HTTPS and Postgres; lost acknowledgments, restart, tenant authorization, ordered atomic writes and seven-day retention. No Feishu sending.

@@ -28,6 +28,20 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
     def do_GET(self):
+        prefix='/open-apis/im/v1/messages/'
+        if self.path.startswith(prefix):
+            app=self.headers.get('Authorization','').removeprefix('Bearer fixture-token-')
+            with connect() as db:
+                row=db.execute('SELECT * FROM receipts WHERE message_id=? AND app=?',(self.path[len(prefix):],app)).fetchone()
+            if not row:
+                self.reply(404,dict(code=230001)); return
+            request=json.loads(row['request'])
+            current=json.loads((ROOT/'control.json').read_text()).get('modes',{}).get(row['chat'])
+            chat=row['chat']+'_wrong' if current=='wrong_readback_target' else row['chat']
+            self.reply(200,dict(code=0,data=dict(items=[dict(message_id=row['message_id'],chat_id=chat,
+                sender=dict(id=row['app'],id_type='app_id',sender_type='app'),msg_type='text',deleted=False,
+                body=dict(content=request['content']))])))
+            return
         self.reply(200,dict(status='fixture'))
     def do_POST(self):
         body=json.loads(self.rfile.read(int(self.headers['Content-Length'])))

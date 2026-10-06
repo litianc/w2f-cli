@@ -9,7 +9,7 @@ COPY cloud/*.py /app/cloud/
 COPY w2f_protocol/*.py /app/w2f_protocol/
 ARG RELEASE=local
 ENV W2F_RELEASE=${RELEASE}
-LABEL org.opencontainers.image.revision=${RELEASE} w2f.project=v040
+LABEL org.opencontainers.image.revision=${RELEASE} w2f.project=v040 w2f.delivery=2
 USER 1040:1040
 EXPOSE 8080
 CMD ["python", "-m", "cloud.server"]

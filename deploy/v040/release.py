@@ -117,7 +117,10 @@ class ReleaseManager:
                 time.sleep(1)
         if result.get("status") != "ok" or result.get("release") != revision:
             raise RuntimeError("Deployed release identity/readiness does not match")
-        for service in ('app','sender'):
+        roles = ('app','sender') if self.supports_sender() else ('app',)
+        if 'sender' not in roles and self.compose('ps','-q','sender').stdout.strip():
+            raise RuntimeError('Legacy release must not leave a sender running')
+        for service in roles:
             container = self.compose("ps", "-q", service).stdout.decode().strip()
             metadata = json.loads(self.run(["docker", "inspect", container]).stdout)[0]
             if ((image_id and metadata['Image'] != image_id)
@@ -145,10 +148,16 @@ class ReleaseManager:
         with os.fdopen(fd, "wb") as stream:
             stream.write(dump)
 
+    def supports_sender(self):
+        image = self.config()['W2F_IMAGE']
+        metadata = json.loads(self.run(['docker','image','inspect',image]).stdout)[0]
+        return metadata['Config'].get('Labels',{}).get('w2f.delivery') == '2'
+
     def up(self):
         # Drain the old role before replacing any image or database container.
         self.compose("stop", "sender")
-        self.compose("up", "-d", "--wait", "--wait-timeout", str(self.wait_seconds))
+        self.compose("up", "-d", "--wait", "--wait-timeout", str(self.wait_seconds),
+                     "--scale", "sender=" + ("1" if self.supports_sender() else "0"))
 
     def activate(self, image: str):
         candidate = self.describe_image(image)
