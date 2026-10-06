@@ -70,11 +70,56 @@ services:
     cpus: 1
     pids_limit: 150
     logging: *logging
+  sender:
+    image: ${W2F_IMAGE:?Set an immutable image tag}
+    command:
+    - python
+    - -m
+    - cloud.sender
+    restart: unless-stopped
+    environment:
+      W2F_CLOUD_ENVIRONMENT: ${W2F_ENVIRONMENT:?Set the environment}
+      W2F_CLOUD_DATA_DIR: /var/lib/w2f
+      W2F_DATABASE_PASSWORD_FILE: /run/secrets/database_password
+      W2F_FEISHU_CREDENTIALS_FILE: /run/secrets/feishu_apps
+    secrets:
+    - database_password
+    - feishu_apps
+    read_only: true
+    tmpfs:
+    - /tmp
+    cap_drop:
+    - ALL
+    security_opt:
+    - no-new-privileges:true
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 100
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+      - CMD
+      - python
+      - -m
+      - cloud.sender
+      - --health
+      interval: 10s
+      timeout: 9s
+      retries: 6
+      start_period: 10s
+    depends_on:
+      app:
+        condition: service_healthy
+    logging: *logging
+
 secrets:
   admin_password:
     file: ${W2F_STATE}/secrets/admin_password
   database_password:
     file: ${W2F_STATE}/secrets/database_password
+  feishu_apps:
+    file: ${W2F_STATE}/secrets/feishu_apps.json
+
 volumes:
   postgres:
   media:

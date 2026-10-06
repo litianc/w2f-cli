@@ -83,12 +83,14 @@ def main():
             config = json.loads(manager.compose("config", "--format", "json").stdout)
             assert not config["services"]["db"].get("ports")
             assert not config["services"]["app"].get("ports")
+            assert not config["services"]["sender"].get("ports")
+            assert set(config["services"]) == {"app", "db", "gateway", "sender"}
             assert all(item["name"].startswith(project + "_") for item in config["volumes"].values())
             manager.compose("exec", "-T", "db", "psql", "-U", "w2f", "-d", "w2f", "-v", "ON_ERROR_STOP=1",
                             "-c", "CREATE TABLE deployment_probe(value text); INSERT INTO deployment_probe VALUES ('persisted');")
             manager.compose("exec", "-T", "app", "python", "-c",
                             "from pathlib import Path; Path('/var/lib/w2f/deployment-probe').write_text('persisted')")
-            manager.compose("up", "-d", "--force-recreate", "--wait", "--wait-timeout", "60", "db", "app")
+            manager.compose("up", "-d", "--force-recreate", "--wait", "--wait-timeout", "60", "db", "app", "sender")
             manager.verify(args.revision)
             persisted = manager.compose("exec", "-T", "db", "psql", "-U", "w2f", "-d", "w2f", "-Atc",
                                         "SELECT value FROM deployment_probe").stdout.strip()
@@ -158,7 +160,7 @@ def main():
             status = manager.compose("ps", "--all").stdout.decode()
             print(status, file=sys.stderr)
             # This stack contains only generated fixtures, never production credentials/data.
-            logs = manager.compose("logs", "--tail", "25", "app", "gateway").stdout.decode()
+            logs = manager.compose("logs", "--tail", "25", "app", "gateway", "sender").stdout.decode()
             print(logs, file=sys.stderr)
             raise
         finally:

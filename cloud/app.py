@@ -32,7 +32,7 @@ class Settings:
     database_port: int = 5432
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls, role="api") -> "Settings":
         environment = os.environ["W2F_CLOUD_ENVIRONMENT"]
         if environment not in {"v040-local", "v040-ci", "v040-prototype"}:
             raise ValueError("An explicit v0.4.0 environment is required")
@@ -41,9 +41,11 @@ class Settings:
             raise ValueError("A dedicated data directory is required")
         data_dir = data_dir.resolve()
         passwords = [Path(os.environ[name]).read_text().strip() for name in
-                     ("W2F_ADMIN_PASSWORD_FILE", "W2F_DATABASE_PASSWORD_FILE")]
+                     (("W2F_DATABASE_PASSWORD_FILE",) if role == "sender" else ("W2F_ADMIN_PASSWORD_FILE", "W2F_DATABASE_PASSWORD_FILE"))]
         if any(len(password) < 24 for password in passwords):
             raise ValueError("Dedicated passwords must contain at least 24 characters")
+        if role == "sender":
+            passwords.insert(0, "")
         return cls(environment, os.environ.get("W2F_RELEASE", "local"), data_dir,
                    os.environ.get("W2F_ADMIN_USER", "admin"), *passwords,
                    os.environ.get("W2F_DATABASE_HOST", "db"),

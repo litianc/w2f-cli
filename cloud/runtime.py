@@ -102,6 +102,9 @@ def initialize(state: Path, environment: str, project: str, public_ip: str,
         raise ValueError("Refusing to reuse another environment's state")
     env_file = state / "compose.env"
     if marker.exists() and env_file.exists():
+        delivery_secret = state / "secrets/feishu_apps.json"
+        if not delivery_secret.exists():
+            write_private(delivery_secret, b"{}\n", 0o444)
         return env_file
     if not marker.exists():
         if any(state.iterdir()):
@@ -114,6 +117,8 @@ def initialize(state: Path, environment: str, project: str, public_ip: str,
         if not path.exists():
             # Container users can read individual secret mounts; the host parent is private.
             write_private(path, (secrets.token_urlsafe(36) + "\n").encode(), 0o444)
+    if not (secret_dir / "feishu_apps.json").exists():
+        write_private(secret_dir / "feishu_apps.json", b"{}\n", 0o444)
     certificate_files(state, public_ip)
     values = {
         "W2F_PROJECT": project, "W2F_STATE": str(state), "W2F_ENVIRONMENT": environment,

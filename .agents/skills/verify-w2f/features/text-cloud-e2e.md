@@ -1,6 +1,6 @@
 # Text cloud intake (M1)
 
-Run this path for changes to client upload/receipts, device authorization, cloud text storage or the shared protocol. It covers M1 of the text-loop plan. Cloud sending and real Feishu reception require later milestones.
+Run this path for changes to client upload/receipts, device authorization, cloud text storage or the shared protocol. It covers M1 of the text-loop plan. Cloud sending has its separate M2 recipe; real Feishu reception requires M3.
 
 ## Run
 
@@ -22,7 +22,7 @@ The command launches an owned `control.py` stack, drives the checks and cleans i
 - An injected clock at the public uploader boundary proves duplicate acknowledgment does not extend retention, confirmed copies remain before seven days and become eligible at seven days, and pending rows survive pruning.
 - Changing cloud restore generation through the operator command quarantines local copies and blocks automatic collection/upload/pruning pending reconciliation. Disable/query operations cover users, devices and bindings.
 
-`ingest.json` keeps synthetic inputs, message/job snapshots, queries, rejected requests and retention results. Credentials stay in private runtime files and are removed at teardown. `run.json` records dirty state, source fingerprints and image identity, so an uncommitted build is identifiable. Reports intentionally call delivery `pending`; there is no sender in M1.
+`ingest.json` keeps synthetic inputs, message/job snapshots, queries, rejected requests and retention results. Credentials stay in private runtime files and are removed at teardown. `run.json` records dirty state, source fingerprints and image identity, so an uncommitted build is identifiable. Reports intentionally call delivery `pending`; the sender stays idle because these bindings are not enabled for delivery.
 
 ## Product operation
 

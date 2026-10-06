@@ -38,7 +38,7 @@ def fingerprint():
     names = ("cloud/app.py", "cloud/__init__.py", "cloud/Dockerfile", "cloud/runtime.py",
              "cloud/constraints.txt", "requirements-cloud.txt", "deploy/v040/compose.yaml",
              "deploy/v040/Caddyfile", ".agents/skills/verify-w2f/scripts/control.py")
-    names = sorted(set(names) | {str(p.relative_to(ROOT)) for folder in ('cloud', 'client', 'w2f_protocol') for p in (ROOT / folder).glob('*.py')} | {'.dockerignore', 'qa/isolation.py', '.agents/skills/verify-w2f/scripts/e2e.py', '.agents/skills/verify-w2f/scripts/message_fixture.py'})
+    names = sorted(set(names) | {str(p.relative_to(ROOT)) for folder in ('cloud', 'client', 'w2f_protocol') for p in (ROOT / folder).glob('*.py')} | {'.dockerignore', 'qa/isolation.py', '.agents/skills/verify-w2f/scripts/e2e.py', '.agents/skills/verify-w2f/scripts/delivery.py', '.agents/skills/verify-w2f/scripts/feishu_fixture.py', '.agents/skills/verify-w2f/scripts/message_fixture.py'})
     return {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in names}
 
 
@@ -72,7 +72,7 @@ def compose(run, data, *args):
         result.check_returncode()
 
 
-def launch():
+def launch(delivery=False):
     output("docker", "info", "--format", "{{.OSType}}")
     BASE.mkdir(parents=True, exist_ok=True)
     token = secrets.token_hex(20)
@@ -89,6 +89,7 @@ def launch():
             "release": output("git", "rev-parse", "HEAD"), "source": fingerprint(),
             "git_dirty": bool(output("git", "status", "--porcelain")),
             "url": f"https://127.0.0.1:{port}", "created_at": datetime.now(timezone.utc).isoformat()}
+    data["delivery_fixture"] = delivery
     save(run / "run.json", data)
     try:
         initialize(runtime / "state", "v040-ci", data["project"], "127.0.0.1",
@@ -96,6 +97,20 @@ def launch():
         config = yaml.safe_load((ROOT / "deploy/v040/compose.yaml").read_text())
         # Same ownership rule as scripts/test_v040_stack.py on native Linux runners.
         config["services"]["gateway"]["user"] = f"{os.getuid()}:{os.getgid()}"
+        if delivery:
+            mock = runtime / "feishu"
+            mock.mkdir(mode=0o700)
+            shutil.copyfile(Path(__file__).with_name('feishu_fixture.py'), mock / 'server.py')
+            save(mock / 'control.json', dict(apps={},modes={}))
+            config['networks']={'default':{'internal':True},'ingress':{}}
+            config['services']['gateway']['networks']=['default','ingress']
+            config['services']['feishu-mock']={
+                'image':data['image'],'command':['python','/fixture/server.py'],
+                'user':f'{os.getuid()}:{os.getgid()}', 'volumes':[str(mock)+':/fixture'],
+                'read_only':True,'tmpfs':['/tmp'],'cap_drop':['ALL'],
+                'mem_limit':'128m','cpus':0.5,'pids_limit':100}
+            config['services']['sender']['environment']['W2F_FEISHU_BASE_URL']='http://feishu-mock:8080'
+        data['expected_services']=sorted(config['services'])
         (runtime / "compose.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
         shutil.copyfile(ROOT / "deploy/v040/Caddyfile", runtime / "Caddyfile")
         data["compose_sha256"] = hashlib.sha256((runtime / "compose.yaml").read_bytes()).hexdigest()
@@ -151,23 +166,25 @@ def doctor(path):
         if hashlib.sha256((run / "runtime" / relative).read_bytes()).hexdigest() != expected:
             raise ValueError("Fixture deployment configuration changed; create a fresh run")
     ids = output("docker", "ps", "-q", "--filter", "label=com.docker.compose.project=" + data["project"]).split()
-    assert len(ids) == 3, "Expected three running containers owned by this run"
+    expected = set(data.get("expected_services", ["app","db","gateway","sender"]))
+    assert len(ids) == len(expected), "Unexpected owned running services"
     items = json.loads(output("docker", "inspect", *ids))
     services = {}
     for item in items:
         service = item["Config"]["Labels"]["com.docker.compose.service"]
         ports = item["HostConfig"].get("PortBindings")
-        if service == "app":
+        if service in {"app", "sender", "feishu-mock"}:
             assert item["Image"] == data["image_id"], "Unexpected app image"
-        if service in {"app", "db"}:
+        if service in {"app", "db", "sender", "feishu-mock"}:
             assert not ports, "App/database ports must stay private"
-            assert item["State"]["Health"]["Status"] == "healthy"
+            if service != "feishu-mock":
+                assert item["State"]["Health"]["Status"] == "healthy"
         if service == "gateway":
             assert ports == {"3040/tcp": [{"HostIp": "127.0.0.1", "HostPort": data["url"].rsplit(":", 1)[1]}]}
         volumes = [m["Name"] for m in item["Mounts"] if m["Type"] == "volume"]
         assert all(name.startswith(data["project"] + "_") for name in volumes)
         services[service] = {"container_id": item["Id"], "ports": ports, "volumes": volumes}
-    assert set(services) == {"app", "db", "gateway"}
+    assert set(services) == expected
     result = request(run, data, "/api/status", "admin")
     assert result["status"] == 200
     assert json.loads(result["body"]) == {"status": "ok", "environment": "v040-ci", "release": data["release"]}

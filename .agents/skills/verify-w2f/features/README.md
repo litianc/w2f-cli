@@ -6,7 +6,7 @@ Read this index before choosing a proof. This map covers the cloud entry, synthe
 
 - Follow `../SKILL.md` from the v0.4.0 checkout with Python 3.12. Docker Compose and the browser are needed for cloud proof, not synthetic messages.
 - `W2F_VERIFY_RUN` is the absolute directory printed by `control.py launch`; `W2F_MESSAGE_RUN` is the separate directory from `messages.py launch`.
-- Require `doctor` to pass before every cloud drive. Each fixture owns its dynamic HTTPS port, fresh passwords/CA, three containers and two persistent volumes.
+- Require `doctor` to pass before every cloud drive. Each fixture owns its dynamic HTTPS port, fresh passwords/CA, four product containers and two persistent volumes.
 - Use the generated fixture only; keep the existing local and public management services running independently.
 - Browser binaries use the dedicated `PLAYWRIGHT_BROWSERS_PATH` from the skill. No WeChat or Feishu credentials are needed.
 
@@ -22,6 +22,8 @@ Read this index before choosing a proof. This map covers the cloud entry, synthe
 Report feature ID, actual commands, source identity, result and retained evidence path. Inspect the screenshot and accessible snapshot for UI proof. Changes affecting several entry points must drive all relevant map entries. One executed feature validates the generated skill, not the entire map. For mutations, pair the browser result with persisted state; for cleanup, check that the fixture disappears and evidence remains.
 
 ## Features
+
+- [Cloud delivery](cloud-delivery.md): actual cloud sender and private Feishu HTTP fixture; ordered persisted parts, retry/unknown outcomes, ownership and recovery.
 
 - [Text cloud intake](text-cloud-e2e.md): actual client, verified HTTPS and Postgres; lost acknowledgments, restart, tenant authorization, ordered atomic writes and seven-day retention. No Feishu sending.
 - [Cloud login](cloud-login.md): anonymous challenge, wrong password, correct credentials at both protected routes.

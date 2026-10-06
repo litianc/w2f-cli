@@ -1,4 +1,4 @@
-"""Transactional text archive. Delivery jobs are durable but not executed in M1."""
+"""Transactional text archive. Delivery jobs are consumed by the independent sender."""
 from contextlib import contextmanager
 import hashlib
 import secrets
@@ -70,6 +70,16 @@ class Store:
                 db.execute(DDL)
                 db.execute('INSERT INTO w2f_generation(id) VALUES(%s)', (uuid.uuid4(),))
                 db.execute('INSERT INTO w2f_schema(version) VALUES(%s)', (SCHEMA_VERSION,))
+            # Keep the core v1 marker compatible with the M1 API on image rollback.
+            # Delivery evolves in its own additive, transactional schema namespace.
+            delivery = db.execute("SELECT to_regclass('public.w2f_delivery_schema') AS name").fetchone()['name']
+            if not delivery:
+                from cloud.delivery import MIGRATION_2
+                db.execute(MIGRATION_2)
+                db.execute('CREATE TABLE w2f_delivery_schema(version integer PRIMARY KEY)')
+                db.execute('INSERT INTO w2f_delivery_schema VALUES(2)')
+            elif db.execute('SELECT version FROM w2f_delivery_schema').fetchall() != [{'version':2}]:
+                raise StoreError('delivery_schema_version',503)
 
     def provision(self, spec):
         if not isinstance(spec, dict) or set(spec) != {'user_id', 'device_id', 'source_account', 'bindings'}:

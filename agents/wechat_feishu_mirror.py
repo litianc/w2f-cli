@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image
+from w2f_protocol.text import split_text, attributed_text
 
 if sys.platform == 'win32':
     import msvcrt
@@ -1014,16 +1015,6 @@ def resolve_name(store, config, sender_id, nickname, unique_key):
     return nickname or '未知发言人', None
 
 
-def split_text(text, byte_limit=12000):
-    parts, current, length = [], [], 0
-    for char in text:
-        size = len(char.encode('utf-8'))
-        if length + size > byte_limit:
-            parts.append(''.join(current)); current = []; length = 0
-        current.append(char); length += size
-    if current:
-        parts.append(''.join(current))
-    return parts or ['']
 
 
 def forward_record_texts(row, config, store):
@@ -1185,7 +1176,7 @@ def send_row(config: dict[str, Any], row: dict[str, Any], state: dict[str, Any],
                     from integrations.forward_layout import split_forward_records
                     parts, record_parts = split_forward_records(records, name, with_record_parts=True)
                 else:
-                    parts = [f'{name}：{part}' for part in split_text(body)]
+                    parts = attributed_text(name, body)
                 plan={'target':target,'parts':parts,'placeholder':is_forward_row(row) and body=='[转发聊天记录内容暂不可用]'}
                 if records:
                     from agents.forward_media import video_plan, image_plan

@@ -117,11 +117,13 @@ class ReleaseManager:
                 time.sleep(1)
         if result.get("status") != "ok" or result.get("release") != revision:
             raise RuntimeError("Deployed release identity/readiness does not match")
-        if image_id:
-            container = self.compose("ps", "-q", "app").stdout.decode().strip()
-            actual = self.run(["docker", "inspect", "--format", "{{.Image}}", container]).stdout.decode().strip()
-            if actual != image_id:
-                raise RuntimeError("Running container does not match the verified image ID")
+        for service in ('app','sender'):
+            container = self.compose("ps", "-q", service).stdout.decode().strip()
+            metadata = json.loads(self.run(["docker", "inspect", container]).stdout)[0]
+            if ((image_id and metadata['Image'] != image_id)
+                    or metadata['State']['Health']['Status'] != 'healthy'
+                    or metadata['Config']['Labels'].get('org.opencontainers.image.revision') != revision):
+                raise RuntimeError("Running role does not match the verified image/readiness")
 
     def describe_image(self, image: str):
         metadata = json.loads(self.run(["docker", "image", "inspect", image]).stdout)[0]
@@ -144,6 +146,8 @@ class ReleaseManager:
             stream.write(dump)
 
     def up(self):
+        # Drain the old role before replacing any image or database container.
+        self.compose("stop", "sender")
         self.compose("up", "-d", "--wait", "--wait-timeout", str(self.wait_seconds))
 
     def activate(self, image: str):
@@ -168,7 +172,7 @@ class ReleaseManager:
                 self.verify(previous["revision"], previous["id"])
             else:
                 # Keep volumes and database for diagnosis; a failed first release is never live.
-                self.compose("stop", "gateway", "app")
+                self.compose("stop", "gateway", "app", "sender")
             raise RuntimeError("Release failed; restored the last healthy release when available") from None
 
     def deploy(self, revision: str, source):

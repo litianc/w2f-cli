@@ -1,18 +1,19 @@
 ---
 name: verify-w2f
-description: Verify W2F cloud management, HTTPS authentication, and runtime isolation, or inject synthetic WeChat text at the reader boundary to test downstream Worker processing, persistence, and replay. Verify client HTTPS uploads and durable cloud receipts with a disposable Postgres stack. Use after cloud/client changes or when message tests need a controllable source.
+description: Verify W2F cloud management, HTTPS authentication, and runtime isolation, or inject synthetic WeChat text at the reader boundary to test downstream Worker processing, persistence, and replay. Verify actual client uploads and ordered cloud sending with a disposable Postgres stack and private Feishu HTTP fixture. Use after cloud/client changes or when message tests need a controllable source.
 ---
 
 # Verify W2F
 
 Run from the **v0.4.0 development checkout**, never main. Read [features/README.md](features/README.md), then choose the relevant path:
 
+- Cloud sending, persisted parts and failure recovery: follow [Cloud delivery](features/cloud-delivery.md), with a private simulated Feishu endpoint.
 - Client upload, tenant isolation, cloud archive and receipt recovery: follow [Text cloud intake](features/text-cloud-e2e.md). This runs the actual client and Postgres with a synthetic reader; it does not send Feishu messages.
 - Cloud management at `/` and `/api/status`: follow the container/browser recipe below.
 - Mock a WeChat message, test collection processing or replay: follow [Synthetic source messages](features/synthetic-messages.md). Its `messages.py collect` drives the new client's local queue; `drive` exercises the legacy Worker with a synthetic Feishu CLI. Both need no Docker, browser or real account.
 - Legacy `agents.manage` UI controls: use the separate browser harness in the feature map.
 
-The cloud exposes deployment status, administrator Basic authentication, device-authenticated text intake and message queries. Restricted operator commands provision and disable users/devices/bindings. The client persists receipts and retains confirmed copies for seven days. Full management UI and cloud Feishu delivery are pending; the legacy Worker proof remains a separate path.
+The cloud exposes deployment status, administrator Basic authentication, device-authenticated text intake and message queries. Restricted operator commands provision and disable users/devices/bindings. The client persists receipts and retains confirmed copies for seven days. The independent cloud sender supports text delivery; its default verification uses a simulated Feishu HTTP service. Full management UI and real Feishu reception remain separate milestones.
 
 ## Launch
 
@@ -44,7 +45,7 @@ test -s "$W2F_VERIFY_RUN/evidence/cleanup.json"
 printf 'Retained evidence: %s/evidence\n' "$W2F_VERIFY_RUN"
 ```
 
-`launch` prints only its absolute run directory. It uses `cloud.runtime.initialize`, the real Dockerfile, and the repository Compose stack with a fixture-owner gateway user, as in `scripts/test_v040_stack.py`. It builds the current source for the host platform, labels a unique image, binds a dynamically allocated loopback port, and creates a unique `w2f-v040-verify-*` project with fresh credentials, CA, Postgres and media volumes. Readiness means three owned running containers, healthy app/database, the expected image ID, and a strictly verified authenticated HTTPS response identifying the build. No seed business data is needed.
+`launch` prints only its absolute run directory. It uses `cloud.runtime.initialize`, the real Dockerfile, and the repository Compose stack with a fixture-owner gateway user, as in `scripts/test_v040_stack.py`. It builds the current source for the host platform, labels a unique image, binds a dynamically allocated loopback port, and creates a unique `w2f-v040-verify-*` project with fresh credentials, CA, Postgres and media volumes. Readiness means four owned running product containers, healthy app/database/sender, the expected image ID, and a strictly verified authenticated HTTPS response identifying the build. No seed business data is needed.
 
 Two runs can coexist; each has its own port, image, state, browser context and volumes. A port-allocation race must fail the run; clean up and launch afresh. Never substitute the existing local port 13040, the public server, or a main data directory for a failed fixture.
 

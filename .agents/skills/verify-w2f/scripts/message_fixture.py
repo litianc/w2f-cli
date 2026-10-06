@@ -39,9 +39,9 @@ def initialize(path):
         ''')
 
 
-def inject(path, text):
-    if not text.strip() or len(text.encode('utf-8')) > 4096:
-        raise ValueError('Use nonempty plain text of at most 4096 UTF-8 bytes')
+def inject(path, text, max_bytes=4096):
+    if not text.strip() or len(text.encode('utf-8')) > max_bytes:
+        raise ValueError(f'Use nonempty plain text of at most {max_bytes} UTF-8 bytes')
     with connect(path) as db:
         db.execute('BEGIN IMMEDIATE')
         local_id = db.execute('SELECT COALESCE(MAX(local_id),0)+1 FROM source').fetchone()[0]

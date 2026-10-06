@@ -8,6 +8,7 @@ import sys
 import psycopg
 from cloud.app import Settings
 from cloud.store import Store, StoreError
+from cloud.delivery import Delivery
 from w2f_protocol.ingest import ProtocolError
 
 
@@ -23,14 +24,24 @@ def main():
         p = sub.add_parser(name)
         p.add_argument('--kind', choices=['user','device','binding'] + (['message'] if name == 'show' else []), required=True)
         p.add_argument('--id', required=True)
+    for name in ('delivery-target','delivery-pause','delivery-resume','delivery-status'):
+        p=sub.add_parser(name)
+        p.add_argument('--binding',required=True)
+        if name=='delivery-target':
+            p.add_argument('--app-id',required=True)
+            p.add_argument('--chat-id',required=True)
     args = parser.parse_args()
     try:
         store = Store(Settings.from_env())
         if args.command == 'migrate':
             store.migrate()
-            result = dict(schema_version=1)
+            result = dict(schema_version=1,delivery_schema_version=2)
         elif args.command == 'new-generation':
             result = store.new_generation()
+        elif args.command.startswith('delivery-'):
+            delivery=Delivery(store)
+            result=(delivery.configure(args.binding,args.app_id,args.chat_id) if args.command=='delivery-target'
+                    else getattr(delivery,args.command.split('-')[1])(args.binding))
         elif args.command == 'provision':
             spec = json.loads(sys.stdin.read() if args.spec_file == '-' else Path(args.spec_file).read_text(encoding='utf-8'))
             path = Path(args.credentials_file)

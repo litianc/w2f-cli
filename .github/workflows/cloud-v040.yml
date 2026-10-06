@@ -4,7 +4,7 @@ on:
   push:
     branches: [codex/v0.4.0]
   pull_request:
-    paths: ["cloud/**", "client/**", "w2f_protocol/**", "tests/test_client*.py", ".agents/skills/verify-w2f/**", "deploy/v040/**", "scripts/test_v040_stack.py", "requirements-cloud.txt", ".dockerignore", ".github/workflows/cloud-v040.yml"]
+    paths: ["cloud/**", "client/**", "w2f_protocol/**", "tests/test_client*.py", "agents/wechat_feishu_mirror.py", "tests/test_mirror.py", ".agents/skills/verify-w2f/**", "deploy/v040/**", "scripts/test_v040_stack.py", "requirements-cloud.txt", ".dockerignore", ".github/workflows/cloud-v040.yml"]
   workflow_dispatch:
 
 permissions:
@@ -24,6 +24,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          fetch-depth: 0  # Pinned M1 source is exercised against the migrated database.
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -39,6 +40,8 @@ jobs:
         run: python -m unittest discover -s cloud/tests -v
       - name: Client HTTPS intake, durable receipts and recovery
         run: python .agents/skills/verify-w2f/scripts/e2e.py
+      - name: Ordered cloud delivery and Feishu fault recovery
+        run: python .agents/skills/verify-w2f/scripts/delivery.py
       - name: TLS, authentication, persistent volumes and rollback
         env:
           RELEASE: ${{ github.sha }}
