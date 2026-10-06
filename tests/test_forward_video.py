@@ -13,7 +13,20 @@ from agents import wechat_feishu_mirror as mirror
 from agents.storage import MirrorStore
 from integrations.forward_records import parse_record
 from tests.test_forward_links import forward_xml
+def _symlink_privilege():
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'probe-target'; target.write_bytes(b'x')
+            link = Path(directory) / 'probe-link'
+            link.symlink_to(target)
+            return True
+    except (OSError, NotImplementedError):
+        return False
+
+
+SYMLINK_OK = _symlink_privilege()
 from tests.test_recovery import History, Sink
+from contextlib import closing
 
 VIDEO = b'\x00\x00\x00\x18ftypmp42fixture-video'
 DIGEST = hashlib.md5(VIDEO).hexdigest()
@@ -201,6 +214,7 @@ class ForwardVideoTest(unittest.TestCase):
         mirror.retry_media_jobs(self.config,self.store)
         self.assertEqual(self.jobs()[0]['state'],'uploaded')
 
+    @unittest.skipIf(not SYMLINK_OK, 'Windows 需管理员/开发者模式才能创建符号链接')
     def test_cover_symlink_never_uploaded(self):
         from agents.forward_media import stage_video,video_plan
         records=mirror.forward_record_texts(row(),self.config,self.store)
@@ -229,11 +243,12 @@ class ForwardVideoTest(unittest.TestCase):
         self.assertEqual(self.store.get_cursor(),11)
 
 class ForwardReaderTest(unittest.TestCase):
+    @unittest.skipIf(not SYMLINK_OK, 'Windows 需管理员/开发者模式才能创建符号链接')
     def test_reader_checks_outer_identity_and_hashes_exact_child_resource(self):
         from integrations.reader_forward import read_forward
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);source=root/'messages.db';video=root/'video.mp4';video.write_bytes(VIDEO)
-            with sqlite3.connect(source) as db:
+            with closing(sqlite3.connect(source, isolation_level=None)) as db:
                 db.execute('CREATE TABLE Msg_room(local_id,server_id,create_time,text)')
                 db.execute('INSERT INTO Msg_room VALUES(11,911,1011,?)',(row()['text'],))
             def connect(path):

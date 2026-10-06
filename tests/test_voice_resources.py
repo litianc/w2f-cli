@@ -10,13 +10,14 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from integrations.reader_voice import read_voice
 from agents import wechat_feishu_mirror as mirror
+from contextlib import closing
 
 
 class VoiceResourcesTest(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name);self.path=self.root/'media_1.db'
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path, isolation_level=None)) as db:
             db.execute('CREATE TABLE Name2Id(user_name TEXT)')
             db.executemany('INSERT INTO Name2Id VALUES(?)',[('room',),('other-room',)])
             db.execute('CREATE TABLE VoiceInfo(chat_name_id INTEGER,local_id INTEGER,svr_id INTEGER,create_time INTEGER,voice_data BLOB)')
@@ -28,7 +29,7 @@ class VoiceResourcesTest(unittest.TestCase):
         self.args=argparse.Namespace(talker='room',local_id=26,server_id=99,create_time=1234)
         self.voice=b'\x02#!SILK_V3\x01\x00\x00'
     def insert(self,room=1,local=26,server=0,created=1234,voice=None):
-        with sqlite3.connect(self.path) as db:db.execute('INSERT INTO VoiceInfo VALUES(?,?,?,?,?)',(room,local,server,created,voice or self.voice))
+        with closing(sqlite3.connect(self.path, isolation_level=None)) as db:db.execute('INSERT INTO VoiceInfo VALUES(?,?,?,?,?)',(room,local,server,created,voice or self.voice))
         db.close()
     def test_outgoing_zero_server_exact_group_local_time(self):
         self.insert();self.insert(room=2,voice=self.voice+b'other')
@@ -38,7 +39,7 @@ class VoiceResourcesTest(unittest.TestCase):
     def test_received_uses_server_and_never_guesses_conflicting_server(self):
         self.insert(local=99,server=99,created=1)
         self.assertEqual(read_voice(self.reader,self.db,self.args)['local_id'],26)
-        with sqlite3.connect(self.path) as db:db.execute('DELETE FROM VoiceInfo')
+        with closing(sqlite3.connect(self.path, isolation_level=None)) as db:db.execute('DELETE FROM VoiceInfo')
         db.close();self.insert(server=88)
         with self.assertRaisesRegex(RuntimeError,'voice_resource_missing'):read_voice(self.reader,self.db,self.args)
     def test_missing_timestamp_group_and_duplicate_blobs_do_not_mix(self):

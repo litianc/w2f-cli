@@ -7,6 +7,8 @@ shapes that agents/wechat_feishu_mirror.py and agents/manage.py expect:
 
 - sync-page   -> {"ok":true,"data":{"contract":"ordered_sync_v1",...}}
 - resolve-chat -> {"ok":true,"data":{"candidates":[...]}}
+- contacts    -> {"ok":true,"data":{"contacts":[...]}} (groups or friends, manage.py wizard/people)
+- members     -> {"ok":true,"data":{"chatroom_id":...,"members":[...]}}
 - media       -> {"ok":true,"data":{"resources":[...]}} (empty until ticket 05)
 
 Configuration via environment: WDA_BASE (default http://localhost:10392).
@@ -14,14 +16,17 @@ Configuration via environment: WDA_BASE (default http://localhost:10392).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 WDA_BASE = os.environ.get("WDA_BASE", "http://localhost:10392").rstrip("/")
 UA = {"User-Agent": "w2f-wda-reader/0.1"}
@@ -78,6 +83,26 @@ def fetch_window(talker: str, want: int) -> list[dict]:
     return collected
 
 
+ALL_MENTION_IDS = {"announceall", "notification@all", "notify@all", "@all"}
+
+
+def _annotate_mentions(content: str, message: dict, names: dict[str, str]) -> str:
+    """Keep @ hints visible when the raw text dropped them (P1 text form).
+
+    Windows WeChat text usually carries "@昵称" inline already; in that case
+    this is a no-op. Real @-Feishu-user mentions need the identity mapping
+    and are deferred to the SaaS stage per the product spec.
+    """
+    ats = [str(u) for u in (message.get("atUsernames") or []) if u]
+    if not ats:
+        return content
+    display = ["全体成员" if u in ALL_MENTION_IDS else (names.get(u) or u) for u in ats]
+    if any(f"@{name}" in content for name in display):
+        return content
+    prefix = " ".join(f"@{name}" for name in display)
+    return f"{prefix} {content}" if content else prefix
+
+
 def map_row(talker: str, message: dict, names: dict[str, str]) -> dict:
     """One WDA message -> one w2f payload row (see ticket 02 mapping table)."""
     wda_type = int(message.get("type") or 0)
@@ -95,11 +120,22 @@ def map_row(talker: str, message: dict, names: dict[str, str]) -> dict:
     }
 
     if base == 1:
-        kind, text = "text", content
+        kind, text = "text", _annotate_mentions(content, message, names)
     elif base == 3:
         kind, text = "image", content          # XML with cdnurl -> w2f media_url
     elif base == 34:
         kind, text = "voice", content
+        # 行内转写（微信自带）作为契约可选字段透传；交付决策在 worker。
+        transcript = str(message.get("voiceTranscript") or "").strip()
+        if transcript:
+            row["voice_transcript"] = transcript
+    elif base == 47:
+        kind, text = "emoji", content
+        # WDA 把表情 content 渲染成 "[表情]"，只留结构化摘要；透传给
+        # 镜像端做资源校验（sticker_metadata 的无 XML 兜底）。
+        digest = str(message.get("emojiMd5") or "").strip().lower()
+        if re.fullmatch(r"[0-9a-f]{32}", digest):
+            row["emoji_md5"] = digest
     elif base == 43 or wda_type == 62:
         kind, text = "video", content
     elif base == 47:
@@ -134,19 +170,43 @@ def map_row(talker: str, message: dict, names: dict[str, str]) -> dict:
         if transcript:
             row["voice_transcript"] = transcript
     if kind == "forward_chat":
-        row["forward_items"] = _forward_items(content)
+        row["forward_items"] = _forward_items(text)
     return row
+
+
+def _channel_feed_xml(message: dict) -> str:
+    """Rebuild the finderFeed XML macOS rows carry, from WDA structured fields.
+
+    Deliberately omits the signed stodownload/CDN URLs: 镜像端契约禁止签名 CDN
+    URL 进入渲染与转发（_channel_share_url 会拒绝），分享页由 objectId/
+    objectNonceId 编码重建。
+    """
+    object_id = str(message.get("objectId") or "").strip()
+    nonce = str(message.get("objectNonceId") or "").strip()
+    if not object_id or not nonce:
+        return ""
+    title = xml_escape(str(message.get("title") or "").strip())
+    creator = xml_escape(str(message.get("from") or "").strip())
+    return (f'<appmsg><title>{title}</title><finderFeed>'
+            f'<objectId>{xml_escape(object_id)}</objectId>'
+            f'<objectNonceId>{xml_escape(nonce)}</objectNonceId>'
+            f'<nickname>{creator}</nickname></finderFeed></appmsg>')
 
 
 def _map_app_message(sub: int, message: dict, content: str) -> tuple[str, str]:
     if sub == 57:
         return "text", content                 # keep refermsg XML for quote_info
     if sub == 19:
+        # WDA renders content as a plain outline; the parseable recordinfo XML
+        # lives in the structured recordItem field (macOS rows carry it as text).
+        record = str(message.get("recordItem") or "").strip()
+        if "<recorditem" in record or "<datalist" in record:
+            return "forward_chat", record
         return "forward_chat", content
     if sub in (6, 74):
         return "file", content
     if sub == 51:
-        return "channel_video", content
+        return "channel_video", _channel_feed_xml(message) or content
     if sub in (5, 4, 68, 3, 63, 33, 36):       # links, articles, mini programs
         title = str(message.get("title") or "").strip()
         url = str(message.get("url") or "").strip()
@@ -167,10 +227,18 @@ def _forward_items(content: str) -> list:
     if "<recorditem" not in content and "<datalist" not in content:
         return []
     try:
-        from forward_records import parse_record
-        return parse_record(content)
-    except Exception:
+        try:
+            from integrations.forward_records import parse_record
+        except ImportError:
+            from forward_records import parse_record
+        items = parse_record(content)
+    except Exception as exc:
+        print(f"[wda_reader] 转发记录解析异常：{exc}", file=sys.stderr)
         return []
+    if not items:
+        # parse_record 对坏 XML 静默返回 []；这里至少留痕，避免无日志可查。
+        print("[wda_reader] 转发记录 XML 存在但未解析出任何记录", file=sys.stderr)
+    return items
 
 
 def cmd_sync_page(args: argparse.Namespace) -> dict:
@@ -328,6 +396,7 @@ def cmd_media(args: argparse.Namespace) -> dict:
     root = Path(os.environ.get("W2F_WDA_CACHE", str(Path.home() / ".local/share/w2f-cli/wda-cache")))
     root.mkdir(parents=True, exist_ok=True)
     for path, params, cache_key, thumbnail_only in attempts:
+        is_emoji = path == "/api/chat/media/emoji" and bool(re.fullmatch(r"[0-9a-f]{32}", cache_key))
         if thumbnail_only:
             # An earlier run may already have staged the original; serve it.
             # Match the .orig suffix exactly — a bare prefix would also hit
@@ -337,19 +406,75 @@ def cmd_media(args: argparse.Namespace) -> dict:
                 return _media_result(original, False)
         cached = _cached_file(root, cache_key)
         if cached:
-            return _media_result(cached, thumbnail_only)
+            if is_emoji and hashlib.md5(cached.read_bytes()).hexdigest() != cache_key:
+                cached.unlink(missing_ok=True)   # poison from an earlier undecrypted fetch
+            else:
+                return _media_result(cached, thumbnail_only)
         fetched = fetch_media(path, **params)
         if not fetched or not fetched[0]:
             continue
         payload, content_type = fetched
+        if is_emoji and hashlib.md5(payload).hexdigest() != cache_key:
+            # WDA 有时把未解密的 CDN 原始字节原样吐回（无 aeskey 可解）。
+            # 摘要不匹配的字节既不能上传也不能进缓存，否则坏文件会被永久复用。
+            continue
         target = root / f"{cache_key}{CONTENT_TYPES.get(content_type, '.bin')}"
         target.write_bytes(payload)
         return _media_result(target, thumbnail_only)
+
+    if base == 47 and re.fullmatch(r"[0-9a-f]{32}", str(message.get("emojiMd5") or "")) and os.name == "nt":
+        # 本地微信库直读层（issue #35）：跨会话找带 cdnurl 的副本，按 XML
+        # 声明的 md5/len 严格校验后落缓存。失败则维持既有占位路径。
+        try:
+            try:
+                from win_store import emoji_download
+            except ImportError:
+                from .win_store import emoji_download
+            data = emoji_download(None, str(message["emojiMd5"]).lower())
+        except Exception:
+            return {"ok": True, "data": {"resources": []}}
+        suffix = ".gif" if data[:3] == b"GIF" else ".png" if data[:4] == b"\x89PNG" else ".bin"
+        target = root / f"{message['emojiMd5']}{suffix}"
+        target.write_bytes(data)
+        return _media_result(target, False)
     return {"ok": True, "data": {"resources": []}}
+
+
+def cmd_contacts(args: argparse.Namespace) -> dict:
+    """Group or friend list for the admin wizard/people pages.
+
+    manage.py calls `contacts --groups-only|--friends-only --limit N` and reads
+    `data.contacts[].{username,display_name,remark,nick_name,alias}`. WDA serves
+    the real address book at /api/chat/contacts with include_* toggles; officials
+    are excluded in both modes so公众号 never shows up as a mirrorable party.
+    """
+    payload = api_get("/api/chat/contacts",
+                      include_groups="true" if args.groups_only else "false",
+                      include_friends="true" if args.friends_only else "false",
+                      include_officials="false")
+    rows = payload.get("contacts") or []
+    want_group = bool(args.groups_only)
+    mapped = [map_contact(row) for row in rows
+              if (str(row.get("type") or "") == "group") == want_group]
+    limit = max(0, int(args.limit))
+    return {"ok": True, "data": {"contacts": mapped[:limit]}}
+
+
+def map_contact(row: dict) -> dict:
+    """One WDA contact -> the manage.py contract row."""
+    username = str(row.get("username") or "")
+    display = next((str(row.get(key) or "").strip()
+                    for key in ("displayName", "remark", "nickname", "alias")
+                    if str(row.get(key) or "").strip()), username)
+    return {"username": username, "display_name": display,
+            "remark": str(row.get("remark") or ""), "nick_name": str(row.get("nickname") or ""),
+            "alias": str(row.get("alias") or "")}
 
 
 def cmd_members(args):
     """Fail closed unless WDA explicitly proves a complete same-group list."""
+    if getattr(args, "chatroom_id", None):
+        args.talker = args.chatroom_id
     payload=api_get('/api/chat/contacts/group_members',username=args.talker,limit=args.limit,offset=args.offset)
     members=payload.get('members')
     total=payload.get('total',payload.get('totalCount'))
@@ -363,10 +488,7 @@ def cmd_members(args):
     return {'ok':True,'data':{'chatroom_id':args.talker,'members':members,'total':total}}
 
 
-def main() -> int:
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")   # Windows 默认 GBK 会损坏中文
-        sys.stderr.reconfigure(encoding="utf-8")
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wda_reader", description="WDA -> w2f 读取器适配层")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -385,8 +507,17 @@ def main() -> int:
     resolve.add_argument("--limit", type=int, default=30)
     resolve.set_defaults(handler=cmd_resolve_chat)
 
+    contacts = sub.add_parser("contacts", help="群/好友通讯录（供管理台向导与人员页）")
+    mode = contacts.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--groups-only", action="store_true")
+    mode.add_argument("--friends-only", action="store_true")
+    contacts.add_argument("--limit", type=int, default=30)
+    contacts.set_defaults(handler=cmd_contacts)
+
     members = sub.add_parser('members',help='Complete membership snapshot or explicit unavailability')
-    members.add_argument('talker')
+    members.add_argument('talker', nargs='?', default='')
+    members.add_argument('--chatroom-id', dest='chatroom_id', default=None,
+                         help='reader.sh 风格旗标形式；与位置参数等价')
     members.add_argument('--limit',type=int,default=10000)
     members.add_argument('--offset',type=int,default=0)
     members.set_defaults(handler=cmd_members)
@@ -397,6 +528,14 @@ def main() -> int:
     media.add_argument("--server-id")
     media.add_argument("--include-local-paths", default="true")
     media.set_defaults(handler=cmd_media)
+    return parser
+
+
+def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")   # Windows 默认 GBK 会损坏中文
+        sys.stderr.reconfigure(encoding="utf-8")
+    parser = build_parser()
 
     args = parser.parse_args()
     try:

@@ -767,7 +767,7 @@ class MirrorStore:
 
     def upsert_message(self, key: str, row: dict[str, Any], kind: str, state: str = "received", *, binding_id: int = 1, source_account: str = "default", payload: dict[str, Any] | None = None, quoted_message_key: str | None = None) -> int:
         ts = now()
-        safe_payload = payload or {k: row.get(k) for k in ("talker", "local_id", "server_id", "sender_wxid", "sender", "kind_name", "text", "content", "time", "create_time", "local_type", "forward_items", "voice_transcript", "article") if k in row}
+        safe_payload = payload or {k: row.get(k) for k in ("talker", "local_id", "server_id", "sender_wxid", "sender", "kind_name", "text", "content", "time", "create_time", "local_type", "forward_items", "voice_transcript", "emoji_md5", "article") if k in row}
         with self.connect() as db:
             db.execute("INSERT INTO messages(binding_id,source_account,wechat_message_key,local_id,server_id,sender_wxid,sender_name,kind,payload_json,quoted_message_key,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(binding_id,wechat_message_key) DO UPDATE SET updated_at=excluded.updated_at", (binding_id, source_account, key, row.get("local_id"), str(row.get("server_id") or ""), row.get("sender_wxid"), row.get("sender"), kind, json.dumps(safe_payload, ensure_ascii=False, default=str), quoted_message_key, state, ts, ts))
             found = db.execute("SELECT id FROM messages WHERE binding_id=? AND wechat_message_key=?", (binding_id, key)).fetchone()
@@ -809,6 +809,55 @@ class MirrorStore:
     def actions(self,person_id=None):
         with self.connect() as db: rows=[dict(r) for r in db.execute("SELECT * FROM management_actions ORDER BY id DESC LIMIT 200")]
         return [r for r in rows if not person_id or json.loads(r.get('details_json') or '{}').get('person_id')==person_id or str(person_id)==str((json.loads(r.get('details_json') or '{}').get('after') or {}).get('person_id'))]
+
+    def metric_rows(self, since, binding_id=None):
+        """阶段2 验收指标的原始输入；窗口按各表的 created_at 过滤。
+
+        时延取消息最后一次成功发送部分的 attempted_at——upsert 重放会刷新
+        messages.updated_at，用它会在补扫后虚高；deliveries 回执不受重放影响。
+        """
+        scope = " AND m.binding_id=?" if binding_id else ""
+        params = (since, binding_id) if binding_id else (since,)
+        latency_sql = (
+            "SELECT m.binding_id,m.kind,{source},MAX(d.attempted_at) FROM messages m"
+            " JOIN deliveries d ON d.message_id=m.id AND d.state='sent'"
+            " WHERE m.created_at>=? AND m.state IN ('sent','placeholder') AND m.local_id IS NOT NULL" + scope + " GROUP BY m.id")
+        with self.connect() as db:
+            try:
+                latency = db.execute(latency_sql.format(source="json_extract(m.payload_json,'$.create_time')"), params).fetchall()
+            except Exception:
+                latency = db.execute(latency_sql.format(source="m.payload_json"), params).fetchall()
+            media = db.execute(
+                "SELECT m.binding_id,j.state,COUNT(*) FROM media_jobs j JOIN messages m ON m.id=j.message_id"
+                " WHERE j.created_at>=?" + scope + " GROUP BY m.binding_id,j.state", params).fetchall()
+            stuck = db.execute(
+                "SELECT m.binding_id,m.state,COUNT(*) FROM messages m"
+                " WHERE m.created_at>=? AND m.state IN ('received','processing','failed')" + scope + " GROUP BY m.binding_id,m.state", params).fetchall()
+            actions = db.execute(
+                "SELECT action,actor,binding_id,COUNT(*) FROM management_actions"
+                " WHERE created_at>=? AND action IN ('watchdog.restart','watchdog.give_up','bindings.start')" + (" AND binding_id=?" if binding_id else "") + " GROUP BY action,actor,binding_id",
+                (since, binding_id) if binding_id else (since,)).fetchall()
+            cursor = dict(db.execute(
+                "SELECT binding_id,cursor FROM runtime_state" + (" WHERE binding_id=?" if binding_id else ""), (binding_id,) if binding_id else ()).fetchall())
+            max_local = dict(db.execute(
+                "SELECT binding_id,MAX(local_id) FROM messages WHERE local_id IS NOT NULL" + (" AND binding_id=?" if binding_id else "") + " GROUP BY binding_id", (binding_id,) if binding_id else ()).fetchall())
+        bindings: dict[int, dict] = {}
+        def slot(bid):
+            return bindings.setdefault(int(bid), {"latency": [], "excluded": 0, "media_states": {}, "stuck_states": {}, "actions": [], "max_local_id": None})
+        for bid, kind, source, delivered_at in latency:
+            if isinstance(source, str):
+                try: source = float(json.loads(source or "null").get("create_time") or 0) if source.strip().startswith("{") else 0.0
+                except (ValueError, AttributeError): source = 0.0
+            target = slot(bid)
+            lag = float(delivered_at or 0) - float(source or 0)
+            if source and source > 0 and lag >= 0: target["latency"].append((str(kind), lag))
+            else: target["excluded"] += 1
+        for bid, state, count in media: slot(bid)["media_states"][state] = int(count)
+        for bid, state, count in stuck: slot(bid)["stuck_states"][state] = int(count)
+        for action, actor, bid, count in actions:
+            if bid is not None: slot(bid)["actions"].extend([(action, actor)] * int(count))
+        for bid, value in max_local.items(): slot(bid)["max_local_id"] = int(value)
+        return {"bindings": bindings, "cursor": cursor}
 
     def uncertain_deliveries(self):
         with self.connect() as db:
