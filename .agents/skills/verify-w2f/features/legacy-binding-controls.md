@@ -20,7 +20,7 @@ The existing single-machine management UI lets an operator confirm or cancel gro
 Preconditions: install `requirements-qa.txt` into `.venv-cloud`, use the dedicated browser cache from the parent skill, and choose a fresh report output directory. This harness creates its own temporary HTTP server and SQLite; no cloud fixture is needed.
 
 - **Drive the existing regression.** Run `.venv-cloud/bin/python -m qa.run --check browser.binding_maintenance --timeout 600 --output "$PWD/.qa-results/verify-w2f/legacy-binding-proof"`.
-- **Verify actions and persistence.** The implementation in `qa/browser_check.py::_binding_maintenance_controls` clicks the actual named buttons, checks `#dialogNote`, uses `#cancel` / `#submit`, waits for real `/api/bindings` POST responses, and independently reads the temporary SQLite settings.
+- **Verify actions and persistence.** The implementation in `qa/browser_check.py::_binding_maintenance_controls` clicks the actual named buttons, checks `#dialogNote`, uses `#cancel` / `#submit`, waits for real `/api/bindings` POST responses, and independently reads temporary SQLite for cancelled name following and confirmed membership enable/stop. Confirmed name-following enable/stop is observed through successful POSTs and refreshed controls; the history check verifies its explanation, not operation rows.
 - **Retain and evaluate evidence.** Require report check ID `browser.binding_maintenance` to be `passed`, inspect its evidence in `report.json` / `report.md`, and run `.venv-cloud/bin/python -m qa.gate .qa-results/verify-w2f/legacy-binding-proof/report.json`. Choose a new output directory for a later proof rather than overwriting evidence. The existing harness captures textual behavioral evidence, not screenshots.
 
 ## Gotchas

@@ -130,6 +130,39 @@ class Live:
             assert json.load(reply)=={'status':'ok'}
         return dict(ready=True,release=self.config['expected_release'])
 
+    def doctor(self):
+        if not self.meta or not self.meta.get('prepared'):
+            raise ValueError('Doctor requires an existing prepared run')
+        # One bounded SSH session avoids a burst of independent handshakes at the
+        # prototype's translated port. All remote operations here are read-only.
+        code = """import json,subprocess,sys
+root,release,binding,app,chat=sys.argv[1:]
+def read(args):
+ return subprocess.check_output(args,text=True,timeout=20)
+read(['/usr/local/sbin/w2f-v040-release','status'])
+base=['docker','compose','--env-file',root+'/state/compose.env','-f',root+'/compose.yaml']
+services=read(base+['ps','--status','running','--services']).split()
+assert set(services)=={'gateway','app','db','sender'}
+for role in ('app','sender'):
+ assert read(base+['exec','-T',role,'python','-c','import os;print(os.environ["W2F_RELEASE"])']).strip()==release
+cloud=json.loads(read(base+['exec','-T','app','python','-m','cloud.manage','delivery-status','--binding',binding]))
+assert cloud['target_app_id']==app and cloud['target_chat_id']==chat
+print(json.dumps(dict(services=sorted(services),release=release,delivery_enabled=cloud['delivery_enabled'])))
+"""
+        result = json.loads(self.ssh(['python3', '-c', code, self.config['remote_root'],
+            self.config['expected_release'], self.meta['binding_id'], self.config['app_id'],
+            self.config['chat_id']]).stdout)
+        context = ssl.create_default_context(cafile=str(self.ca))
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect(),
+                                            urllib.request.HTTPSHandler(context=context))
+        with opener.open(self.config['url']+'/health/ready', timeout=15) as reply:
+            assert json.load(reply) == {'status':'ok'}
+        result.update(result='passed', mode=self.meta['mode'], checked_at=time.time())
+        evidence = self.state / ('doctor-'+str(time.time_ns())+'.json')
+        save(evidence, result)
+        return dict(result='passed', release=result['release'], services=result['services'],
+                    delivery_enabled=result['delivery_enabled'], evidence=str(evidence))
+
     def prepare(self, mode):
         if self.meta and self.meta['mode']!=mode:
             raise ValueError('Run mode is immutable')
@@ -230,7 +263,7 @@ class Live:
                 result['paused']=not self.manage('delivery-pause','--binding',self.meta['binding_id'])['delivery_enabled']
             finally:
                 result['finished_at']=time.time();save(evidence,result)
-        return dict(result=result['result'],messages=len(pending),paused=result['paused'],evidence=str(evidence),human_confirmation='pending')
+        return dict(result=result['result'],messages=len(pending),paused=result['paused'],evidence=str(evidence),recipient_verification='pending')
 
     def replay(self, evidence):
         prior=private_json(evidence)
@@ -264,7 +297,7 @@ def main():
     p=sub.add_parser('inject');p.add_argument('--text',required=True)
     p=sub.add_parser('collect');p.add_argument('--offline',action='store_true')
     p=sub.add_parser('replay');p.add_argument('--evidence',required=True)
-    sub.add_parser('deliver');sub.add_parser('status')
+    sub.add_parser('deliver');sub.add_parser('status');sub.add_parser('doctor')
     args=parser.parse_args()
     try:
         live=Live(args.config,args.state)
