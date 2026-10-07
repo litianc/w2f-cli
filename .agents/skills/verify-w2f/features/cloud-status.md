@@ -1,6 +1,6 @@
 # Cloud management status
 
-The management page shows service readiness, the running environment and build, and the notice that text upload/query is available, provisioning uses restricted commands, and Feishu delivery is pending.
+The management page shows service readiness, the running environment and build, and the notice that text upload/query is available, provisioning uses restricted commands, and Feishu delivery is pending. That last notice is stale product copy: cloud text delivery is implemented and has its own [delivery proof](cloud-delivery.md). A status-page pass does not resolve this product gap.
 
 ## Sub-features
 

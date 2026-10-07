@@ -1,20 +1,20 @@
 ---
 name: verify-w2f
-description: Verify W2F cloud management, HTTPS authentication, and runtime isolation, or inject synthetic WeChat text at the reader boundary to test downstream Worker processing, persistence, and replay. Verify actual client uploads and ordered cloud sending with a disposable Postgres stack and private Feishu HTTP fixture. Use after cloud/client changes or when message tests need a controllable source.
+description: Verify W2F cloud management, HTTPS authentication, and runtime isolation; synthetic reader-to-Worker processing and replay; actual client uploads and cloud sending against a disposable Postgres/Feishu fixture; or explicitly authorized real server, Feishu and Mac collection checks. Use after cloud/client changes or to verify the text message chain.
 ---
 
 # Verify W2F
 
 Run from the **v0.4.0 development checkout**, never main. Read [features/README.md](features/README.md), then choose the relevant path:
 
-- Explicitly authorized real server/Feishu or Mac input: follow [Live text verification](features/live-text.md); its private evidence and human confirmation are separate from CI.
+- Explicitly authorized real server/Feishu or Mac input: follow [Live text verification](features/live-text.md); its private evidence and recipient verification are separate from CI. Use [Lark CLI recipient readback](features/recipient-readback.md) to automatically confirm text accessibility as the receiving user.
 - Cloud sending, persisted parts and failure recovery: follow [Cloud delivery](features/cloud-delivery.md), with a private simulated Feishu endpoint.
 - Client upload, tenant isolation, cloud archive and receipt recovery: follow [Text cloud intake](features/text-cloud-e2e.md). This runs the actual client and Postgres with a synthetic reader; it does not send Feishu messages.
 - Cloud management at `/` and `/api/status`: follow the container/browser recipe below.
 - Mock a WeChat message, test collection processing or replay: follow [Synthetic source messages](features/synthetic-messages.md). Its `messages.py collect` drives the new client's local queue; `drive` exercises the legacy Worker with a synthetic Feishu CLI. Both need no Docker, browser or real account.
 - Legacy `agents.manage` UI controls: use the separate browser harness in the feature map.
 
-The cloud exposes deployment status, administrator Basic authentication, device-authenticated text intake and message queries. Restricted operator commands provision and disable users/devices/bindings. The client persists receipts and retains confirmed copies for seven days. The independent cloud sender supports text delivery; its default verification uses a simulated Feishu HTTP service. Full management UI and real Feishu reception remain separate milestones.
+The cloud exposes deployment status, administrator Basic authentication, device-authenticated text intake and message queries. Restricted operator commands provision and disable users/devices/bindings. The client persists receipts and retains confirmed copies for seven days. The independent cloud sender supports text delivery; its default verification uses a simulated Feishu HTTP service. Real text reception uses the live recipe and exact recipient-user Lark CLI readback; historical manual confirmation remains valid. Full management UI remains a separate milestone.
 
 ## Launch
 
@@ -100,5 +100,9 @@ After **every failed iteration**, execute cleanup using the reported run directo
 `scripts/control.py` is executable; its interpreter is the project virtualenv. Available invocations are `launch`, `doctor RUN`, `drive RUN --feature auth|dashboard`, and `cleanup RUN`, demonstrated above. Its `--help` lists the same interface. It derives the checkout from its own location; it does not embed a developer home path or server credentials.
 
 `scripts/messages.py` has a separate `launch`, `doctor RUN`, `inject RUN --text TEXT`, `collect RUN`, `drive RUN [--text TEXT]`, and `cleanup RUN` interface. `collect` verifies the new client's durable pending queue; `drive --text` injects while the legacy Worker is reading; `inject` queues while stopped. Its [feature recipe](features/synthetic-messages.md) defines replay, evidence and cleanup. Keep each helper's run directory with that helper.
+
+`scripts/recipient.py` provides separate read-only `doctor` and `verify --evidence FILE` operations with required `--state`/`--profile` and explicit `--as user`; its [feature recipe](features/recipient-readback.md) defines identity, permission, exact-receipt checks and private evidence. The helper never sends or resumes a binding.
+
+`scripts/live.py --config PRIVATE_CONFIG --state PRIVATE_STATE doctor` health-checks an existing prepared real run before replay or further live driving; it observes versions, strict TLS, service inventory and the bound target without sending. See the live feature for existing-receipt maintenance and fresh-input acceptance.
 
 Keep this map aligned with routes and selectors as the app changes using `$maintain-verification-skill`.
