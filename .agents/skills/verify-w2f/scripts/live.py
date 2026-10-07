@@ -230,7 +230,7 @@ class Live:
                 result['paused']=not self.manage('delivery-pause','--binding',self.meta['binding_id'])['delivery_enabled']
             finally:
                 result['finished_at']=time.time();save(evidence,result)
-        return dict(result=result['result'],messages=len(pending),paused=result['paused'],evidence=str(evidence),human_confirmation='pending')
+        return dict(result=result['result'],messages=len(pending),paused=result['paused'],evidence=str(evidence),recipient_verification='pending')
 
     def replay(self, evidence):
         prior=private_json(evidence)

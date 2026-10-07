@@ -23,7 +23,9 @@ Report feature ID, actual commands, source identity, result and retained evidenc
 
 ## Features
 
-- [Live text verification](live-text.md): M3 real cloud/Feishu and M4 Mac input; explicit private configuration, bounded sending/readback, human receipt confirmation.
+- [Live text verification](live-text.md): M3 real cloud/Feishu and M4 Mac input; explicit private configuration, bounded sending/readback, recipient accessibility confirmation.
+
+- [Lark CLI recipient readback](recipient-readback.md): exact real text receipts fetched as the receiving user; automatic acceptance, explicit Profile/identity, no new send.
 
 - [Cloud delivery](cloud-delivery.md): actual cloud sender and private Feishu HTTP fixture; ordered persisted parts, retry/unknown outcomes, ownership and recovery.
 
